@@ -1301,15 +1301,23 @@ class SQLiteStorageAdapter {
       db.exec(`ALTER TABLE ${this._tableName(className)} ADD COLUMN "${nullFieldTrackerColumn}" TEXT`);
     }
   }
+  _tableExists(className, dbOverride) {
+    const db = dbOverride || this._db;
+    const rawName = this._rawTableName(className);
+    return !!this._prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = ?", db).get(rawName);
+  }
   async classExists(className, dbOverride) {
     const db = dbOverride || this._db;
+    const tableExists = this._tableExists(className, db);
     if (this._existingClasses.has(className)) {
+      if (!tableExists) {
+        this._existingClasses.delete(className);
+        return false;
+      }
       this._ensureNullFieldTrackerColumn(className, db);
       return true;
     }
-    const rawName = this._rawTableName(className);
-    const row = this._prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = ?", db).get(rawName);
-    if (row) {
+    if (tableExists) {
       this._existingClasses.add(className);
       this._ensureNullFieldTrackerColumn(className, db);
       return true;

@@ -1639,16 +1639,26 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     }
   }
 
+  _tableExists(className: string, dbOverride?: any): boolean {
+    const db = dbOverride || this._db;
+    const rawName = this._rawTableName(className);
+    return !!this._prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = ?", db).get(
+      rawName
+    );
+  }
+
   async classExists(className: string, dbOverride?: any): Promise<boolean> {
     const db = dbOverride || this._db;
+    const tableExists = this._tableExists(className, db);
     if (this._existingClasses.has(className)) {
+      if (!tableExists) {
+        this._existingClasses.delete(className);
+        return false;
+      }
       this._ensureNullFieldTrackerColumn(className, db);
       return true;
     }
-    const rawName = this._rawTableName(className);
-    const row = this._prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = ?", db)
-      .get(rawName);
-    if (row) {
+    if (tableExists) {
       this._existingClasses.add(className);
       this._ensureNullFieldTrackerColumn(className, db);
       return true;
