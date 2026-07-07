@@ -78,8 +78,11 @@ const aggregateHiddenFieldNames = new Set(['_hashed_password', '_rperm', '_wperm
 const aggregateDateMatchOperators = new Set(['$eq', '$ne', '$lt', '$lte', '$gt', '$gte', '$in', '$nin', '$all', '$exists']);
 const sqliteShutdownDrainDelayMs = 200;
 const nullFieldTrackerColumn = '_nullFields';
+// Hidden write-order tie-breaker for Parse timestamps, which are only
+// millisecond-precision once serialized for storage.
 const writeSequenceColumn = '_writeSeq';
 const sqliteEncodedTableNamePrefix = '__psa__';
+const authDataFieldPrefix = '_auth_data_';
 const implicitSQLiteUserColumnFields = Object.freeze({
   _hashed_password: {
     type: 'String'
@@ -115,6 +118,54 @@ const implicitSQLiteUserColumnFields = Object.freeze({
 const hiddenUserSchemaFields = new Set(['_hashed_password', '_password_history', '_email_verify_token_expires_at', '_email_verify_token', '_account_lockout_expires_at', '_failed_login_count', '_perishable_token', '_perishable_token_expires_at', '_password_changed_at']);
 const userDateLikeStringFields = new Set(['_email_verify_token_expires_at', '_account_lockout_expires_at', '_perishable_token_expires_at', '_password_changed_at']);
 const isAdapterInternalColumn = fieldName => fieldName === nullFieldTrackerColumn || fieldName === writeSequenceColumn;
+const getAuthDataProviderFieldName = fieldName => {
+  if (typeof fieldName !== 'string' || !fieldName.startsWith(authDataFieldPrefix)) {
+    return null;
+  }
+  const provider = fieldName.slice(authDataFieldPrefix.length);
+  if (!provider) {
+    return null;
+  }
+  for (let i = 0; i < provider.length; i += 1) {
+    const code = provider.charCodeAt(i);
+    const isNumeric = code >= 48 && code <= 57;
+    const isUpperAlpha = code >= 65 && code <= 90;
+    const isLowerAlpha = code >= 97 && code <= 122;
+    if (!(isNumeric || isUpperAlpha || isLowerAlpha || code === 95)) {
+      return null;
+    }
+  }
+  return provider;
+};
+const partitionFlattenedConstraintValues = values => {
+  const nonNulls = [];
+  let hasAny = false;
+  let hasNull = false;
+  for (const value of values) {
+    if (Array.isArray(value)) {
+      for (const nestedValue of value) {
+        hasAny = true;
+        if (nestedValue === null) {
+          hasNull = true;
+        } else {
+          nonNulls.push(nestedValue);
+        }
+      }
+    } else {
+      hasAny = true;
+      if (value === null) {
+        hasNull = true;
+      } else {
+        nonNulls.push(value);
+      }
+    }
+  }
+  return {
+    hasAny,
+    hasNull,
+    nonNulls
+  };
+};
 const temporarySQLiteDirectories = new Set();
 let sharedMemorySQLiteDatabase;
 const unsafeRestQuery = _RestQuery.default && _RestQuery.default._UnsafeRestQuery;
@@ -1378,6 +1429,8 @@ class SQLiteStorageAdapter {
     return stmt;
   }
   _nextWriteSequence() {
+    // Use a monotonic adapter-local counter so equal millisecond timestamps
+    // still sort in write order without a pre-write round trip.
     const sequenceBase = Date.now() * 1000;
     this._lastWriteSequence = sequenceBase > this._lastWriteSequence ? sequenceBase : this._lastWriteSequence + 1;
     return this._lastWriteSequence;
@@ -2155,9 +2208,8 @@ class SQLiteStorageAdapter {
       if (!Object.prototype.hasOwnProperty.call(copy, key)) {
         continue;
       }
-      const authDataMatch = key.match(/^_auth_data_([a-zA-Z0-9_]+)$/);
-      if (authDataMatch) {
-        const provider = authDataMatch[1];
+      const provider = getAuthDataProviderFieldName(key);
+      if (provider) {
         copy.authData = copy.authData || {};
         copy.authData[provider] = copy[key];
         delete copy[key];
@@ -2373,11 +2425,14 @@ class SQLiteStorageAdapter {
     const params = [];
     const orderBys = [];
     const orderByParams = [];
-    for (const key of Object.keys(query)) {
+    for (const key in query) {
+      if (!Object.prototype.hasOwnProperty.call(query, key)) {
+        continue;
+      }
       const val = query[key];
       const isDotNotation = key.indexOf('.') >= 0;
-      const authDataMatch = key.match(/^_auth_data_([a-zA-Z0-9_]+)$/);
-      const normalizedKey = !preserveSpecialFieldNames && !authDataMatch && !isDotNotation ? normalizeStorageFieldName(key) : key;
+      const authDataProvider = getAuthDataProviderFieldName(key);
+      const normalizedKey = !preserveSpecialFieldNames && !authDataProvider && !isDotNotation ? normalizeStorageFieldName(key) : key;
       if (key === '$or' || key === '$and' || key === '$nor') {
         const subConds = [];
         for (const subQuery of val) {
@@ -2413,7 +2468,10 @@ class SQLiteStorageAdapter {
         }
       }
       if (isQueryOperatorObject(val)) {
-        for (const op of Object.keys(val)) {
+        for (const op in val) {
+          if (!Object.prototype.hasOwnProperty.call(val, op)) {
+            continue;
+          }
           const opVal = val[op];
           if (opVal && typeof opVal === 'object' && opVal.$relativeTime) {
             if (['$lt', '$lte', '$gt', '$gte'].indexOf(op) === -1) {
@@ -2437,8 +2495,8 @@ class SQLiteStorageAdapter {
       const dotFieldArrayPath = dotFieldUsesRootArrayTraversal ? buildArrayRootDotFieldPath(key) : null;
       const dotFieldArraySourceSql = dotFieldArrayPath ? quoteColumnName(dotFieldArrayPath.rootFieldName) : null;
       let targetSql;
-      if (authDataMatch) {
-        targetSql = `json_extract("authData", '$.${authDataMatch[1]}')`;
+      if (authDataProvider) {
+        targetSql = `json_extract("authData", '$.${authDataProvider}')`;
       } else if (isDotNotation) {
         targetSql = dotFieldArrayPath ? dotFieldArrayPath.valueExpression : dotFieldRootExists ? dotFieldPath.valueExpression : 'NULL';
       } else {
@@ -2447,9 +2505,9 @@ class SQLiteStorageAdapter {
         targetSql = fieldExistsInSchema ? quoteColumnName(normalizedKey) : 'NULL';
       }
       const dotFieldTypeSql = dotFieldArrayPath ? dotFieldArrayPath.typeExpression : dotFieldPath && dotFieldRootExists ? dotFieldPath.typeExpression : null;
-      const usesCaseInsensitiveComparison = caseInsensitive && !authDataMatch && !isDotNotation && (normalizedKey === 'username' || normalizedKey === 'email');
+      const usesCaseInsensitiveComparison = caseInsensitive && !authDataProvider && !isDotNotation && (normalizedKey === 'username' || normalizedKey === 'email');
       const isArrayField = normalizedKey === '_rperm' || normalizedKey === '_wperm' || schemaFields[normalizedKey] && schemaFields[normalizedKey].type === 'Array';
-      const explicitNullFieldMatch = shouldTrackExplicitNullFields(className) && !authDataMatch && !isDotNotation ? getExplicitNullFieldMatchExpression(normalizedKey) : null;
+      const explicitNullFieldMatch = shouldTrackExplicitNullFields(className) && !authDataProvider && !isDotNotation ? getExplicitNullFieldMatchExpression(normalizedKey) : null;
       if (val === null || val === undefined) {
         if (dotFieldArraySourceSql) {
           conditions.push(`EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${targetSql} IS NULL)`);
@@ -2459,8 +2517,10 @@ class SQLiteStorageAdapter {
         continue;
       }
       if (isQueryOperatorObject(val)) {
-        const keys = Object.keys(val);
-        for (const op of keys) {
+        for (const op in val) {
+          if (!Object.prototype.hasOwnProperty.call(val, op)) {
+            continue;
+          }
           const opVal = val[op];
           if (op === '$eq') {
             if (opVal === null) {
@@ -2542,10 +2602,12 @@ class SQLiteStorageAdapter {
             if (!Array.isArray(opVal)) {
               throw new _node.default.Error(_node.default.Error.INVALID_JSON, 'bad $in value');
             }
-            const normalizedInValues = opVal.flatMap(value => value);
-            if (normalizedInValues.length > 0) {
-              const hasNull = normalizedInValues.includes(null);
-              const nonNulls = normalizedInValues.filter(v => v !== null);
+            const {
+              hasAny: hasInValues,
+              hasNull: hasNull,
+              nonNulls
+            } = partitionFlattenedConstraintValues(opVal);
+            if (hasInValues) {
               if (isArrayField) {
                 if (nonNulls.length > 0) {
                   const anyMatch = getArrayAnyMatchExpression(targetSql, nonNulls);
@@ -2613,10 +2675,12 @@ class SQLiteStorageAdapter {
             if (!Array.isArray(opVal)) {
               throw new _node.default.Error(_node.default.Error.INVALID_JSON, 'bad $nin value');
             }
-            const normalizedNinValues = opVal.flatMap(value => value);
-            if (normalizedNinValues.length > 0) {
-              const hasNull = normalizedNinValues.includes(null);
-              const nonNulls = normalizedNinValues.filter(v => v !== null);
+            const {
+              hasAny: hasNinValues,
+              hasNull: hasNull,
+              nonNulls
+            } = partitionFlattenedConstraintValues(opVal);
+            if (hasNinValues) {
               if (isArrayField) {
                 if (nonNulls.length > 0) {
                   const anyMatch = getArrayAnyMatchExpression(targetSql, nonNulls);
@@ -2924,27 +2988,24 @@ class SQLiteStorageAdapter {
     let includeTextScore = false;
     if (keys && keys.length > 0) {
       const selectedCols = [];
-      const selectedKeys = keys.reduce((memo, key) => {
-        if (key === 'ACL') {
-          memo.push('_rperm');
-          memo.push('_wperm');
-        } else if (key && key.length > 0) {
-          memo.push(key);
-        }
-        return memo;
-      }, []);
-      for (const k of selectedKeys) {
-        const rootFieldName = k.indexOf('.') >= 0 ? k.split('.')[0] : k;
-        if (k !== '$score' && (!schema.fields[rootFieldName] || schema.fields[rootFieldName].type === 'Relation')) {
+      for (const key of keys) {
+        if (!key || key.length === 0) {
           continue;
         }
-        if (k.indexOf('.') >= 0) {
-          selectedCols.push(`${transformDotField(k)} as "${k.replace(/"/g, '""')}"`);
-        } else if (k === '$score') {
-          includeTextScore = true;
-        } else {
-          validateFieldName(k);
-          selectedCols.push(quoteColumnName(k));
+        const expandedKeys = key === 'ACL' ? ['_rperm', '_wperm'] : [key];
+        for (const selectedKey of expandedKeys) {
+          const rootFieldName = selectedKey.indexOf('.') >= 0 ? selectedKey.split('.')[0] : selectedKey;
+          if (selectedKey !== '$score' && (!schema.fields[rootFieldName] || schema.fields[rootFieldName].type === 'Relation')) {
+            continue;
+          }
+          if (selectedKey.indexOf('.') >= 0) {
+            selectedCols.push(`${transformDotField(selectedKey)} as "${selectedKey.replace(/"/g, '""')}"`);
+          } else if (selectedKey === '$score') {
+            includeTextScore = true;
+          } else {
+            validateFieldName(selectedKey);
+            selectedCols.push(quoteColumnName(selectedKey));
+          }
         }
       }
       if (selectedCols.length > 0) {
@@ -4140,15 +4201,15 @@ class SQLiteStorageAdapter {
         if (!Object.prototype.hasOwnProperty.call(updateObject, fieldName)) {
           continue;
         }
-        const authDataMatch = fieldName.match(/^_auth_data_([a-zA-Z0-9_]+)$/);
-        if (!authDataMatch) {
+        const provider = getAuthDataProviderFieldName(fieldName);
+        if (!provider) {
           continue;
         }
         if (!hasAuthDataUpdate) {
           authDataUpdate = {};
           hasAuthDataUpdate = true;
         }
-        authDataUpdate[authDataMatch[1]] = updateObject[fieldName];
+        authDataUpdate[provider] = updateObject[fieldName];
         delete updateObject[fieldName];
       }
       if (hasAuthDataUpdate && authDataUpdate) {
@@ -4214,12 +4275,11 @@ class SQLiteStorageAdapter {
       if (typeof fieldValue === 'undefined') {
         return;
       }
-      const authDataMatch = fieldName.match(/^_auth_data_([a-zA-Z0-9_]+)$/);
-      if (authDataMatch) {
-        const provider = authDataMatch[1];
+      const authDataProvider = getAuthDataProviderFieldName(fieldName);
+      if (authDataProvider) {
         fieldName = 'authData';
         fieldValue = {
-          [provider]: fieldValue
+          [authDataProvider]: fieldValue
         };
       }
       const isDotNotationField = fieldName.indexOf('.') >= 0;

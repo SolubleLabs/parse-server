@@ -1550,3 +1550,17 @@
   - `TESTING=1 PARSE_SERVER_TEST_DB=sqlite PARSE_SERVER_TEST_DATABASE_URI=sqlite://:memory: npx jasmine --seed=49944 --fail-fast`
   - result: exit code `0`
   - summary: `Executed 4143 of 4442 specs (299 pending) in 14 mins 14 secs`
+
+### Post-Green Perf Tidy
+- Replaced repeated `_auth_data_<provider>` regex matches in the adapter hot paths with a centralized prefix parser plus ASCII validation.
+- Collapsed normal query `$in` / `$nin` null handling from:
+  - flatten pass
+  - `includes(null)` pass
+  - `filter(v !== null)` pass
+  into one partitioning pass.
+- Removed one normal `find()` projection double-pass:
+  - key expansion for `ACL` now happens inline instead of reducing to a temporary array and looping again.
+- Focused revalidation after the perf tidy:
+  - `TESTING=1 PARSE_SERVER_TEST_DB=sqlite PARSE_SERVER_TEST_DATABASE_URI=sqlite://:memory: npx jasmine spec/SQLiteStorageAdapter.spec.js`
+  - `TESTING=1 PARSE_SERVER_TEST_DB=sqlite PARSE_SERVER_TEST_DATABASE_URI=sqlite://:memory: npx jasmine --filter='order by updatedAt|order by createdAt|containedIn queries|notContainedIn queries|withJSON with geoWithin.centerSphere fails with invalid coordinate|withJSON with geoWithin.centerSphere fails with invalid geo point' spec/ParseQuery.spec.js`
+  - result: green
