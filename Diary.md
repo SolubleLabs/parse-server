@@ -1564,3 +1564,19 @@
   - `TESTING=1 PARSE_SERVER_TEST_DB=sqlite PARSE_SERVER_TEST_DATABASE_URI=sqlite://:memory: npx jasmine spec/SQLiteStorageAdapter.spec.js`
   - `TESTING=1 PARSE_SERVER_TEST_DB=sqlite PARSE_SERVER_TEST_DATABASE_URI=sqlite://:memory: npx jasmine --filter='order by updatedAt|order by createdAt|containedIn queries|notContainedIn queries|withJSON with geoWithin.centerSphere fails with invalid coordinate|withJSON with geoWithin.centerSphere fails with invalid geo point' spec/ParseQuery.spec.js`
   - result: green
+
+### Fresh Perf Recheck
+- Re-ran the steady-state `createObject()` micro-benchmark after the latest hot-path tidy using the repo's current adapter code under the system `nvm` Node.
+- Benchmark shape:
+  - `10000` measured inserts per run
+  - `1000` warmup inserts
+  - `5` repeats
+  - same schema and object payload in all scenarios
+- Results:
+  - current cached path with the top-level `MessageChannel` yield: about `0.0280 ms/op` (`~35.7k ops/sec`)
+  - same cached path with only the yield bypassed: about `0.0243 ms/op` (`~41.2k ops/sec`)
+  - forced fresh table-column reads on every write plus the yield: about `0.0460 ms/op` (`~21.8k ops/sec`)
+- Read of those numbers:
+  - the current `MessageChannel` hop costs about `0.0037 ms/op` on this benchmark, roughly `15.3%` relative to the no-yield direct path
+  - the older repeated-schema-probe behavior is still much worse: about `0.0180 ms/op` slower than current, roughly `64.1%` slower
+  - so the remaining parity yield is now materially smaller than the old adapter-specific schema-probe tax it replaced
