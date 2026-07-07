@@ -1235,7 +1235,7 @@ const validateRegexPattern = (pattern, flags) => {
     new RegExp(normalizedRegex.pattern, normalizedRegex.flags);
     return normalizedRegex;
   } catch (error) {
-    throw (0, _Error.createSanitizedError)(_node.default.Error.INVALID_QUERY, `Invalid regular expression: ${error.message}`, undefined, 'Invalid regular expression');
+    throw (0, _Error.createSanitizedError)(_node.default.Error.INTERNAL_SERVER_ERROR, `Invalid regular expression: ${error.message}`, undefined, 'An internal server error occurred');
   }
 };
 const escapeSQLiteLikePattern = literal => literal.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
