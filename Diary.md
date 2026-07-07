@@ -1160,3 +1160,148 @@
 - Standalone package refresh:
   - refreshed [src/Adapters/Storage/SQLite/parse-server-sqlite-adapter](/Users/swittkongdachalert/Documents/Projects/Libraries/parse-server/src/Adapters/Storage/SQLite/parse-server-sqlite-adapter) from built source
   - rebuilt repo so the `lib/.../parse-server-sqlite-adapter` copy matches
+
+## 2026-07-07
+
+### Production Audit Snapshot
+
+- Exact code/runtime under audit:
+  - Parse Server package version: `9.10.0-alpha.2`
+  - repo commit: `8547e2d11ffa93510c8ffd1393f78d0585d2b0c2`
+  - Node used for all current SQLite runs: `22.22.0` from the user's installed `nvm`
+  - `better-sqlite3`: `12.11.1`
+  - bundled SQLite: `3.53.2`
+
+- Exact SQLite suite entry command:
+  - `source ~/.nvm/nvm.sh && nvm use 22.22.0 >/dev/null && npm run test:sqlite:testonly`
+  - script expansion from `package.json`:
+    - `PARSE_SERVER_TEST_DB=sqlite`
+    - `PARSE_SERVER_TEST_DATABASE_URI=sqlite://:memory:`
+    - then `npm run testonly`
+    - which expands to `TESTING=1 jasmine`
+  - important:
+    - the normal SQLite suite path does **not** use `PARSE_SERVER_DATABASE_ADAPTER`
+    - `spec/helper.js` only uses `PARSE_SERVER_DATABASE_ADAPTER` if explicitly supplied from env; otherwise it instantiates `new SQLiteStorageAdapter(...)` directly when `PARSE_SERVER_TEST_DB=sqlite`
+
+- Generic-suite coverage sanity:
+  - prior broad SQLite run summary:
+    - `Executed 4123 of 4422 specs (23 FAILED) (299 PENDING)`
+  - this means most of the generic suite is actually exercised under SQLite; it is not a tiny adapter-only subset
+  - but DB gating is real:
+    - explicit `it_only_db('mongo')`: `43`
+    - explicit `describe_only_db('mongo')`: `15`
+    - explicit `it_only_db('postgres')`: `27`
+    - explicit `describe_only_db('postgres')`: `6`
+    - explicit SQLite-only gates: just `1` `it_only_db('sqlite')` and `1` `describe_only_db('sqlite')`
+  - there are also `31` literal `xit` / `xdescribe` sites in `spec/`
+  - I did **not** produce a same-machine apples-to-apples executed/pending count for a full Mongo or Postgres run in this audit pass because local Mongo/Postgres availability is not clean enough to trust that comparison
+
+- Focused spec reruns worth remembering:
+  - `npm run test:sqlite:testonly -- spec/SQLiteStorageAdapter.spec.js`
+    - `20 specs, 0 failures`
+  - `npm run test:sqlite:testonly -- spec/batch.spec.js --filter='transaction'`
+    - `29 specs, 0 failures`
+  - `npm run test:sqlite:testonly -- spec/ParseQuery.FullTextSearch.spec.js`
+    - SQLite-executed portion green
+  - `npm run test:sqlite:testonly -- spec/ParseInstallation.spec.js`
+    - `56 specs, 2 failures, 2 pending`
+    - failures include:
+      - `enforceAuth=true with master-key caller still bypasses ACL and dedups`
+      - `allows you to get your own installation (regression test for #1718)`
+  - `npm run test:sqlite:testonly -- spec/ParseRole.spec.js`
+    - `18 specs, 1 failure`
+    - failing spec:
+      - `should not recursively load the same role multiple times`
+      - observed extra recursion/query count (`Expected 6 to equal 2`)
+
+### SQLite-Specific Runtime Findings
+
+- Production connection pragmas are present on file-backed DBs:
+  - verified on both the main connection and a separately-created transactional connection:
+    - `journal_mode = wal`
+    - `synchronous = NORMAL`
+    - `foreign_keys = ON`
+    - `busy_timeout = 5000`
+    - `temp_store = MEMORY`
+    - cache-size honoring the configured KB target
+  - for `:memory:` DBs:
+    - `journal_mode` is naturally `memory`, not `wal`
+
+- Concurrency / locking:
+  - normal single-process Parse traffic is effectively serialized at the Node thread because `better-sqlite3` is synchronous
+  - that means regular same-process requests are unlikely to race into `SQLITE_BUSY` under light load; they mostly queue behind event-loop blocking instead
+  - cross-connection / cross-process locking was probed directly:
+    - when one writer held `BEGIN IMMEDIATE` for ~`2s`, a second writer waited and then succeeded after ~`1929 ms`
+    - when one writer held the lock for ~`6s`, the second writer failed after ~`5219 ms` with `SQLITE_BUSY`
+  - implication:
+    - the `5000 ms` timeout is doing what it should
+    - but multi-process deployments or long-running transactions can still surface `SQLITE_BUSY`
+
+- Transaction behavior:
+  - adapter sessions use a fresh SQLite connection plus `BEGIN IMMEDIATE`
+  - commit/rollback plumbing itself is working; adapter unit tests and batch transaction specs pass
+  - direct probe of a duplicate-key failure inside a transactional batch:
+    - rollback worked correctly (`count = 0` for the failed logical write set)
+    - but the HTTP response surfaced as a generic `500 Internal server error`
+  - caveat:
+    - atomicity looks okay
+    - error-shaping for some SQLite-level failures inside transactional batch flows is still rough
+
+- Event-loop blocking measurements with a file-backed Parse server using this adapter:
+  - read-heavy probe:
+    - `200` requests, concurrency `25`
+    - request latency: p95 ~`23.9 ms`, p99 ~`65.3 ms`, max ~`84.0 ms`
+    - event-loop delay: p95/p99/max ~`16.8 ms`
+  - write burst probe:
+    - `200` creates, concurrency `25`
+    - request latency: p95 ~`14.3 ms`, p99 ~`14.4 ms`, max ~`15.1 ms`
+    - event-loop delay: p95/p99/max ~`14.4 ms`
+  - update burst probe:
+    - `50` updates, concurrency `25`
+    - request latency: p95 ~`16.6 ms`, p99/max ~`16.7 ms`
+    - event-loop delay: p95/p99/max ~`14.8 ms`
+  - large page query probe:
+    - `limit=1000` result page
+    - latency ~`8.6 ms`
+  - interpretation:
+    - for a small single-tenant BBS, main-thread `better-sqlite3` is not obviously scary
+    - it is still synchronous, so pathological large scans / regexes / migrations will block the process
+
+- Migration / index-creation blocking:
+  - on a `20k`-row synthetic class:
+    - normal B-tree index creation took ~`6.4 ms`
+    - FTS5 rebuild took ~`25.4 ms`
+  - because these operations are synchronous, elapsed time is effectively the pause budget on the main thread
+
+- Backup / restore / crash boringness:
+  - `better-sqlite3` does expose a `db.backup(...)` API
+  - live-backup probe:
+    - copying only the main `.sqlite` file while WAL was active produced a broken copy (`no such table: t`)
+    - `db.backup(...)` produced a good copy with the expected row count and `PRAGMA integrity_check = ok`
+  - crash probe:
+    - a writer process was killed with `SIGKILL` during a tight insert loop on a WAL DB
+    - reopened DB still passed `PRAGMA integrity_check = ok`
+    - `.sqlite`, `-wal`, and `-shm` files were all present after the crash, as expected
+
+### Production Risk Notes
+
+- Real adapter-facing blockers still visible today:
+  - `_Installation` is not fully trustworthy yet; two isolated specs still fail
+  - `_Role` recursive loading / dedup behavior still has at least one failing isolated spec
+
+- Important non-blocker caveats:
+  - include handling still relies on a temporary prototype patch of `RestQuery._UnsafeRestQuery.handleInclude`
+    - scoped with ref-counting and released on shutdown
+    - acceptable for a single SQLite Parse process
+    - risky if someone tries to mix adapters in one process
+  - adapter prototype still chains to Postgres via `Object.setPrototypeOf(...)`
+    - this is another version-coupling caveat for the standalone drop-in package
+  - large `$in` / `$nin` lists are expanded into OR chains, not a compact `IN (...)`
+    - compile-time SQLite bind limit here is `MAX_VARIABLE_NUMBER=32766`
+    - so extremely wide list queries are technically supported only up to practical SQL/bind limits and may get slow before the hard cap
+  - regex fallback uses SQLite user-defined functions that run JS `RegExp`
+    - simple safe cases are lowered to `LIKE` / `GLOB`
+    - complex regexes are CPU work on the Node thread and can force scans
+  - file bytes are not stored in SQLite by default
+    - with an explicit `databaseAdapter`, Parse Server also requires an explicit `filesAdapter`
+    - SQLite stores Parse metadata / file names only; actual file bytes go through the chosen files adapter
