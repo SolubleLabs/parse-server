@@ -50,6 +50,22 @@ const importRewrite = {
   ].join(""),
 };
 
+const utilsCompatSearch = [
+  "const {\n",
+  "  getSimpleNormalizedRegexInfo,\n",
+  "  isNumericArrayIndexComponent,\n",
+  "  normalizeRegexPattern\n",
+  "} = require('./SQLiteUtils');\n",
+].join("");
+
+const utilsCompatReplace =
+  utilsCompatSearch +
+  "const parseServerUtils = _Utils.default ?? _Utils;\n" +
+  "if (typeof parseServerUtils.isDate !== 'function') {\n" +
+  "  // Older Parse Server builds expose Utils without the realm-safe Date helper this adapter expects.\n" +
+  "  parseServerUtils.isDate = value => Object.prototype.toString.call(value) === '[object Date]';\n" +
+  "}\n";
+
 function stripSourceMap(content) {
   return content.replace(/\n\/\/# sourceMappingURL=.*$/s, "");
 }
@@ -69,6 +85,13 @@ function rewriteStandaloneImports(content) {
   return content.replace(importRewrite.search, importRewrite.replace);
 }
 
+function applyStandaloneCompat(content) {
+  if (!content.includes(utilsCompatSearch)) {
+    throw new Error("Could not find the SQLite utils import block to patch.");
+  }
+  return content.replace(utilsCompatSearch, utilsCompatReplace);
+}
+
 for (const filename of Object.keys(fileHeaders)) {
   const sourceFile = path.join(sourceDir, filename);
   const targetFile = path.join(targetDir, filename);
@@ -76,6 +99,7 @@ for (const filename of Object.keys(fileHeaders)) {
   content = stripSourceMap(content);
   if (filename === "SQLiteStorageAdapter.js") {
     content = rewriteStandaloneImports(content);
+    content = applyStandaloneCompat(content);
   }
   content = withHeader(filename, content);
   fs.writeFileSync(targetFile, content);

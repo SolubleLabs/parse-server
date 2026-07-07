@@ -107,6 +107,20 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
     expect(results[0].age).toBe(30);
   });
 
+  it('treats late storage probes after shutdown as empty results', async () => {
+    const schema = {
+      className: 'LateShutdownClass',
+      fields: {
+        objectId: { type: 'String' },
+      },
+    };
+    await adapter.createClass('LateShutdownClass', schema);
+    await adapter.handleShutdown();
+
+    await expectAsync(adapter.classExists('LateShutdownClass')).toBeResolvedTo(false);
+    await expectAsync(adapter.find('LateShutdownClass', schema, {})).toBeResolvedTo([]);
+  });
+
   it('handles transactions commit and abort', async () => {
     const schema = {
       className: 'TxClass',
@@ -510,6 +524,148 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
     expect(results[0].a).toEqual({ foo: ['b', 'c'] });
   });
 
+  it('infers semantic field types for root update ops', async () => {
+    const schema = {
+      className: 'RootUpdateOpInferenceClass',
+      fields: {
+        objectId: { type: 'String' },
+      },
+    };
+    await adapter.createClass('RootUpdateOpInferenceClass', schema);
+    await adapter.createObject('RootUpdateOpInferenceClass', schema, {
+      objectId: 'root-op-1',
+    });
+
+    await adapter.updateObjectsByQuery(
+      'RootUpdateOpInferenceClass',
+      schema,
+      { objectId: 'root-op-1' },
+      {
+        lastRefundAt: { __op: 'Delete' },
+        refundCount: { __op: 'Increment', amount: 1 },
+        tags: { __op: 'AddUnique', objects: ['a'] },
+        removedTags: { __op: 'Remove', objects: ['x'] },
+      }
+    );
+
+    let storedSchema = await adapter.getClass('RootUpdateOpInferenceClass');
+    expect(storedSchema.fields.lastRefundAt).toBeUndefined();
+    expect(storedSchema.fields.refundCount.type).toBe('Number');
+    expect(storedSchema.fields.tags.type).toBe('Array');
+    expect(storedSchema.fields.removedTags.type).toBe('Array');
+
+    await adapter.updateObjectsByQuery(
+      'RootUpdateOpInferenceClass',
+      storedSchema,
+      { objectId: 'root-op-1' },
+      {
+        lastRefundAt: 123,
+        refundCount: { __op: 'Increment', amount: 2 },
+        tags: { __op: 'AddUnique', objects: ['b'] },
+        removedTags: { __op: 'AddUnique', objects: ['c'] },
+      }
+    );
+
+    const results = await adapter.find('RootUpdateOpInferenceClass', storedSchema, {
+      objectId: 'root-op-1',
+    });
+    expect(results.length).toBe(1);
+    expect(results[0].lastRefundAt).toBe(123);
+    expect(results[0].refundCount).toBe(3);
+    expect(results[0].tags).toEqual(['a', 'b']);
+    expect(results[0].removedTags).toEqual(['c']);
+  });
+
+  it('does not infer string schema from null-only writes on new fields', async () => {
+    const schema = {
+      className: 'NullFieldInferenceClass',
+      fields: {
+        objectId: { type: 'String' },
+      },
+    };
+    await adapter.createClass('NullFieldInferenceClass', schema);
+    await adapter.createObject('NullFieldInferenceClass', schema, {
+      objectId: 'null-field-1',
+      nullableMetric: null,
+    });
+
+    let storedSchema = await adapter.getClass('NullFieldInferenceClass');
+    expect(storedSchema.fields.nullableMetric).toBeUndefined();
+
+    let results = await adapter.find('NullFieldInferenceClass', storedSchema, {
+      objectId: 'null-field-1',
+    });
+    expect(results.length).toBe(1);
+    expect(results[0].nullableMetric).toBeNull();
+
+    await adapter.updateObjectsByQuery(
+      'NullFieldInferenceClass',
+      storedSchema,
+      { objectId: 'null-field-1' },
+      {
+        nullableMetric: 7,
+      }
+    );
+
+    storedSchema = await adapter.getClass('NullFieldInferenceClass');
+    expect(storedSchema.fields.nullableMetric.type).toBe('Number');
+
+    results = await adapter.find('NullFieldInferenceClass', storedSchema, {
+      objectId: 'null-field-1',
+    });
+    expect(results.length).toBe(1);
+    expect(results[0].nullableMetric).toBe(7);
+  });
+
+  it('tracks null-only update writes without requiring a backing column first', async () => {
+    const schema = {
+      className: 'NullFieldUpdateInferenceClass',
+      fields: {
+        objectId: { type: 'String' },
+      },
+    };
+    await adapter.createClass('NullFieldUpdateInferenceClass', schema);
+    await adapter.createObject('NullFieldUpdateInferenceClass', schema, {
+      objectId: 'null-field-update-1',
+    });
+
+    await adapter.updateObjectsByQuery(
+      'NullFieldUpdateInferenceClass',
+      schema,
+      { objectId: 'null-field-update-1' },
+      {
+        nullableArray: null,
+      }
+    );
+
+    let storedSchema = await adapter.getClass('NullFieldUpdateInferenceClass');
+    expect(storedSchema.fields.nullableArray).toBeUndefined();
+
+    let results = await adapter.find('NullFieldUpdateInferenceClass', storedSchema, {
+      objectId: 'null-field-update-1',
+    });
+    expect(results.length).toBe(1);
+    expect(results[0].nullableArray).toBeNull();
+
+    await adapter.updateObjectsByQuery(
+      'NullFieldUpdateInferenceClass',
+      storedSchema,
+      { objectId: 'null-field-update-1' },
+      {
+        nullableArray: [],
+      }
+    );
+
+    storedSchema = await adapter.getClass('NullFieldUpdateInferenceClass');
+    expect(storedSchema.fields.nullableArray.type).toBe('Array');
+
+    results = await adapter.find('NullFieldUpdateInferenceClass', storedSchema, {
+      objectId: 'null-field-update-1',
+    });
+    expect(results.length).toBe(1);
+    expect(results[0].nullableArray).toEqual([]);
+  });
+
   it('preserves array indexes when deleting dotted numeric paths', async () => {
     const schema = {
       className: 'NestedArrayDeleteClass',
@@ -540,6 +696,82 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
     });
     expect(results.length).toBe(1);
     expect(results[0].payload.items).toEqual(['a', null, 'c']);
+  });
+
+  it('treats dotted queries on missing root columns as no-match instead of SQL errors', async () => {
+    const schema = {
+      className: 'MissingDotRootQueryClass',
+      fields: {
+        objectId: { type: 'String' },
+      },
+    };
+    await adapter.createClass('MissingDotRootQueryClass', schema);
+    await adapter.createObject('MissingDotRootQueryClass', schema, {
+      objectId: 'missing-dot-root-1',
+    });
+
+    const results = await adapter.find('MissingDotRootQueryClass', schema, {
+      'externalRecordURL.value': 'integration://provider/account/user',
+    });
+
+    expect(results).toEqual([]);
+  });
+
+  it('matches dotted queries through arrays of objects', async () => {
+    const schema = {
+      className: 'ArrayObjectDotQueryClass',
+      fields: {
+        objectId: { type: 'String' },
+        externalRecordURL: { type: 'Array' },
+      },
+    };
+    await adapter.createClass('ArrayObjectDotQueryClass', schema);
+    await adapter.createObject('ArrayObjectDotQueryClass', schema, {
+      objectId: 'array-dot-match-1',
+      externalRecordURL: [
+        {
+          label: 'Integration:provider',
+          value: 'integration://provider/account/user',
+        },
+      ],
+    });
+
+    const results = await adapter.find('ArrayObjectDotQueryClass', schema, {
+      'externalRecordURL.value': 'integration://provider/account/user',
+    });
+
+    expect(results.map(result => result.objectId)).toEqual(['array-dot-match-1']);
+  });
+
+  it('preserves nested undefined keys in JSON payloads as null', async () => {
+    const schema = {
+      className: 'UndefinedJSONPayloadClass',
+      fields: {
+        objectId: { type: 'String' },
+        changes: { type: 'Array' },
+      },
+    };
+    await adapter.createClass('UndefinedJSONPayloadClass', schema);
+    await adapter.createObject('UndefinedJSONPayloadClass', schema, {
+      objectId: 'undefined-json-1',
+      changes: [
+        {
+          changes: {
+            status: 'active',
+            taskStatus: undefined,
+          },
+        },
+      ],
+    });
+
+    const [result] = await adapter.find('UndefinedJSONPayloadClass', schema, {
+      objectId: 'undefined-json-1',
+    });
+
+    expect(result.changes[0].changes).toEqual({
+      status: 'active',
+      taskStatus: null,
+    });
   });
 
   it('avoids repeating metadata lookups for cached classExists checks', async () => {

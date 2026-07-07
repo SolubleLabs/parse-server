@@ -9,7 +9,6 @@ const decodeSQLitePath = path => {
     return path;
   }
 };
-
 const parseOptionalInteger = value => {
   if (value === undefined || value === null || value === '') {
     return null;
@@ -17,7 +16,6 @@ const parseOptionalInteger = value => {
   const parsedValue = parseInt(value, 10);
   return Number.isFinite(parsedValue) ? parsedValue : null;
 };
-
 const applySQLiteQueryOptions = (options, searchParams) => {
   if (searchParams.has('fileMustExist')) {
     options.fileMustExist = searchParams.get('fileMustExist') === 'true';
@@ -31,7 +29,6 @@ const applySQLiteQueryOptions = (options, searchParams) => {
     options.cacheSizeKb = cacheSizeKb;
   }
 };
-
 const normalizeFileSQLiteURI = uri => {
   if (uri === 'file::memory:' || uri.startsWith('file::memory:?')) {
     return ':memory:';
@@ -56,7 +53,6 @@ const normalizeFileSQLiteURI = uri => {
     return decodeSQLitePath(uri.slice(5).split('?')[0]);
   }
 };
-
 function getDatabaseOptionsFromURI(uri) {
   const options = {};
   if (!uri) {

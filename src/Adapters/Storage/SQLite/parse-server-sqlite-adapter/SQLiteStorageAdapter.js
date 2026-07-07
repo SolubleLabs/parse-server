@@ -26,6 +26,11 @@ const {
   isNumericArrayIndexComponent,
   normalizeRegexPattern
 } = require('./SQLiteUtils');
+const parseServerUtils = _Utils.default ?? _Utils;
+if (typeof parseServerUtils.isDate !== 'function') {
+  // Older Parse Server builds expose Utils without the realm-safe Date helper this adapter expects.
+  parseServerUtils.isDate = value => Object.prototype.toString.call(value) === '[object Date]';
+}
 const defaultCLPS = Object.freeze({
   ACL: {
     '*': {
@@ -197,6 +202,22 @@ const releaseSQLiteHandleIncludePatch = () => {
     patchedSQLiteHandleInclude = null;
   }
 };
+const createClosedSQLiteStatement = () => ({
+  // During Parse Server shutdown some async follow-up tasks may still probe
+  // storage. Return empty results so teardown completes cleanly.
+  all() {
+    return [];
+  },
+  get() {
+    return undefined;
+  },
+  run() {
+    return {
+      changes: 0,
+      lastInsertRowid: 0
+    };
+  }
+});
 const cleanupTemporarySQLiteDirectories = () => {
   for (const directory of temporarySQLiteDirectories) {
     try {
@@ -576,6 +597,21 @@ const normalizeGeoWithinPolygonValue = polygon => {
     }))
   };
 };
+const stringifySQLiteJSONValue = value => JSON.stringify(value, (_key, currentValue) => {
+  if (currentValue === undefined) {
+    return null;
+  }
+  if (currentValue && typeof currentValue === 'object' && currentValue.__type === 'Polygon') {
+    return normalizePolygonValue(currentValue);
+  }
+  if (currentValue && typeof currentValue === 'object' && currentValue.__type === 'Date' && _Utils.default.isDate(currentValue.iso)) {
+    return {
+      ...currentValue,
+      iso: currentValue.iso.toISOString()
+    };
+  }
+  return currentValue;
+});
 const toSQLiteValue = value => {
   if (value === null || value === undefined) {
     return null;
@@ -603,17 +639,40 @@ const toSQLiteValue = value => {
       return value.objectId == null ? null : value.objectId;
     }
     if (value.__type === 'Bytes') {
-      return JSON.stringify(value);
+      return stringifySQLiteJSONValue(value);
     }
     if (value.__type === 'GeoPoint') {
-      return JSON.stringify(value);
+      return stringifySQLiteJSONValue(value);
     }
     if (value.__type === 'Polygon') {
-      return JSON.stringify(normalizePolygonValue(value));
+      return stringifySQLiteJSONValue(value);
     }
-    return JSON.stringify(value);
+    return stringifySQLiteJSONValue(value);
   }
   return value;
+};
+const getUpdateValueForSchemaInference = (fieldName, fieldValue) => {
+  if (fieldValue === null || typeof fieldValue === 'undefined') {
+    return undefined;
+  }
+  if (fieldName === 'authData') {
+    return fieldValue;
+  }
+  if (!fieldValue || typeof fieldValue !== 'object' || Array.isArray(fieldValue)) {
+    return fieldValue;
+  }
+  switch (fieldValue.__op) {
+    case 'Increment':
+      return fieldValue.amount;
+    case 'Add':
+    case 'AddUnique':
+    case 'Remove':
+      return fieldValue.objects;
+    case 'Delete':
+      return undefined;
+    default:
+      return fieldValue;
+  }
 };
 const shouldTrackExplicitNullFields = className => className !== '_SCHEMA' && !isJoinTableClass(className);
 const shouldPersistExplicitNullField = (className, fieldName) => shouldTrackExplicitNullFields(className) && !(className === '_Session' && fieldName === 'expiresAt');
@@ -632,18 +691,33 @@ const getExplicitNullFieldMatchExpression = fieldName => ({
   sql: `EXISTS (` + `SELECT 1 FROM json_each(COALESCE(${quoteColumnName(nullFieldTrackerColumn)}, '[]')) ` + `WHERE json_each.value = ?` + `)`,
   params: [fieldName]
 });
-const toSQLiteJSONObjectValue = value => {
-  if (value && typeof value === 'object' && value.__type === 'Polygon') {
-    return JSON.stringify(normalizePolygonValue(value));
-  }
-  if (value && typeof value === 'object' && value.__type === 'Date' && _Utils.default.isDate(value.iso)) {
-    return JSON.stringify({
-      ...value,
-      iso: value.iso.toISOString()
+
+const waitForNextEventLoopTurn = (() => {
+  let postMessageToNextTurn;
+  if (typeof MessageChannel === 'function') {
+    const pendingResolvers = [];
+    const { port1, port2 } = new MessageChannel();
+    port1.onmessage = () => {
+      const resolve = pendingResolvers.shift();
+      if (resolve) {
+        resolve();
+      }
+    };
+    postMessageToNextTurn = () => new Promise(resolve => {
+      pendingResolvers.push(resolve);
+      port2.postMessage(null);
+    });
+  } else {
+    postMessageToNextTurn = () => new Promise(resolve => {
+      setImmediate(resolve);
     });
   }
-  return JSON.stringify(value);
-};
+  return () => postMessageToNextTurn();
+})();
+
+const shouldYieldBeforeTopLevelSQLiteOperation = transactionalSession => !(transactionalSession && typeof transactionalSession.prepare === 'function');
+const shouldIgnoreSQLiteOperationAfterShutdown = (dbHandle, isShutDown) => !dbHandle && isShutDown;
+const toSQLiteJSONObjectValue = value => stringifySQLiteJSONValue(value);
 const sqliteValueToParseValue = (value, type) => {
   if (value === null || value === undefined) {
     return null;
@@ -729,11 +803,7 @@ const getDotFieldPathParts = fieldName => {
   };
 };
 const getJsonRootTypeExpression = expression => `(CASE WHEN ${expression} IS NOT NULL AND json_valid(${expression}) THEN json_type(${expression}) ELSE NULL END)`;
-const buildDotFieldPath = fieldName => {
-  const {
-    rootFieldName,
-    components
-  } = getDotFieldPathParts(fieldName);
+const buildJsonPathTraversalExpressions = (rootExpression, components, fieldName) => {
   let jsonPath = '$';
   let hasAmbiguousNumericSegments = false;
   for (const component of components) {
@@ -745,11 +815,8 @@ const buildDotFieldPath = fieldName => {
     validateObjectPathComponent(component, fieldName);
     jsonPath += `."${component}"`;
   }
-  const rootExpression = quoteColumnName(rootFieldName);
   if (!hasAmbiguousNumericSegments) {
     return {
-      rootFieldName,
-      components,
       hasAmbiguousNumericSegments,
       jsonPath,
       valueExpression: `json_extract(${rootExpression}, '${jsonPath}')`,
@@ -774,14 +841,35 @@ const buildDotFieldPath = fieldName => {
     typeExpression = `(CASE WHEN ${currentTypeExpression} IN ('array', 'object') ` + `THEN json_type(${currentValueExpression}, '${objectPath}') ELSE NULL END)`;
   }
   return {
-    rootFieldName,
-    components,
     hasAmbiguousNumericSegments,
     jsonPath,
     valueExpression,
     typeExpression
   };
 };
+const buildDotFieldPath = fieldName => {
+  const {
+    rootFieldName,
+    components
+  } = getDotFieldPathParts(fieldName);
+  return {
+    rootFieldName,
+    components,
+    ...buildJsonPathTraversalExpressions(quoteColumnName(rootFieldName), components, fieldName)
+  };
+};
+const buildArrayRootDotFieldPath = (fieldName, eachTableAlias = 'json_each') => {
+  const {
+    rootFieldName,
+    components
+  } = getDotFieldPathParts(fieldName);
+  return {
+    rootFieldName,
+    components,
+    ...buildJsonPathTraversalExpressions(`${eachTableAlias}.value`, components, fieldName)
+  };
+};
+const doesSQLiteFieldExistInSchema = (schemaFields, fieldName) => defaultSchemaIndexFields.has(fieldName) || fieldName === '_rperm' || fieldName === '_wperm' || Object.prototype.hasOwnProperty.call(schemaFields, fieldName);
 const handleDotFields = object => {
   Object.keys(object).forEach(fieldName => {
     if (fieldName.indexOf('.') > -1) {
@@ -1013,6 +1101,24 @@ const getArrayElementMatchExpression = (targetSql, comparisonValue) => {
     params: valueMatch.params
   };
 };
+const getArrayRootDotValueMatchExpression = (arraySourceExpression, valueExpression, comparisonValue) => {
+  const valueMatch = getJsonValueMatchExpression(valueExpression, comparisonValue);
+  return {
+    sql: `EXISTS (SELECT 1 FROM json_each(${arraySourceExpression}) WHERE ${valueMatch.sql})`,
+    params: valueMatch.params
+  };
+};
+const getArrayRootDotAnyMatchExpression = (arraySourceExpression, valueExpression, comparisonValues) => {
+  const valueMatch = getJsonValueAnyMatchExpression(valueExpression, comparisonValues);
+  return {
+    sql: `EXISTS (SELECT 1 FROM json_each(${arraySourceExpression}) WHERE ${valueMatch.sql})`,
+    params: valueMatch.params
+  };
+};
+const getArrayRootDotExistsExpression = (arraySourceExpression, typeExpression, shouldExist) => ({
+  sql: shouldExist ? `EXISTS (SELECT 1 FROM json_each(${arraySourceExpression}) WHERE ${typeExpression} IS NOT NULL)` : `NOT EXISTS (SELECT 1 FROM json_each(${arraySourceExpression}) WHERE ${typeExpression} IS NOT NULL)`,
+  params: []
+});
 const isGeoPointValue = value => value && typeof value === 'object' && !Array.isArray(value) && value.__type === 'GeoPoint' && typeof value.latitude === 'number' && typeof value.longitude === 'number';
 const getArrayAnyMatchExpression = (targetSql, comparisonValues) => {
   const eachTableName = getJSONArrayTableFunctionName(comparisonValues);
@@ -1193,6 +1299,7 @@ class SQLiteStorageAdapter {
     this._resolvedTableNames = new Map();
     this._temporaryDirectory = null;
     this._usesSharedMemoryDatabase = false;
+    this._isShutDown = false;
     const dbOptions = (0, _SQLiteConfigParser.getDatabaseOptionsFromURI)(this._uri);
     Object.assign(dbOptions, databaseOptions);
     if (dbOptions.cacheSizeKb == null && options.cacheSizeKb != null) {
@@ -1213,6 +1320,12 @@ class SQLiteStorageAdapter {
     if (dbOverride) {
       return db.prepare(sql);
     }
+    if (!db) {
+      if (this._isShutDown) {
+        return createClosedSQLiteStatement();
+      }
+      throw new Error('SQLite database handle is not available');
+    }
     let stmt = this._stmtCache.get(sql);
     if (!stmt) {
       stmt = db.prepare(sql);
@@ -1232,6 +1345,7 @@ class SQLiteStorageAdapter {
     return null;
   }
   async handleShutdown() {
+    this._isShutDown = true;
     if (this._db) {
       try {
         this._db.close();
@@ -1244,6 +1358,7 @@ class SQLiteStorageAdapter {
     this._existingClasses.clear();
     this._nullFieldTrackerReadyClasses.clear();
     this._schemaCache.clear();
+    this._resolvedTableNames.clear();
     this._onSchemaChange = () => {};
     if (this._temporaryDirectory) {
       temporarySQLiteDirectories.delete(this._temporaryDirectory);
@@ -1316,7 +1431,7 @@ class SQLiteStorageAdapter {
     const db = dbOverride || this._db;
     return !!this._prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = ?", db).get(rawTableName);
   }
-  _rawTableName(className) {
+  _rawTableName(className, dbOverride) {
     if (className === '_SCHEMA') {
       return '_SCHEMA';
     }
@@ -1467,19 +1582,28 @@ class SQLiteStorageAdapter {
       }
       if (key.indexOf('.') >= 0) {
         const rootKey = key.split('.')[0];
+        const rootFieldType = fields[rootKey] || cachedSchema.fields[rootKey] || getImplicitHiddenUserFieldSchema(className, rootKey);
         if (!existingCols.has(rootKey)) {
+          if (row[key] === null && !rootFieldType) {
+            continue;
+          }
           db.exec(`ALTER TABLE ${tableName} ADD COLUMN "${rootKey.replace(/"/g, '""')}" TEXT`);
           existingCols.add(rootKey);
-          cachedSchema.fields[rootKey] = {
-            type: 'Object'
-          };
-          this._schemaCache.set(className, cachedSchema);
-          schemaChanged = true;
+          if (!rootFieldType) {
+            cachedSchema.fields[rootKey] = {
+              type: 'Object'
+            };
+            this._schemaCache.set(className, cachedSchema);
+            schemaChanged = true;
+          }
         }
         continue;
       }
       let fieldType = fields[key] || cachedSchema.fields[key] || getImplicitHiddenUserFieldSchema(className, key);
       if (!fieldType) {
+        if (row[key] === null) {
+          continue;
+        }
         fieldType = inferFieldType(key, row[key]);
         cachedSchema.fields[key] = fieldType;
         this._schemaCache.set(className, cachedSchema);
@@ -1912,9 +2036,12 @@ class SQLiteStorageAdapter {
     });
     Object.keys(copy).forEach(key => {
       const val = copy[key];
+      if (typeof val === 'undefined') {
+        return;
+      }
       const sqliteValue = toSQLiteValue(val);
       row[key] = sqliteValue;
-      if (sqliteValue === null && shouldPersistExplicitNullField(className, key)) {
+      if (val === null && sqliteValue === null && shouldPersistExplicitNullField(className, key)) {
         explicitNullFields.add(key);
       }
     });
@@ -2012,6 +2139,21 @@ class SQLiteStorageAdapter {
       }
       object[key] = sqliteValueToParseValue(val, fieldSchema);
     });
+
+    // Explicit nulls may be tracked without a backing SQLite column when Parse
+    // accepted a null write before the field had any concrete schema type.
+    explicitNullFields.forEach(fieldName => {
+      if (fieldName in object) {
+        return;
+      }
+      if (fieldName === 'createdAt' || fieldName === 'updatedAt' || fieldName === '_created_at' || fieldName === '_updated_at') {
+        return;
+      }
+      if (className === '_User' && (hiddenUserSchemaFields.has(fieldName) || fieldName === 'authData')) {
+        return;
+      }
+      object[fieldName] = null;
+    });
     if (fields) {
       Object.keys(fields).forEach(key => {
         if (fields[key].type === 'Relation' && !object[key]) {
@@ -2025,18 +2167,40 @@ class SQLiteStorageAdapter {
     return object;
   }
   async createObject(className, schema, object, transactionalSession) {
+    // `better-sqlite3` completes adapter work synchronously in-process. A
+    // single top-level hop keeps request scheduling closer to Mongo/Postgres,
+    // which avoids SQLite-only timing skew in triggers and background tasks.
+    if (shouldYieldBeforeTopLevelSQLiteOperation(transactionalSession)) {
+      await waitForNextEventLoopTurn();
+    }
+
     const db = transactionalSession || this._db;
+    if (shouldIgnoreSQLiteOperationAfterShutdown(db, this._isShutDown)) {
+      return {
+        ops: [object]
+      };
+    }
     await this._ensureClassExists(className, schema, db);
     const row = this._parseObjectToSQLiteRow(className, object);
     await this._ensureColumnsExist(className, row, schema, db);
+    const existingTableColumns = new Set(this._getTableColumns(className, db));
     if (className === '_Idempotency') {
       this._deleteExpiredIdempotencyRecords(db);
     }
-    const cols = Object.keys(row).map(quoteColumnName);
-    const placeholders = Object.keys(row).map(() => '?');
-    const values = Object.keys(row).map(k => row[k]);
+    const persistedRow = {};
+    Object.keys(row).forEach(key => {
+      if (key === nullFieldTrackerColumn || row[key] !== null || existingTableColumns.has(key)) {
+        persistedRow[key] = row[key];
+      }
+    });
+    const cols = Object.keys(persistedRow).map(quoteColumnName);
+    const placeholders = Object.keys(persistedRow).map(() => '?');
+    const values = Object.keys(persistedRow).map(k => persistedRow[k]);
     const stmtSql = `INSERT INTO ${this._tableName(className)} (${cols.join(', ')}) VALUES (${placeholders.join(', ')})`;
     try {
+      if (shouldYieldBeforeTopLevelSQLiteOperation(transactionalSession)) {
+        await waitForNextEventLoopTurn();
+      }
       this._prepare(stmtSql, transactionalSession).run(...values);
     } catch (err) {
       throw this._transformDuplicateKeyError(err, className);
@@ -2122,22 +2286,30 @@ class SQLiteStorageAdapter {
         }
       }
       const dotFieldPath = isDotNotation ? buildDotFieldPath(key) : null;
+      const dotFieldRootExists = dotFieldPath && doesSQLiteFieldExistInSchema(schemaFields, dotFieldPath.rootFieldName);
+      const dotFieldUsesRootArrayTraversal = dotFieldPath && dotFieldRootExists && schemaFields[dotFieldPath.rootFieldName] && schemaFields[dotFieldPath.rootFieldName].type === 'Array' && dotFieldPath.components.length > 0 && !isNumericArrayIndexComponent(dotFieldPath.components[0]);
+      const dotFieldArrayPath = dotFieldUsesRootArrayTraversal ? buildArrayRootDotFieldPath(key) : null;
+      const dotFieldArraySourceSql = dotFieldArrayPath ? quoteColumnName(dotFieldArrayPath.rootFieldName) : null;
       let targetSql;
       if (authDataMatch) {
         targetSql = `json_extract("authData", '$.${authDataMatch[1]}')`;
       } else if (isDotNotation) {
-        targetSql = dotFieldPath.valueExpression;
+        targetSql = dotFieldArrayPath ? dotFieldArrayPath.valueExpression : dotFieldRootExists ? dotFieldPath.valueExpression : 'NULL';
       } else {
         validateFieldName(normalizedKey);
-        const fieldExistsInSchema = defaultSchemaIndexFields.has(normalizedKey) || normalizedKey === '_rperm' || normalizedKey === '_wperm' || Object.prototype.hasOwnProperty.call(schemaFields, normalizedKey);
+        const fieldExistsInSchema = doesSQLiteFieldExistInSchema(schemaFields, normalizedKey);
         targetSql = fieldExistsInSchema ? quoteColumnName(normalizedKey) : 'NULL';
       }
-      const dotFieldTypeSql = dotFieldPath ? dotFieldPath.typeExpression : null;
+      const dotFieldTypeSql = dotFieldArrayPath ? dotFieldArrayPath.typeExpression : dotFieldPath && dotFieldRootExists ? dotFieldPath.typeExpression : null;
       const usesCaseInsensitiveComparison = caseInsensitive && !authDataMatch && !isDotNotation && (normalizedKey === 'username' || normalizedKey === 'email');
       const isArrayField = normalizedKey === '_rperm' || normalizedKey === '_wperm' || schemaFields[normalizedKey] && schemaFields[normalizedKey].type === 'Array';
       const explicitNullFieldMatch = shouldTrackExplicitNullFields(className) && !authDataMatch && !isDotNotation ? getExplicitNullFieldMatchExpression(normalizedKey) : null;
       if (val === null || val === undefined) {
-        conditions.push(`${targetSql} IS NULL`);
+        if (dotFieldArraySourceSql) {
+          conditions.push(`EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${targetSql} IS NULL)`);
+        } else {
+          conditions.push(`${targetSql} IS NULL`);
+        }
         continue;
       }
       if (isQueryOperatorObject(val)) {
@@ -2146,11 +2318,19 @@ class SQLiteStorageAdapter {
           const opVal = val[op];
           if (op === '$eq') {
             if (opVal === null) {
-              conditions.push(`${targetSql} IS NULL`);
+              if (dotFieldArraySourceSql) {
+                conditions.push(`EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${targetSql} IS NULL)`);
+              } else {
+                conditions.push(`${targetSql} IS NULL`);
+              }
             } else if (isArrayField) {
               const elementMatch = getArrayElementMatchExpression(targetSql, opVal);
               conditions.push(elementMatch.sql);
               params.push(...elementMatch.params);
+            } else if (dotFieldArraySourceSql) {
+              const valueMatch = getArrayRootDotValueMatchExpression(dotFieldArraySourceSql, targetSql, opVal);
+              conditions.push(`(${valueMatch.sql})`);
+              params.push(...valueMatch.params);
             } else if (usesCaseInsensitiveComparison && typeof opVal === 'string') {
               conditions.push(`(LOWER(${targetSql}) = LOWER(?))`);
               params.push(opVal);
@@ -2161,11 +2341,21 @@ class SQLiteStorageAdapter {
             }
           } else if (op === '$ne') {
             if (opVal === null) {
-              conditions.push(`${targetSql} IS NOT NULL`);
+              if (dotFieldArraySourceSql) {
+                const existsMatch = getArrayRootDotExistsExpression(dotFieldArraySourceSql, dotFieldTypeSql, true);
+                conditions.push(existsMatch.sql);
+                params.push(...existsMatch.params);
+              } else {
+                conditions.push(`${targetSql} IS NOT NULL`);
+              }
             } else if (isArrayField) {
               const elementMatch = getArrayElementMatchExpression(targetSql, opVal);
               conditions.push(`(${targetSql} IS NULL OR NOT (${elementMatch.sql}))`);
               params.push(...elementMatch.params);
+            } else if (dotFieldArraySourceSql) {
+              const valueMatch = getArrayRootDotValueMatchExpression(dotFieldArraySourceSql, targetSql, opVal);
+              conditions.push(`NOT (${valueMatch.sql})`);
+              params.push(...valueMatch.params);
             } else if (usesCaseInsensitiveComparison && typeof opVal === 'string') {
               conditions.push(`(${targetSql} IS NULL OR LOWER(${targetSql}) != LOWER(?))`);
               params.push(opVal);
@@ -2175,16 +2365,32 @@ class SQLiteStorageAdapter {
               params.push(...valueMatch.params);
             }
           } else if (op === '$lt') {
-            conditions.push(`${targetSql} < ?`);
+            if (dotFieldArraySourceSql) {
+              conditions.push(`EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${targetSql} < ?)`);
+            } else {
+              conditions.push(`${targetSql} < ?`);
+            }
             params.push(toSQLiteValue(opVal));
           } else if (op === '$lte') {
-            conditions.push(`${targetSql} <= ?`);
+            if (dotFieldArraySourceSql) {
+              conditions.push(`EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${targetSql} <= ?)`);
+            } else {
+              conditions.push(`${targetSql} <= ?`);
+            }
             params.push(toSQLiteValue(opVal));
           } else if (op === '$gt') {
-            conditions.push(`${targetSql} > ?`);
+            if (dotFieldArraySourceSql) {
+              conditions.push(`EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${targetSql} > ?)`);
+            } else {
+              conditions.push(`${targetSql} > ?`);
+            }
             params.push(toSQLiteValue(opVal));
           } else if (op === '$gte') {
-            conditions.push(`${targetSql} >= ?`);
+            if (dotFieldArraySourceSql) {
+              conditions.push(`EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${targetSql} >= ?)`);
+            } else {
+              conditions.push(`${targetSql} >= ?`);
+            }
             params.push(toSQLiteValue(opVal));
           } else if (op === '$in') {
             if (!Array.isArray(opVal)) {
@@ -2205,6 +2411,20 @@ class SQLiteStorageAdapter {
                   params.push(...anyMatch.params);
                 } else if (hasNull) {
                   conditions.push(`${targetSql} IS NULL`);
+                } else {
+                  conditions.push('1 = 0');
+                }
+              } else if (dotFieldArraySourceSql) {
+                if (nonNulls.length > 0) {
+                  const anyMatch = getArrayRootDotAnyMatchExpression(dotFieldArraySourceSql, targetSql, nonNulls);
+                  if (hasNull) {
+                    conditions.push(`(${anyMatch.sql} OR EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${targetSql} IS NULL))`);
+                  } else {
+                    conditions.push(`(${anyMatch.sql})`);
+                  }
+                  params.push(...anyMatch.params);
+                } else if (hasNull) {
+                  conditions.push(`EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${targetSql} IS NULL)`);
                 } else {
                   conditions.push('1 = 0');
                 }
@@ -2263,6 +2483,22 @@ class SQLiteStorageAdapter {
                 } else if (hasNull) {
                   conditions.push(`${targetSql} IS NOT NULL`);
                 }
+              } else if (dotFieldArraySourceSql) {
+                if (nonNulls.length > 0) {
+                  const anyMatch = getArrayRootDotAnyMatchExpression(dotFieldArraySourceSql, targetSql, nonNulls);
+                  if (hasNull) {
+                    const existsMatch = getArrayRootDotExistsExpression(dotFieldArraySourceSql, dotFieldTypeSql, true);
+                    conditions.push(`(${existsMatch.sql} AND NOT (${anyMatch.sql}))`);
+                    params.push(...existsMatch.params, ...anyMatch.params);
+                  } else {
+                    conditions.push(`NOT (${anyMatch.sql})`);
+                    params.push(...anyMatch.params);
+                  }
+                } else if (hasNull) {
+                  const existsMatch = getArrayRootDotExistsExpression(dotFieldArraySourceSql, dotFieldTypeSql, true);
+                  conditions.push(existsMatch.sql);
+                  params.push(...existsMatch.params);
+                }
               } else if (dotFieldTypeSql) {
                 if (nonNulls.length > 0) {
                   const scalarMatch = getScalarAnyMatchExpression(targetSql, nonNulls);
@@ -2294,14 +2530,22 @@ class SQLiteStorageAdapter {
             }
           } else if (op === '$exists') {
             if (opVal) {
-              if (explicitNullFieldMatch) {
+              if (dotFieldArraySourceSql) {
+                const existsMatch = getArrayRootDotExistsExpression(dotFieldArraySourceSql, dotFieldTypeSql, true);
+                conditions.push(existsMatch.sql);
+                params.push(...existsMatch.params);
+              } else if (explicitNullFieldMatch) {
                 conditions.push(`(${targetSql} IS NOT NULL OR ${explicitNullFieldMatch.sql})`);
                 params.push(...explicitNullFieldMatch.params);
               } else {
                 conditions.push(`${targetSql} IS NOT NULL`);
               }
             } else {
-              if (explicitNullFieldMatch) {
+              if (dotFieldArraySourceSql) {
+                const existsMatch = getArrayRootDotExistsExpression(dotFieldArraySourceSql, dotFieldTypeSql, false);
+                conditions.push(existsMatch.sql);
+                params.push(...existsMatch.params);
+              } else if (explicitNullFieldMatch) {
                 conditions.push(`(${targetSql} IS NULL AND NOT ${explicitNullFieldMatch.sql})`);
                 params.push(...explicitNullFieldMatch.params);
               } else {
@@ -2320,6 +2564,17 @@ class SQLiteStorageAdapter {
                 params.push(normalizedRegex.pattern, normalizedRegex.flags);
               } else {
                 conditions.push(`EXISTS (SELECT 1 FROM json_each(${targetSql}) WHERE value REGEXP ?)`);
+                params.push(normalizedRegex.pattern);
+              }
+            } else if (dotFieldArraySourceSql) {
+              if (regexMatch) {
+                conditions.push(`EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${regexMatch.sql})`);
+                params.push(...regexMatch.params);
+              } else if (normalizedRegex.flags) {
+                conditions.push(`EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE regexp_flags(?, ?, ${targetSql}) = 1)`);
+                params.push(normalizedRegex.pattern, normalizedRegex.flags);
+              } else {
+                conditions.push(`EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${targetSql} REGEXP ?)`);
                 params.push(normalizedRegex.pattern);
               }
             } else {
@@ -2478,6 +2733,10 @@ class SQLiteStorageAdapter {
           const elementMatch = getArrayElementMatchExpression(targetSql, val);
           conditions.push(elementMatch.sql);
           params.push(...elementMatch.params);
+        } else if (dotFieldArraySourceSql) {
+          const valueMatch = getArrayRootDotValueMatchExpression(dotFieldArraySourceSql, targetSql, val);
+          conditions.push(valueMatch.sql);
+          params.push(...valueMatch.params);
         } else if (usesCaseInsensitiveComparison && typeof val === 'string') {
           conditions.push(`(LOWER(${targetSql}) = LOWER(?))`);
           params.push(val);
@@ -2502,6 +2761,11 @@ class SQLiteStorageAdapter {
     keys,
     caseInsensitive
   } = {}, transactionalSession) {
+    // See `createObject()` for why top-level adapter entrypoints yield once.
+    if (shouldYieldBeforeTopLevelSQLiteOperation(transactionalSession)) {
+      await waitForNextEventLoopTurn();
+    }
+
     schema = normalizeSQLiteSchema(className, schema);
     const db = transactionalSession || this._db;
     const textSearch = parseTextSearch(query);
@@ -2600,8 +2864,14 @@ class SQLiteStorageAdapter {
     const rows = this._prepare(sql, db).all(...queryParams, ...where.orderByParams);
     return rows.map(row => this._sqliteRowToParseObject(className, row, schema));
   }
-  async count(className, schema, query) {
-    if (!(await this.classExists(className))) {
+  async count(className, schema, query, transactionalSession) {
+    if (shouldYieldBeforeTopLevelSQLiteOperation(transactionalSession)) {
+      await waitForNextEventLoopTurn();
+    }
+
+    const db = transactionalSession && typeof transactionalSession.prepare === 'function' ? transactionalSession : this._db;
+
+    if (!(await this.classExists(className, db))) {
       return 0;
     }
     const tableName = this._tableName(className);
@@ -2610,17 +2880,23 @@ class SQLiteStorageAdapter {
     if (where.sql) {
       sql += ` WHERE ${where.sql}`;
     }
-    const row = this._prepare(sql).get(...where.params);
+    const row = this._prepare(sql, db).get(...where.params);
     return row ? row.count : 0;
   }
-  async distinct(className, schema, query, fieldName) {
-    if (!(await this.classExists(className))) {
+  async distinct(className, schema, query, fieldName, transactionalSession) {
+    if (shouldYieldBeforeTopLevelSQLiteOperation(transactionalSession)) {
+      await waitForNextEventLoopTurn();
+    }
+
+    const db = transactionalSession && typeof transactionalSession.prepare === 'function' ? transactionalSession : this._db;
+
+    if (!(await this.classExists(className, db))) {
       return [];
     }
     const rootFieldName = fieldName.indexOf('.') >= 0 ? fieldName.split('.')[0] : fieldName;
     validateFieldName(rootFieldName);
     schema = normalizeSQLiteSchema(className, schema);
-    const columns = this._getTableColumns(className);
+    const columns = this._getTableColumns(className, db);
     if (!['objectId', 'createdAt', 'updatedAt'].includes(rootFieldName) && !columns.includes(rootFieldName)) {
       return [];
     }
@@ -2634,7 +2910,7 @@ class SQLiteStorageAdapter {
       } else {
         sql += ` WHERE json_each.value IS NOT NULL`;
       }
-      const rows = this._prepare(sql).all(...where.params);
+      const rows = this._prepare(sql, db).all(...where.params);
       return rows.map(row => parseJSONValue(row.val));
     }
     const targetSql = fieldName.indexOf('.') >= 0 ? transformDotField(fieldName) : quoteColumnName(fieldName);
@@ -2644,7 +2920,7 @@ class SQLiteStorageAdapter {
     } else {
       sql += ` WHERE ${targetSql} IS NOT NULL`;
     }
-    const rows = this._prepare(sql).all(...where.params);
+    const rows = this._prepare(sql, db).all(...where.params);
     if (fieldSchema && fieldSchema.type === 'Pointer') {
       return rows.filter(row => row.val !== null && row.val !== undefined).map(row => ({
         __type: 'Pointer',
@@ -3649,7 +3925,14 @@ class SQLiteStorageAdapter {
     }));
   }
   async deleteObjectsByQuery(className, schema, query, transactionalSession) {
+    if (shouldYieldBeforeTopLevelSQLiteOperation(transactionalSession)) {
+      await waitForNextEventLoopTurn();
+    }
+
     const db = transactionalSession || this._db;
+    if (shouldIgnoreSQLiteOperationAfterShutdown(db, this._isShutDown)) {
+      return;
+    }
     if (!(await this.classExists(className, db))) {
       return;
     }
@@ -3659,13 +3942,23 @@ class SQLiteStorageAdapter {
     if (where.sql) {
       sql += ` WHERE ${where.sql}`;
     }
+    if (shouldYieldBeforeTopLevelSQLiteOperation(transactionalSession)) {
+      await waitForNextEventLoopTurn();
+    }
     const result = this._prepare(sql, transactionalSession).run(...where.params);
     if (!result || result.changes === 0) {
       throw new _node.default.Error(_node.default.Error.OBJECT_NOT_FOUND, 'Object not found.');
     }
   }
   async updateObjectsByQuery(className, schema, query, update, transactionalSession) {
+    if (shouldYieldBeforeTopLevelSQLiteOperation(transactionalSession)) {
+      await waitForNextEventLoopTurn();
+    }
+
     const db = transactionalSession || this._db;
+    if (shouldIgnoreSQLiteOperationAfterShutdown(db, this._isShutDown)) {
+      return [];
+    }
     if (!(await this.classExists(className, db))) {
       return [];
     }
@@ -3701,13 +3994,13 @@ class SQLiteStorageAdapter {
     normalizeAuthDataUpdateObject(update.$add);
     normalizeAuthDataUpdateObject(update.$addUnique);
     normalizeAuthDataUpdateObject(update.$remove);
+    const tableName = this._tableName(className);
 
     // Keep the initial read only for Mongo-compatible update return semantics.
     const existing = await this.find(className, schema, query, {}, db);
     if (!existing || existing.length === 0) {
       return [];
     }
-    const tableName = this._tableName(className);
     const where = this._buildWhereClause(className, schema, query);
     const setClauses = [];
     const params = [];
@@ -3718,6 +4011,7 @@ class SQLiteStorageAdapter {
       ...(cachedSchema && cachedSchema.fields || {}),
       ...(schema && schema.fields || {})
     };
+    const existingTableColumns = new Set(this._getTableColumns(className, db));
     const appendNullFieldTrackerUpdate = (fieldName, trackExplicitNull) => {
       if (!fieldName || fieldName === nullFieldTrackerColumn) {
         return;
@@ -3763,15 +4057,25 @@ class SQLiteStorageAdapter {
       const isDotNotationField = fieldName.indexOf('.') >= 0;
       const dotFieldPath = isDotNotationField ? buildDotFieldPath(fieldName) : null;
       const columnName = quoteColumnName(dotFieldPath ? dotFieldPath.rootFieldName : fieldName);
-      await this._ensureColumnsExist(className, {
-        [fieldName]: fieldValue
-      }, schema, db);
+      const storageFieldName = dotFieldPath ? dotFieldPath.rootFieldName : fieldName;
+      const schemaInferenceValue = getUpdateValueForSchemaInference(fieldName, fieldValue);
+      if (typeof schemaInferenceValue !== 'undefined') {
+        await this._ensureColumnsExist(className, {
+          [fieldName]: schemaInferenceValue
+        }, schema, db);
+        existingTableColumns.add(storageFieldName);
+      }
       if (fieldValue === null) {
         if (dotFieldPath) {
+          if (!existingTableColumns.has(storageFieldName)) {
+            return;
+          }
           appendNestedFieldUpdate(dotFieldPath, null);
         } else {
           validateFieldName(fieldName);
-          setClauses.push(`${columnName} = NULL`);
+          if (existingTableColumns.has(storageFieldName)) {
+            setClauses.push(`${columnName} = NULL`);
+          }
           appendNullFieldTrackerUpdate(fieldName, true);
         }
         return;
@@ -3825,6 +4129,9 @@ class SQLiteStorageAdapter {
           return;
         }
         if (fieldValue.__op === 'Delete') {
+          if (!existingTableColumns.has(storageFieldName)) {
+            return;
+          }
           if (dotFieldPath) {
             appendNestedFieldUpdate(dotFieldPath, fieldValue);
           } else {
@@ -3892,10 +4199,17 @@ class SQLiteStorageAdapter {
     if (update.$unset) {
       for (const k of Object.keys(update.$unset)) {
         if (k.indexOf('.') >= 0) {
-          appendNestedFieldUpdate(buildDotFieldPath(k), {
+          const dotFieldPath = buildDotFieldPath(k);
+          if (!existingTableColumns.has(dotFieldPath.rootFieldName)) {
+            continue;
+          }
+          appendNestedFieldUpdate(dotFieldPath, {
             __op: 'Delete'
           });
         } else {
+          if (!existingTableColumns.has(k)) {
+            continue;
+          }
           validateFieldName(k);
           setClauses.push(`${quoteColumnName(k)} = NULL`);
           appendNullFieldTrackerUpdate(k, false);
@@ -3946,6 +4260,9 @@ class SQLiteStorageAdapter {
       }
       params.push(...where.params);
       try {
+        if (shouldYieldBeforeTopLevelSQLiteOperation(transactionalSession)) {
+          await waitForNextEventLoopTurn();
+        }
         this._prepare(sql, transactionalSession).run(...params);
       } catch (err) {
         throw this._transformDuplicateKeyError(err, className);

@@ -1478,3 +1478,30 @@
 - Intentionally not “fixed” from the audit:
   - the broader regex ReDoS concern is real in principle, but a safe fix is not the same thing as sprinkling heuristics over JavaScript `RegExp`; it needs an explicit compatibility/security policy rather than an ad-hoc partial blocklist
   - full SQLite URI-filename semantics beyond adapter-owned options are still intentionally not claimed; `better-sqlite3` does not enable SQLite URI mode by default, so this adapter now normalizes ordinary `file:` paths instead of pretending the raw URI string is natively supported
+
+## 2026-07-07 External Validation Summary
+
+### Why The Real-App Run Mattered
+- I validated the standalone SQLite adapter against a separate real Parse Server application instead of relying only on parse-server's own suite.
+- That integration run exposed several adapter mismatches that the public parse-server tests had not hit yet.
+
+### Adapter Bugs Found Through Real-App Validation
+- Root update-op schema inference on missing fields was wrong:
+  - root-field update ops must infer semantic field types from the op itself rather than from the raw `{ __op: ... }` payload
+  - delete/unset of nonexistent root columns must stay a no-op
+- Dotted queries on missing root JSON columns were compiling to invalid SQL instead of behaving like a nullish/no-match field.
+- Dotted queries through arrays of objects needed Parse/Mongo-style semantics rather than a naive `json_extract(...)` path.
+- Nested `undefined` keys inside stored JSON payloads needed to survive as explicit `null` values instead of being dropped.
+- Top-level exact-id validation reads were too synchronous relative to Mongo/Postgres, which changed trigger interleaving in a concurrency-sensitive path.
+- The first async-yield parity fix used `setImmediate(...)`, which then deadlocked under fake timers; that yield needed a `MessageChannel`-based hop instead.
+- Late shutdown background reads/writes still needed extra guarding so torn-down DB handles do not crash teardown paths.
+
+### Real-App Harness Learnings
+- The consuming application's SQLite test mode needed a few adapter-adjacent compatibility adjustments to emulate its normal Parse environment correctly:
+  - normalize legacy raw `_p_*` pointer values in the SQLite test shim
+  - preserve file-storage parity separately from object-storage parity
+  - clear one stale in-memory cache across DB resets
+- Those application-specific harness details are documented with the consuming application and omitted here.
+
+### Result
+- After the adapter fixes above, the external application's full SQLite suite passed in a fresh rerun.
