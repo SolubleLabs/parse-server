@@ -1069,4 +1069,52 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
     const exists = await adapter.classExists('InjectionClass');
     expect(exists).toBe(true);
   });
+
+  it('rejects regular expressions with unsafe repeated groups to prevent ReDoS', async () => {
+    const schema = {
+      className: 'ReDoSTest',
+      fields: {
+        objectId: { type: 'String' },
+        field: { type: 'String' },
+      },
+    };
+    await adapter.createClass('ReDoSTest', schema);
+    await adapter.createObject('ReDoSTest', schema, {
+      objectId: 'redo1',
+      field: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaac',
+    });
+
+    for (const pattern of ['(a+)+b', '(a|aa)+b']) {
+      try {
+        await adapter.find('ReDoSTest', schema, {
+          field: { $regex: pattern },
+        });
+        fail(`should have thrown an error for ${pattern}`);
+      } catch (error) {
+        expect(error.code).toBe(Parse.Error.INVALID_QUERY);
+        expect(error.message).toBe('Invalid regular expression');
+      }
+    }
+  });
+
+  it('allows safe regular expressions to execute natively', async () => {
+    const schema = {
+      className: 'SafeRegexTest',
+      fields: {
+        objectId: { type: 'String' },
+        field: { type: 'String' },
+      },
+    };
+    await adapter.createClass('SafeRegexTest', schema);
+    await adapter.createObject('SafeRegexTest', schema, {
+      objectId: 'redo2',
+      field: 'foo_123',
+    });
+
+    const results = await adapter.find('SafeRegexTest', schema, {
+      field: { $regex: '^[a-z]+_[0-9]+$' },
+    });
+    expect(results.length).toBe(1);
+    expect(results[0].objectId).toBe('redo2');
+  });
 });

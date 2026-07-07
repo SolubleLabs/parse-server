@@ -1518,18 +1518,18 @@ const getScalarAnyMatchExpression = (
 };
 
 const validateRegexPattern = (pattern: string, flags: string): { pattern: string, flags: string } => {
-  const normalizedRegex = normalizeRegexPattern(pattern, flags);
   try {
+    const normalizedRegex = normalizeRegexPattern(pattern, flags);
     new RegExp(normalizedRegex.pattern, normalizedRegex.flags);
+    return normalizedRegex;
   } catch (error) {
     throw createSanitizedError(
-      Parse.Error.INTERNAL_SERVER_ERROR,
+      Parse.Error.INVALID_QUERY,
       `Invalid regular expression: ${error.message}`,
       undefined,
-      'An internal server error occurred'
+      'Invalid regular expression'
     );
   }
-  return normalizedRegex;
 };
 
 const escapeSQLiteLikePattern = (literal: string): string =>

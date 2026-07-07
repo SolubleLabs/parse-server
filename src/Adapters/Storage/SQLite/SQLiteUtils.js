@@ -81,6 +81,69 @@ const processRegexPattern = (pattern: string) => {
   return literalizeRegexPart(pattern);
 };
 
+const isRegexQuantifierStart = (pattern: string, index: number): boolean => {
+  const char = pattern[index];
+  return (
+    char === '*' ||
+    char === '+' ||
+    char === '{' ||
+    (char === '?' && index > 0 && pattern[index - 1] !== '(')
+  );
+};
+
+const hasPotentiallyUnsafeRegexBacktracking = (pattern: string): boolean => {
+  const stack = [];
+  let inCharClass = false;
+  for (let i = 0; i < pattern.length; i++) {
+    const char = pattern[i];
+    if (char === '\\') {
+      i++; // skip next char
+      continue;
+    }
+    if (char === '[') {
+      inCharClass = true;
+      continue;
+    }
+    if (char === ']') {
+      inCharClass = false;
+      continue;
+    }
+    if (inCharClass) {
+      continue;
+    }
+
+    if (char === '(') {
+      if (pattern[i + 1] === '?' && pattern[i + 2] !== ':') {
+        return true;
+      }
+      stack.push({ hasQuantifier: false, hasAlternation: false });
+    } else if (char === '|') {
+      if (stack.length > 0) {
+        stack[stack.length - 1].hasAlternation = true;
+      }
+    } else if (char === ')') {
+      const top = stack.pop();
+      if (top) {
+        const isQuantified = isRegexQuantifierStart(pattern, i + 1);
+        if (isQuantified && (top.hasQuantifier || top.hasAlternation)) {
+          return true;
+        }
+        if (stack.length > 0) {
+          stack[stack.length - 1].hasAlternation =
+            stack[stack.length - 1].hasAlternation || top.hasAlternation;
+          stack[stack.length - 1].hasQuantifier =
+            stack[stack.length - 1].hasQuantifier || top.hasQuantifier || isQuantified;
+        }
+      }
+    } else if (isRegexQuantifierStart(pattern, i)) {
+      if (stack.length > 0) {
+        stack[stack.length - 1].hasQuantifier = true;
+      }
+    }
+  }
+  return false;
+};
+
 const normalizeRegexPattern = (
   pattern: string,
   flags?: string
@@ -92,6 +155,9 @@ const normalizeRegexPattern = (
     normalizedFlags = normalizedFlags.replace(/x/g, '');
   }
   normalizedPattern = processRegexPattern(normalizedPattern);
+  if (hasPotentiallyUnsafeRegexBacktracking(normalizedPattern)) {
+    throw new Error('Unsupported potentially unsafe regular expression construct');
+  }
   return {
     pattern: normalizedPattern,
     flags: normalizedFlags,

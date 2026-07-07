@@ -188,6 +188,18 @@ function createClient(options: Object) {
   // Keep the default cache modest for small Parse installs; callers can raise it.
   db.pragma(`cache_size = -${cacheSizeKb}`);
   db.pragma('foreign_keys = ON');
+  // Reuse compiled regexes for a query's repeated row-level UDF calls.
+  const compiledRegexCache = new Map();
+  const getCompiledRegex = (pattern: string, flags?: string) => {
+    const normalizedRegex = normalizeRegexPattern(String(pattern), flags ? String(flags) : '');
+    const cacheKey = `${normalizedRegex.flags}\u0000${normalizedRegex.pattern}`;
+    let compiledRegex = compiledRegexCache.get(cacheKey);
+    if (!compiledRegex) {
+      compiledRegex = new RegExp(normalizedRegex.pattern, normalizedRegex.flags);
+      compiledRegexCache.set(cacheKey, compiledRegex);
+    }
+    return compiledRegex;
+  };
 
   // Register REGEXP function for SQLite `REGEXP` operator
   db.function('regexp', { deterministic: true }, (pattern, text) => {
@@ -195,9 +207,7 @@ function createClient(options: Object) {
       return 0;
     }
     try {
-      const normalizedRegex = normalizeRegexPattern(String(pattern));
-      const re = new RegExp(normalizedRegex.pattern);
-      return re.test(String(text)) ? 1 : 0;
+      return getCompiledRegex(pattern).test(String(text)) ? 1 : 0;
     } catch {
       return 0;
     }
@@ -209,9 +219,7 @@ function createClient(options: Object) {
       return 0;
     }
     try {
-      const normalizedRegex = normalizeRegexPattern(String(pattern), flags ? String(flags) : '');
-      const re = new RegExp(normalizedRegex.pattern, normalizedRegex.flags);
-      return re.test(String(text)) ? 1 : 0;
+      return getCompiledRegex(pattern, flags).test(String(text)) ? 1 : 0;
     } catch {
       return 0;
     }

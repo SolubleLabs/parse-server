@@ -1230,13 +1230,13 @@ const getScalarAnyMatchExpression = (targetSql, comparisonValues) => {
   };
 };
 const validateRegexPattern = (pattern, flags) => {
-  const normalizedRegex = normalizeRegexPattern(pattern, flags);
   try {
+    const normalizedRegex = normalizeRegexPattern(pattern, flags);
     new RegExp(normalizedRegex.pattern, normalizedRegex.flags);
+    return normalizedRegex;
   } catch (error) {
-    throw (0, _Error.createSanitizedError)(_node.default.Error.INTERNAL_SERVER_ERROR, `Invalid regular expression: ${error.message}`, undefined, 'An internal server error occurred');
+    throw (0, _Error.createSanitizedError)(_node.default.Error.INVALID_QUERY, `Invalid regular expression: ${error.message}`, undefined, 'Invalid regular expression');
   }
-  return normalizedRegex;
 };
 const escapeSQLiteLikePattern = literal => literal.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
 const escapeSQLiteGlobPattern = literal => literal.replace(/\[/g, '[[]').replace(/\*/g, '[*]').replace(/\?/g, '[?]');

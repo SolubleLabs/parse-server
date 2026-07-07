@@ -1580,3 +1580,24 @@
   - the current `MessageChannel` hop costs about `0.0037 ms/op` on this benchmark, roughly `15.3%` relative to the no-yield direct path
   - the older repeated-schema-probe behavior is still much worse: about `0.0180 ms/op` slower than current, roughly `64.1%` slower
   - so the remaining parity yield is now materially smaller than the old adapter-specific schema-probe tax it replaced
+
+## 2026-07-08 SQLite Regex Safety Follow-Up
+
+### Finding Verification
+- The SQLite UDF fallback still used JavaScript `RegExp`, so the security finding was only partially stale.
+- What was already true in current code:
+  - the adapter now validates and normalizes `$regex` before building SQL
+  - simple anchored/literal cases are lowered to `LIKE` / `GLOB` and never hit the regex UDF
+- What was still not good enough:
+  - the new guard only caught nested quantifiers
+  - it missed ambiguous repeated groups such as `(a|aa)+`, which still route to the SQLite regex UDF and can backtrack badly under the JS engine
+
+### Follow-Up Fix
+- Tightened SQLite regex normalization to reject potentially unsafe repeated-group shapes before query execution.
+- The guard now also rejects quantified alternation groups, plus `(?...)` advanced group forms in the SQLite path.
+- Added a small compiled-regex cache inside the SQLite client so repeated row-level UDF calls do not recompile the same safe pattern over and over.
+
+### Focused Validation
+- `TESTING=1 PARSE_SERVER_TEST_DB=sqlite PARSE_SERVER_TEST_DATABASE_URI=sqlite://:memory: npx jasmine spec/SQLiteStorageAdapter.spec.js`
+- `TESTING=1 PARSE_SERVER_TEST_DB=sqlite PARSE_SERVER_TEST_DATABASE_URI=sqlite://:memory: npx jasmine --filter='startsWith|endsWith|containsAllStartingWith|still accepts valid string \\$regex in query' spec/ParseQuery.spec.js`
+- result: green
