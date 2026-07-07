@@ -1391,3 +1391,65 @@
 - Validation caveat logged:
   - one failed run was my own mistake from launching the spec in parallel with `npm run build`
   - rerunning after the build completed was green
+
+## 2026-07-07
+
+### Current File-Backed Suite State
+- File-backed SQLite broad run reached `4130 / 4429` executed with `299 pending`.
+- First full file-backed pass failed in 4 CLI startup specs because startup output was timing out instead of surfacing the real adapter error.
+- After fixing that path, the rerun dropped to 1 deterministic failure:
+  - `spec/ParseGraphQLSchema.spec.js`
+  - `name collision`
+  - `should not generate duplicate types when colliding the same name`
+
+### What Was Proved Today
+- Targeted SQLite specs are green in both memory-backed and file-backed mode:
+  - `spec/PushWorker.spec.js`
+  - `spec/ParseRole.spec.js`
+  - `spec/ParseInstallation.spec.js`
+- The generic batch duplicate-key rollback issue is not a SQLite adapter atomicity bug:
+  - the transaction rolled back correctly
+  - Parse Server core still returns a generic `500` for that batch failure shape
+
+### Adapter Fixes Added Today
+- `spec/CLI.spec.js`
+  - startup wait now aggregates both stdout and stderr
+  - if the child exits early, the captured output is included in the failure instead of a blind timeout
+- SQLite adapter stale-table guard:
+  - `classExists()` now drops stale cached schema entries when `_SCHEMA` says a class exists but the physical table does not
+  - this fixed the `_Hooks` startup failure in file-backed CLI tests
+- SQLite physical table naming:
+  - logical Parse class names now map to a case-safe encoded physical table name
+  - this prevents SQLite identifier case-folding from collapsing `Car` and `car` onto one table
+  - the mapping is cached per class name, so hot query paths do not pay repeated sqlite_master lookups
+  - no legacy fallback path was kept
+- Join-table cleanup now goes through the same centralized table-name helper instead of hand-built raw names
+- Table-info PRAGMA calls now use the centralized raw-table quoting helper instead of repeating inline quoting logic
+
+### Latest Focused Verification
+- File-backed GraphQL collision repro is now green:
+  - `spec/ParseGraphQLSchema.spec.js --filter='should not generate duplicate types when colliding the same name'`
+- File-backed CLI startup smoke is green again:
+  - `should start Parse Server`
+  - `can start Parse Server with auth via CLI`
+  - `should start Parse Server with GraphQL`
+  - `should start Parse Server with GraphQL and Playground`
+
+### Final File-Backed Broad Pass
+- Full file-backed SQLite suite now passes:
+  - `PARSE_SERVER_TEST_DB=sqlite`
+  - `PARSE_SERVER_TEST_DATABASE_URI='sqlite:////tmp/parse-sqlite-filetests.urXy9B/full-after-encoded-map-rerun.sqlite'`
+  - `TESTING=1 npm test`
+- Result:
+  - `Executed 4130 of 4429 specs`
+  - `0 failed`
+  - `299 pending`
+  - `14 mins 18 secs`
+- `/usr/bin/time -l` from the passing file-backed run:
+  - `861.88 real`
+  - `1471119360 maximum resident set size`
+- The one prior `order by _updated_at` broad-suite red did not reproduce after the duplicate-key log fix:
+  - isolated rerun was green
+  - 30 repeated isolated reruns were green
+  - the next full file-backed rerun was green
+- In-memory broad rerun was intentionally cancelled after the user said not to spend time on it because file-backed is the stricter path.

@@ -89,6 +89,7 @@ const aggregateDateMatchOperators = new Set([
 ]);
 const sqliteShutdownDrainDelayMs = 200;
 const nullFieldTrackerColumn = '_nullFields';
+const sqliteEncodedTableNamePrefix = '__psa__';
 const implicitSQLiteUserColumnFields = Object.freeze({
   _hashed_password: { type: 'String' },
   _password_history: { type: 'Array' },
@@ -283,6 +284,17 @@ const defaultSchemaIndexFields = new Set(['_id', 'objectId', 'createdAt', 'updat
 const buildDefaultSchemaIndexes = () => ({
   _id_: { _id: 1 },
 });
+
+const encodeSQLiteTableNameToken = (className: string): string =>
+  Buffer.from(className, 'utf8').toString('base64url');
+
+const decodeSQLiteTableNameToken = (token: string): ?string => {
+  try {
+    return Buffer.from(token, 'base64url').toString('utf8');
+  } catch {
+    return null;
+  }
+};
 
 const cloneIndexDefinition = index =>
   Object.keys(index || {}).reduce((output, key) => {
@@ -1485,6 +1497,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
   _stmtCache: Map<string, any>;
   _existingClasses: Set<string>;
   _schemaCache: Map<string, any>;
+  _resolvedTableNames: Map<string, string>;
   _temporaryDirectory: ?string;
   _usesSharedMemoryDatabase: boolean;
 
@@ -1500,6 +1513,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     this._stmtCache = new Map();
     this._existingClasses = new Set();
     this._schemaCache = new Map();
+    this._resolvedTableNames = new Map();
     this._temporaryDirectory = null;
     this._usesSharedMemoryDatabase = false;
 
@@ -1601,6 +1615,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     this._stmtCache.clear();
     this._existingClasses.clear();
     this._schemaCache.clear();
+    this._resolvedTableNames.clear();
     try {
       const rows = this._db.prepare('SELECT "className", "schema" FROM "_SCHEMA"').all();
       for (const row of rows) {
@@ -1616,12 +1631,45 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     }
   }
 
-  _tableName(className: string): string {
-    return `"${(this._collectionPrefix + className).replace(/"/g, '""')}"`;
+  _preferredRawTableName(className: string): string {
+    if (className === '_SCHEMA') {
+      return '_SCHEMA';
+    }
+    // SQLite folds table identifiers case-insensitively, so custom classes need
+    // a stable encoded table name to keep `Car` and `car` physically distinct.
+    return `${this._collectionPrefix}${sqliteEncodedTableNamePrefix}${encodeSQLiteTableNameToken(className)}`;
   }
 
-  _rawTableName(className: string): string {
-    return this._collectionPrefix + className;
+  _quoteRawTableName(rawTableName: string): string {
+    return `"${rawTableName.replace(/"/g, '""')}"`;
+  }
+
+  _tableName(className: string, dbOverride?: any): string {
+    return this._quoteRawTableName(this._rawTableName(className, dbOverride));
+  }
+
+  _tableNameExistsByRawName(rawTableName: string, dbOverride?: any): boolean {
+    const db = dbOverride || this._db;
+    return !!this._prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = ?", db).get(
+      rawTableName
+    );
+  }
+
+  _rawTableName(className: string, dbOverride?: any): string {
+    if (className === '_SCHEMA') {
+      return '_SCHEMA';
+    }
+    const cachedRawTableName = this._resolvedTableNames.get(className);
+    if (cachedRawTableName) {
+      return cachedRawTableName;
+    }
+    const preferredRawTableName = this._preferredRawTableName(className);
+    this._resolvedTableNames.set(className, preferredRawTableName);
+    return preferredRawTableName;
+  }
+
+  _joinTableClassName(fieldName: string, className: string): string {
+    return `_Join:${fieldName}:${className}`;
   }
 
   _ensureNullFieldTrackerColumn(className: string, dbOverride?: any) {
@@ -1629,22 +1677,22 @@ export class SQLiteStorageAdapter implements StorageAdapter {
       return;
     }
     const db = dbOverride || this._db;
-    const rawName = this._rawTableName(className);
+    const rawName = this._rawTableName(className, db);
     const hasColumn = db
-      .prepare(`PRAGMA table_info("${rawName.replace(/"/g, '""')}")`)
+      .prepare(`PRAGMA table_info(${this._quoteRawTableName(rawName)})`)
       .all()
       .some(col => col.name === nullFieldTrackerColumn);
     if (!hasColumn) {
-      db.exec(`ALTER TABLE ${this._tableName(className)} ADD COLUMN "${nullFieldTrackerColumn}" TEXT`);
+      db.exec(
+        `ALTER TABLE ${this._tableName(className, db)} ADD COLUMN "${nullFieldTrackerColumn}" TEXT`
+      );
     }
   }
 
   _tableExists(className: string, dbOverride?: any): boolean {
     const db = dbOverride || this._db;
-    const rawName = this._rawTableName(className);
-    return !!this._prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = ?", db).get(
-      rawName
-    );
+    const rawName = this._rawTableName(className, db);
+    return this._tableNameExistsByRawName(rawName, db);
   }
 
   async classExists(className: string, dbOverride?: any): Promise<boolean> {
@@ -1653,6 +1701,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     if (this._existingClasses.has(className)) {
       if (!tableExists) {
         this._existingClasses.delete(className);
+        this._resolvedTableNames.delete(className);
         return false;
       }
       this._ensureNullFieldTrackerColumn(className, db);
@@ -1667,10 +1716,10 @@ export class SQLiteStorageAdapter implements StorageAdapter {
   }
 
   _getTableColumns(className: string, connection?: any): Array<string> {
-    const rawName = this._rawTableName(className);
+    const rawName = this._rawTableName(className, connection);
     const db = connection || this._db;
     return db
-      .prepare(`PRAGMA table_info("${rawName.replace(/"/g, '""')}")`)
+      .prepare(`PRAGMA table_info(${this._quoteRawTableName(rawName)})`)
       .all()
       .map(column => column.name);
   }
@@ -1797,7 +1846,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     const db = dbOverride || this._db;
     const tableName = this._tableName(className);
     const rawName = this._rawTableName(className);
-    const tableInfo = db.prepare(`PRAGMA table_info("${rawName.replace(/"/g, '""')}")`).all();
+    const tableInfo = db.prepare(`PRAGMA table_info(${this._quoteRawTableName(rawName)})`).all();
     const existingCols = new Set(tableInfo.map(col => col.name));
 
     const fields = schema ? schema.fields || {} : {};
@@ -1974,7 +2023,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     }
 
     if (type.type !== 'Relation') {
-      const tableInfo = this._db.prepare(`PRAGMA table_info("${rawName.replace(/"/g, '""')}")`).all();
+      const tableInfo = this._db.prepare(`PRAGMA table_info(${this._quoteRawTableName(rawName)})`).all();
       const exists = tableInfo.some(col => col.name === fieldName);
       if (!exists) {
         const sqliteType = parseTypeToSQLiteType(type);
@@ -2016,7 +2065,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
         if (schema && schema.fields) {
           Object.keys(schema.fields).forEach(field => {
             if (schema.fields[field].type === 'Relation') {
-              const joinTableName = `"${(this._collectionPrefix + `_Join:${field}:${className}`).replace(/"/g, '""')}"`;
+              const joinTableName = this._tableName(this._joinTableClassName(field, className));
               this._db.exec(`DROP TABLE IF EXISTS ${joinTableName}`);
             }
           });
@@ -2030,6 +2079,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     this._prepare('DELETE FROM "_SCHEMA" WHERE "className" = ?').run(className);
     this._existingClasses.delete(className);
     this._schemaCache.delete(className);
+    this._resolvedTableNames.delete(className);
     this._notifySchemaChange();
     return className.indexOf('_Join:') !== 0;
   }
@@ -2042,6 +2092,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     this._stmtCache.clear();
     this._existingClasses.clear();
     this._schemaCache.clear();
+    this._resolvedTableNames.clear();
     this._initSchemaTable();
     this._notifySchemaChange();
   }
@@ -2060,7 +2111,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
       if (schemaObj.fields && schemaObj.fields[fieldName]) {
         if (schemaObj.fields[fieldName].type === 'Relation') {
           relationalFieldNames.add(fieldName);
-          const joinTableName = `"${(this._collectionPrefix + `_Join:${fieldName}:${className}`).replace(/"/g, '""')}"`;
+          const joinTableName = this._tableName(this._joinTableClassName(fieldName, className));
           this._db.exec(`DROP TABLE IF EXISTS ${joinTableName}`);
         }
         delete schemaObj.fields[fieldName];
@@ -2090,9 +2141,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
       const rebuildTableRawName =
         `${rawName}__rebuild__${Date.now()}_${Math.random().toString(16).slice(2)}`;
       const rebuildTableName = `"${rebuildTableRawName.replace(/"/g, '""')}"`;
-      const tableInfo = this._db
-        .prepare(`PRAGMA table_info("${rawName.replace(/"/g, '""')}")`)
-        .all();
+      const tableInfo = this._db.prepare(`PRAGMA table_info(${this._quoteRawTableName(rawName)})`).all();
       const keptColumns = tableInfo.filter(column => !deletedFieldNames.has(column.name));
 
       if (keptColumns.length > 0) {
@@ -2308,7 +2357,10 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     if (!isUniqueConstraintError(err)) {
       return err;
     }
-    logger.error('Duplicate key error:', buildDuplicateKeyLogMessage(this._rawTableName(className), err));
+    logger.error(
+      'Duplicate key error:',
+      buildDuplicateKeyLogMessage(this._collectionPrefix + className, err)
+    );
     const duplicatedField = getDuplicatedFieldFromUniqueConstraint(className, err);
     const parseError = new Parse.Error(
       Parse.Error.DUPLICATE_VALUE,
@@ -5106,7 +5158,16 @@ export class SQLiteStorageAdapter implements StorageAdapter {
 
   _collectionNameToClassName(collectionName: string): string {
     if (collectionName.startsWith(this._collectionPrefix)) {
-      return collectionName.slice(this._collectionPrefix.length);
+      const rawTableName = collectionName.slice(this._collectionPrefix.length);
+      if (rawTableName.startsWith(sqliteEncodedTableNamePrefix)) {
+        const decodedClassName = decodeSQLiteTableNameToken(
+          rawTableName.slice(sqliteEncodedTableNamePrefix.length)
+        );
+        if (decodedClassName) {
+          return decodedClassName;
+        }
+      }
+      return rawTableName;
     }
     return collectionName;
   }
