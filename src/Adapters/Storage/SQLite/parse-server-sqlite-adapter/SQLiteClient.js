@@ -5,6 +5,7 @@
 const Database = require('better-sqlite3');
 const {
   canonicalJSONStringify,
+  isNumericArrayIndexComponent,
   normalizeRegexPattern,
   parseJSONArray
 } = require('./SQLiteUtils');
@@ -20,6 +21,127 @@ function getSQLiteCacheSizeKb(options) {
   }
   return Math.trunc(cacheSizeKb);
 }
+const parseJSONContainer = (value, fallbackContainer) => {
+  try {
+    const parsedValue = typeof value === 'string' ? JSON.parse(value) : value;
+    if (Array.isArray(parsedValue) || parsedValue && typeof parsedValue === 'object') {
+      return parsedValue;
+    }
+  } catch {
+    /* */
+  }
+  return fallbackContainer;
+};
+const parseJSONValue = value => {
+  if (value === undefined) {
+    return undefined;
+  }
+  try {
+    return typeof value === 'string' ? JSON.parse(value) : value;
+  } catch {
+    return value;
+  }
+};
+const createMissingNestedContainer = nextComponent => isNumericArrayIndexComponent(nextComponent) ? [] : {};
+const getContainerEntry = (container, component) => {
+  if (Array.isArray(container) && isNumericArrayIndexComponent(component)) {
+    return container[Number(component)];
+  }
+  if (container && typeof container === 'object') {
+    return container[component];
+  }
+  return undefined;
+};
+const setContainerEntry = (container, component, value) => {
+  if (Array.isArray(container) && isNumericArrayIndexComponent(component)) {
+    const index = Number(component);
+    while (container.length < index) {
+      container.push(null);
+    }
+    container[index] = value;
+    return;
+  }
+  container[component] = value;
+};
+const removeContainerEntry = (container, component) => {
+  if (Array.isArray(container) && isNumericArrayIndexComponent(component)) {
+    const index = Number(component);
+    if (index >= 0 && index < container.length) {
+      container.splice(index, 1);
+    }
+    return;
+  }
+  if (container && typeof container === 'object') {
+    delete container[component];
+  }
+};
+const ensureNestedContainer = (container, component, nextComponent) => {
+  let entry = getContainerEntry(container, component);
+  if (Array.isArray(entry) || entry && typeof entry === 'object') {
+    return entry;
+  }
+  entry = createMissingNestedContainer(nextComponent);
+  setContainerEntry(container, component, entry);
+  return entry;
+};
+const applyDynamicPathMutation = (rootContainer, pathComponents, operation, rawValue) => {
+  if (!Array.isArray(pathComponents) || pathComponents.length === 0) {
+    return rootContainer;
+  }
+  let currentContainer = rootContainer;
+  for (let index = 0; index < pathComponents.length - 1; index += 1) {
+    currentContainer = ensureNestedContainer(currentContainer, pathComponents[index], pathComponents[index + 1]);
+  }
+  const targetComponent = pathComponents[pathComponents.length - 1];
+  const currentValue = getContainerEntry(currentContainer, targetComponent);
+  switch (operation) {
+    case 'Delete':
+      removeContainerEntry(currentContainer, targetComponent);
+      return rootContainer;
+    case 'Increment':
+      {
+        const baseValue = currentValue == null ? 0 : Number(currentValue);
+        const amount = Number(rawValue);
+        setContainerEntry(currentContainer, targetComponent, (Number.isFinite(baseValue) ? baseValue : 0) + (Number.isFinite(amount) ? amount : 0));
+        return rootContainer;
+      }
+    case 'Add':
+      {
+        const targetArray = Array.isArray(currentValue) ? currentValue : [];
+        const items = Array.isArray(rawValue) ? rawValue : [];
+        setContainerEntry(currentContainer, targetComponent, targetArray.concat(items));
+        return rootContainer;
+      }
+    case 'AddUnique':
+      {
+        const targetArray = Array.isArray(currentValue) ? currentValue : [];
+        const items = Array.isArray(rawValue) ? rawValue : [];
+        const nextArray = targetArray.slice();
+        const seenValues = new Set(nextArray.map(item => canonicalJSONStringify(item)));
+        for (const item of items) {
+          const serializedItem = canonicalJSONStringify(item);
+          if (!seenValues.has(serializedItem)) {
+            seenValues.add(serializedItem);
+            nextArray.push(item);
+          }
+        }
+        setContainerEntry(currentContainer, targetComponent, nextArray);
+        return rootContainer;
+      }
+    case 'Remove':
+      {
+        const targetArray = Array.isArray(currentValue) ? currentValue : [];
+        const items = Array.isArray(rawValue) ? rawValue : [];
+        const removeSet = new Set(items.map(item => canonicalJSONStringify(item)));
+        setContainerEntry(currentContainer, targetComponent, targetArray.filter(item => !removeSet.has(canonicalJSONStringify(item))));
+        return rootContainer;
+      }
+    case 'Set':
+    default:
+      setContainerEntry(currentContainer, targetComponent, rawValue);
+      return rootContainer;
+  }
+};
 function createClient(options) {
   const filename = options.filename || ':memory:';
   const dbOptions = {
@@ -198,6 +320,17 @@ function createClient(options) {
     const removeSet = new Set(items.map(item => canonicalJSONStringify(item)));
     const result = target.filter(item => !removeSet.has(canonicalJSONStringify(item)));
     return JSON.stringify(result);
+  });
+
+  // Numeric dot-path segments are ambiguous in Parse syntax. Resolve them against
+  // the runtime parent container type for writes instead of relying on root-name heuristics.
+  db.function('parse_json_apply_path_mutation', {
+    deterministic: true
+  }, (targetStr, pathStr, operation, valueStr) => {
+    const pathComponents = parseJSONValue(pathStr);
+    const rootContainer = parseJSONContainer(targetStr, isNumericArrayIndexComponent(pathComponents && pathComponents[0]) ? [] : {});
+    const nextValue = applyDynamicPathMutation(rootContainer, Array.isArray(pathComponents) ? pathComponents : [], String(operation), parseJSONValue(valueStr));
+    return JSON.stringify(nextValue);
   });
   return db;
 }

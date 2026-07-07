@@ -3,6 +3,7 @@
 // Standalone package copy of the built SQLite adapter utility helpers.
 
 const stableStringify = require('safe-stable-stringify');
+const numericArrayIndexPattern = /^(0|[1-9]\d*)$/;
 
 // Keep object-key order deterministic so equality-sensitive array operations
 // behave consistently across logically equivalent payloads.
@@ -15,6 +16,10 @@ const parseJSONArray = value => {
     return [];
   }
 };
+
+// Treat only canonical non-negative integers as potential array indexes.
+// Values like "01" stay object keys because Parse field paths can target both.
+const isNumericArrayIndexComponent = value => typeof value === 'string' && numericArrayIndexPattern.test(value);
 const removeRegexWhiteSpace = regex => {
   let normalizedRegex = regex;
   if (!normalizedRegex.endsWith('\n')) {
@@ -129,6 +134,7 @@ const getSimpleNormalizedRegexInfo = (pattern, flags) => {
 module.exports = {
   canonicalJSONStringify,
   getSimpleNormalizedRegexInfo,
+  isNumericArrayIndexComponent,
   normalizeRegexPattern,
   parseJSONArray
 };

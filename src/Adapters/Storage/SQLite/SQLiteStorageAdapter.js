@@ -15,6 +15,7 @@ import { createSanitizedError } from '../../../Error';
 import logger from '../../../logger';
 const {
   getSimpleNormalizedRegexInfo,
+  isNumericArrayIndexComponent,
   normalizeRegexPattern,
 } = require('./SQLiteUtils');
 
@@ -86,7 +87,7 @@ const aggregateDateMatchOperators = new Set([
   '$all',
   '$exists',
 ]);
-const sqliteShutdownDrainDelayMs = 50;
+const sqliteShutdownDrainDelayMs = 200;
 const nullFieldTrackerColumn = '_nullFields';
 const implicitSQLiteUserColumnFields = Object.freeze({
   _hashed_password: { type: 'String' },
@@ -768,22 +769,82 @@ const validateObjectPathComponent = (component: string, fieldName: string) => {
   }
 };
 
-const buildDotFieldPath = (fieldName: string) => {
+const getDotFieldPathParts = (fieldName: string) => {
   const parts = fieldName.split('.');
   const rootFieldName = parts.shift();
   validateFieldName(rootFieldName);
+  return {
+    rootFieldName,
+    components: parts,
+  };
+};
+
+const getJsonRootTypeExpression = (expression: string) =>
+  `(CASE WHEN ${expression} IS NOT NULL AND json_valid(${expression}) THEN json_type(${expression}) ELSE NULL END)`;
+
+const buildDotFieldPath = (fieldName: string) => {
+  const { rootFieldName, components } = getDotFieldPathParts(fieldName);
   let jsonPath = '$';
-  for (const component of parts) {
-    if (/^\d+$/.test(component)) {
+  let hasAmbiguousNumericSegments = false;
+  for (const component of components) {
+    if (isNumericArrayIndexComponent(component)) {
+      hasAmbiguousNumericSegments = true;
       jsonPath += `[${component}]`;
       continue;
     }
     validateObjectPathComponent(component, fieldName);
     jsonPath += `."${component}"`;
   }
+
+  const rootExpression = quoteColumnName(rootFieldName);
+  if (!hasAmbiguousNumericSegments) {
+    return {
+      rootFieldName,
+      components,
+      hasAmbiguousNumericSegments,
+      jsonPath,
+      valueExpression: `json_extract(${rootExpression}, '${jsonPath}')`,
+      typeExpression: `json_type(${rootExpression}, '${jsonPath}')`,
+    };
+  }
+
+  let valueExpression = rootExpression;
+  let typeExpression = getJsonRootTypeExpression(rootExpression);
+  for (const component of components) {
+    const currentValueExpression = valueExpression;
+    const currentTypeExpression = typeExpression;
+    if (isNumericArrayIndexComponent(component)) {
+      const arrayPath = `$[${component}]`;
+      const objectPath = `$."${component}"`;
+      valueExpression =
+        `(CASE ${currentTypeExpression} ` +
+        `WHEN 'array' THEN json_extract(${currentValueExpression}, '${arrayPath}') ` +
+        `WHEN 'object' THEN json_extract(${currentValueExpression}, '${objectPath}') ` +
+        `ELSE NULL END)`;
+      typeExpression =
+        `(CASE ${currentTypeExpression} ` +
+        `WHEN 'array' THEN json_type(${currentValueExpression}, '${arrayPath}') ` +
+        `WHEN 'object' THEN json_type(${currentValueExpression}, '${objectPath}') ` +
+        `ELSE NULL END)`;
+      continue;
+    }
+    validateObjectPathComponent(component, fieldName);
+    const objectPath = `$."${component}"`;
+    valueExpression =
+      `(CASE WHEN ${currentTypeExpression} IN ('array', 'object') ` +
+      `THEN json_extract(${currentValueExpression}, '${objectPath}') ELSE NULL END)`;
+    typeExpression =
+      `(CASE WHEN ${currentTypeExpression} IN ('array', 'object') ` +
+      `THEN json_type(${currentValueExpression}, '${objectPath}') ELSE NULL END)`;
+  }
+
   return {
     rootFieldName,
+    components,
+    hasAmbiguousNumericSegments,
     jsonPath,
+    valueExpression,
+    typeExpression,
   };
 };
 
@@ -873,8 +934,12 @@ const getParameterizedValueExpression = (value: any) => {
 const getNormalizedJsonArrayExpression = (expression: string) =>
   `CASE WHEN json_valid(${expression}) AND json_type(${expression}) = 'array' THEN ${expression} ELSE '[]' END`;
 
-const getJsonObjectValueExpression = (columnName: string) =>
-  `CASE WHEN json_valid(${columnName}) AND json_type(${columnName}) = 'object' THEN ${columnName} ELSE '{}' END`;
+const getJsonContainerValueExpression = (
+  expression: string,
+  fallbackContainerType: 'object' | 'array' = 'object'
+) =>
+  `CASE WHEN json_valid(${expression}) AND json_type(${expression}) IN ('object', 'array') ` +
+  `THEN ${expression} ELSE ${fallbackContainerType === 'array' ? "'[]'" : "'{}'"} END`;
 
 const getJsonArrayValueExpression = (containerExpression: string, jsonPath: string) =>
   getNormalizedJsonArrayExpression(`json_extract(${containerExpression}, '${jsonPath}')`);
@@ -920,11 +985,75 @@ const buildSingleEvaluationJSONMutationExpression = (
   `(SELECT ${buildMutationExpression('__parse_current_json.obj')} ` +
   `FROM (SELECT ${currentObjectExpression} AS obj) AS __parse_current_json)`;
 
-const buildJsonPathUpdateExpression = (
+const buildDynamicJsonPathUpdateExpression = (
   currentObjectExpression: string,
-  jsonPath: string,
+  pathComponents: Array<string>,
   fieldValue: any
 ): { expression: string, params: Array<any> } => {
+  let operation = 'Set';
+  let rawValue = fieldValue;
+
+  if (fieldValue === null) {
+    rawValue = null;
+  } else if (typeof fieldValue === 'object') {
+    switch (fieldValue.__op) {
+      case 'Increment':
+        if (typeof fieldValue.amount !== 'number' || Number.isNaN(fieldValue.amount)) {
+          throw new Parse.Error(Parse.Error.INVALID_JSON, 'Cannot increment by a non-numeric value.');
+        }
+        operation = 'Increment';
+        rawValue = fieldValue.amount;
+        break;
+      case 'Add':
+        operation = 'Add';
+        rawValue = fieldValue.objects;
+        break;
+      case 'AddUnique':
+        operation = 'AddUnique';
+        rawValue = fieldValue.objects;
+        break;
+      case 'Remove':
+        operation = 'Remove';
+        rawValue = fieldValue.objects;
+        break;
+      case 'Delete':
+        operation = 'Delete';
+        rawValue = null;
+        break;
+      default:
+        validateNestedKeys(fieldValue);
+        break;
+    }
+  }
+
+  return {
+    expression: buildSingleEvaluationJSONMutationExpression(
+      currentObjectExpression,
+      objectExpression =>
+        `json(parse_json_apply_path_mutation(${objectExpression}, ?, ?, ?))`
+    ),
+    params: [JSON.stringify(pathComponents), operation, toSQLiteJSONObjectValue(rawValue)],
+  };
+};
+
+const buildJsonPathUpdateExpression = (
+  currentObjectExpression: string,
+  dotFieldPath: {
+    hasAmbiguousNumericSegments: boolean,
+    jsonPath: string,
+    components: Array<string>,
+  },
+  fieldValue: any
+): { expression: string, params: Array<any> } => {
+  if (dotFieldPath.hasAmbiguousNumericSegments) {
+    return buildDynamicJsonPathUpdateExpression(
+      currentObjectExpression,
+      dotFieldPath.components,
+      fieldValue
+    );
+  }
+
+  const { jsonPath } = dotFieldPath;
   if (fieldValue === null) {
     return {
       expression: buildSingleEvaluationJSONMutationExpression(
@@ -1213,8 +1342,7 @@ const transformDotField = (fieldName: string) => {
     validateFieldName(fieldName);
     return quoteColumnName(fieldName);
   }
-  const { rootFieldName, jsonPath } = buildDotFieldPath(fieldName);
-  return `json_extract(${quoteColumnName(rootFieldName)}, '${jsonPath}')`;
+  return buildDotFieldPath(fieldName).valueExpression;
 };
 
 const validateFieldName = (name: string) => {
@@ -2084,11 +2212,41 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     return fieldName;
   }
 
+  _normalizeIndexFieldPath(fieldName: string): string {
+    if (fieldName.indexOf('.') < 0) {
+      return this._normalizeIndexColumnName(fieldName);
+    }
+    const parts = fieldName.split('.');
+    const rootFieldName = this._normalizeIndexColumnName(parts.shift());
+    return [rootFieldName, ...parts].join('.');
+  }
+
+  _buildIndexFieldExpression(fieldName: string): { expression: string, requiredColumns: Array<string> } {
+    const normalizedFieldName = this._normalizeIndexFieldPath(fieldName);
+    if (normalizedFieldName.indexOf('.') < 0) {
+      validateFieldName(normalizedFieldName);
+      return {
+        expression: quoteColumnName(normalizedFieldName),
+        requiredColumns: [normalizedFieldName],
+      };
+    }
+
+    const dotFieldPath = buildDotFieldPath(normalizedFieldName);
+    return {
+      expression: dotFieldPath.valueExpression,
+      requiredColumns: [dotFieldPath.rootFieldName],
+    };
+  }
+
   _fieldExistsForIndex(fields: any, fieldName: string): boolean {
     if (defaultSchemaIndexFields.has(fieldName)) {
       return true;
     }
-    const normalizedFieldName = this._normalizeIndexColumnName(fieldName);
+    const normalizedFieldName = this._normalizeIndexFieldPath(fieldName);
+    if (normalizedFieldName.indexOf('.') >= 0) {
+      const [rootFieldName] = normalizedFieldName.split('.');
+      return Object.prototype.hasOwnProperty.call(fields || {}, rootFieldName);
+    }
     return Object.prototype.hasOwnProperty.call(fields || {}, normalizedFieldName);
   }
 
@@ -2419,11 +2577,12 @@ export class SQLiteStorageAdapter implements StorageAdapter {
         }
       }
 
+      const dotFieldPath = isDotNotation ? buildDotFieldPath(key) : null;
       let targetSql;
       if (authDataMatch) {
         targetSql = `json_extract("authData", '$.${authDataMatch[1]}')`;
       } else if (isDotNotation) {
-        targetSql = transformDotField(key);
+        targetSql = dotFieldPath.valueExpression;
       } else {
         validateFieldName(normalizedKey);
         const fieldExistsInSchema =
@@ -2434,10 +2593,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
         targetSql = fieldExistsInSchema ? quoteColumnName(normalizedKey) : 'NULL';
       }
 
-      const dotFieldPath = isDotNotation ? buildDotFieldPath(key) : null;
-      const dotFieldTypeSql = dotFieldPath
-        ? `json_type(${quoteColumnName(dotFieldPath.rootFieldName)}, '${dotFieldPath.jsonPath}')`
-        : null;
+      const dotFieldTypeSql = dotFieldPath ? dotFieldPath.typeExpression : null;
       const usesCaseInsensitiveComparison =
         caseInsensitive &&
         !authDataMatch &&
@@ -4283,6 +4439,11 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     const params = [];
     const nestedFieldUpdates = new Map();
     let nullFieldTrackerUpdate = null;
+    const cachedSchema = this._schemaCache.get(className);
+    const mergedSchemaFields = {
+      ...((cachedSchema && cachedSchema.fields) || {}),
+      ...((schema && schema.fields) || {}),
+    };
 
     const appendNullFieldTrackerUpdate = (fieldName, trackExplicitNull) => {
       if (!fieldName || fieldName === nullFieldTrackerColumn) {
@@ -4302,14 +4463,22 @@ export class SQLiteStorageAdapter implements StorageAdapter {
       };
     };
 
-    const appendNestedFieldUpdate = (rootFieldName, jsonPath, fieldValue) => {
+    const appendNestedFieldUpdate = (dotFieldPath, fieldValue) => {
+      const { rootFieldName } = dotFieldPath;
+      const fallbackContainerType =
+        mergedSchemaFields[rootFieldName] && mergedSchemaFields[rootFieldName].type === 'Array'
+          ? 'array'
+          : 'object';
       const existingUpdate = nestedFieldUpdates.get(rootFieldName) || {
-        expression: getJsonObjectValueExpression(quoteColumnName(rootFieldName)),
+        expression: getJsonContainerValueExpression(
+          quoteColumnName(rootFieldName),
+          fallbackContainerType
+        ),
         params: [],
       };
       const nextUpdate = buildJsonPathUpdateExpression(
         existingUpdate.expression,
-        jsonPath,
+        dotFieldPath,
         fieldValue
       );
       nestedFieldUpdates.set(rootFieldName, {
@@ -4339,7 +4508,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
 
       if (fieldValue === null) {
         if (dotFieldPath) {
-          appendNestedFieldUpdate(dotFieldPath.rootFieldName, dotFieldPath.jsonPath, null);
+          appendNestedFieldUpdate(dotFieldPath, null);
         } else {
           validateFieldName(fieldName);
           setClauses.push(`${columnName} = NULL`);
@@ -4351,7 +4520,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
       if (typeof fieldValue === 'object') {
         if (fieldValue.__op === 'Increment') {
           if (dotFieldPath) {
-            appendNestedFieldUpdate(dotFieldPath.rootFieldName, dotFieldPath.jsonPath, fieldValue);
+            appendNestedFieldUpdate(dotFieldPath, fieldValue);
           } else {
             if (typeof fieldValue.amount !== 'number' || Number.isNaN(fieldValue.amount)) {
               throw new Parse.Error(
@@ -4368,7 +4537,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
         }
         if (fieldValue.__op === 'Add') {
           if (dotFieldPath) {
-            appendNestedFieldUpdate(dotFieldPath.rootFieldName, dotFieldPath.jsonPath, fieldValue);
+            appendNestedFieldUpdate(dotFieldPath, fieldValue);
           } else {
             validateFieldName(fieldName);
             setClauses.push(`${columnName} = ${buildJSONArrayAppendExpression(columnName)}`);
@@ -4379,7 +4548,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
         }
         if (fieldValue.__op === 'AddUnique') {
           if (dotFieldPath) {
-            appendNestedFieldUpdate(dotFieldPath.rootFieldName, dotFieldPath.jsonPath, fieldValue);
+            appendNestedFieldUpdate(dotFieldPath, fieldValue);
           } else {
             validateFieldName(fieldName);
             setClauses.push(`${columnName} = parse_array_add_unique(${columnName}, ?)`);
@@ -4390,7 +4559,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
         }
         if (fieldValue.__op === 'Remove') {
           if (dotFieldPath) {
-            appendNestedFieldUpdate(dotFieldPath.rootFieldName, dotFieldPath.jsonPath, fieldValue);
+            appendNestedFieldUpdate(dotFieldPath, fieldValue);
           } else {
             validateFieldName(fieldName);
             setClauses.push(`${columnName} = parse_array_remove(${columnName}, ?)`);
@@ -4401,7 +4570,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
         }
         if (fieldValue.__op === 'Delete') {
           if (dotFieldPath) {
-            appendNestedFieldUpdate(dotFieldPath.rootFieldName, dotFieldPath.jsonPath, fieldValue);
+            appendNestedFieldUpdate(dotFieldPath, fieldValue);
           } else {
             validateFieldName(fieldName);
             setClauses.push(`${columnName} = NULL`);
@@ -4444,7 +4613,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
       }
 
       if (dotFieldPath) {
-        appendNestedFieldUpdate(dotFieldPath.rootFieldName, dotFieldPath.jsonPath, fieldValue);
+        appendNestedFieldUpdate(dotFieldPath, fieldValue);
         return;
       }
 
@@ -4469,8 +4638,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     if (update.$unset) {
       for (const k of Object.keys(update.$unset)) {
         if (k.indexOf('.') >= 0) {
-          const { rootFieldName, jsonPath } = buildDotFieldPath(k);
-          appendNestedFieldUpdate(rootFieldName, jsonPath, { __op: 'Delete' });
+          appendNestedFieldUpdate(buildDotFieldPath(k), { __op: 'Delete' });
         } else {
           validateFieldName(k);
           setClauses.push(`${quoteColumnName(k)} = NULL`);
@@ -4608,10 +4776,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     const tableName = this._tableName(className);
     const idxName = indexName || `parse_default_${fieldNames.sort().join('_')}`;
     const safeIdxName = `"${idxName.replace(/"/g, '""')}"`;
-    const colExprs = fieldNames.map(f => {
-      validateFieldName(f);
-      return `"${f.replace(/"/g, '""')}"`;
-    });
+    const colExprs = fieldNames.map(fieldName => this._buildIndexFieldExpression(fieldName).expression);
 
     let sql = `CREATE INDEX IF NOT EXISTS ${safeIdxName} ON ${tableName} (${colExprs.join(', ')})`;
     if (options.ttl) {
@@ -4635,10 +4800,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     const tableName = this._tableName(className);
     const idxName = `unique_${fieldNames.join('_')}`;
     const safeIdxName = `"${idxName.replace(/"/g, '""')}"`;
-    const colExprs = fieldNames.map(f => {
-      validateFieldName(f);
-      return `"${f.replace(/"/g, '""')}"`;
-    });
+    const colExprs = fieldNames.map(fieldName => this._buildIndexFieldExpression(fieldName).expression);
 
     const sql = `CREATE UNIQUE INDEX IF NOT EXISTS ${safeIdxName} ON ${tableName} (${colExprs.join(', ')})`;
     try {
@@ -4748,16 +4910,22 @@ export class SQLiteStorageAdapter implements StorageAdapter {
         continue;
       }
 
-      const fieldNames = Object.keys(key).map(fieldName => this._normalizeIndexColumnName(fieldName));
-      if (fieldNames.some(fieldName => !columns.has(fieldName))) {
+      const indexFieldExpressions = Object.keys(key).map(fieldName =>
+        this._buildIndexFieldExpression(fieldName)
+      );
+      if (
+        indexFieldExpressions.some(({ requiredColumns }) =>
+          requiredColumns.some(columnName => !columns.has(columnName))
+        )
+      ) {
         continue;
       }
 
       const idxName = `"${index.name.replace(/"/g, '""')}"`;
-      const cols = fieldNames.map(fieldName => `"${fieldName.replace(/"/g, '""')}"`);
+      const cols = indexFieldExpressions.map(({ expression }) => expression);
       let sql = `CREATE ${index.unique ? 'UNIQUE ' : ''}INDEX IF NOT EXISTS ${idxName} ON ${tableName} (${cols.join(', ')})`;
       if (index.sparse) {
-        sql += ` WHERE ${cols.map(column => `${column} IS NOT NULL`).join(' AND ')}`;
+        sql += ` WHERE ${cols.map(expression => `${expression} IS NOT NULL`).join(' AND ')}`;
       }
 
       try {

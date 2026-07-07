@@ -1,6 +1,7 @@
 // @flow
 
 const stableStringify = require('safe-stable-stringify');
+const numericArrayIndexPattern = /^(0|[1-9]\d*)$/;
 
 // Keep object-key order deterministic so equality-sensitive array operations
 // behave consistently across logically equivalent payloads.
@@ -14,6 +15,11 @@ const parseJSONArray = (value: any): Array<any> => {
     return [];
   }
 };
+
+// Treat only canonical non-negative integers as potential array indexes.
+// Values like "01" stay object keys because Parse field paths can target both.
+const isNumericArrayIndexComponent = (value: any): boolean =>
+  typeof value === 'string' && numericArrayIndexPattern.test(value);
 
 const removeRegexWhiteSpace = (regex: string) => {
   let normalizedRegex = regex;
@@ -169,6 +175,7 @@ const getSimpleNormalizedRegexInfo = (
 module.exports = {
   canonicalJSONStringify,
   getSimpleNormalizedRegexInfo,
+  isNumericArrayIndexComponent,
   normalizeRegexPattern,
   parseJSONArray,
 };

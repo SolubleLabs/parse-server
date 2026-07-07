@@ -1305,3 +1305,89 @@
   - file bytes are not stored in SQLite by default
     - with an explicit `databaseAdapter`, Parse Server also requires an explicit `filesAdapter`
     - SQLite stores Parse metadata / file names only; actual file bytes go through the chosen files adapter
+
+### 2026-07-07: Numeric Dot-Path Heuristic Removal
+
+- The consultant note in `bad_heuristics.md` is correct:
+  - `sentPerUTCOffset.1` is ambiguous in SQLite JSON path terms
+  - the earlier `numericJsonObjectKeyRootFields` whitelist was a narrow patch, not a real solution
+- Parse itself also relies on numeric dot segments meaning array indexes in generic behavior:
+  - `spec/ParseObject.spec.js`
+    - `items.1.value`
+    - `items.0`
+  - so flipping all numeric segments to object keys would break valid Parse behavior
+- Replaced the whitelist with runtime parent-type resolution:
+  - read/query side:
+    - unambiguous paths still use native `json_extract(...)`
+    - paths with canonical numeric segments now emit SQL that checks the current JSON container type at each step
+    - if parent is `array`, use `[n]`
+    - if parent is `object`, use `."n"`
+  - write/update side:
+    - unambiguous nested updates still use native `json_set(...)` / `json_remove(...)`
+    - ambiguous numeric nested updates now go through a targeted SQLite UDF:
+      - `parse_json_apply_path_mutation(...)`
+    - this keeps the JS fallback scoped to the cases SQLite path syntax cannot disambiguate on its own
+- Missing-container policy in the new write path:
+  - preserve the existing runtime container when it already exists
+  - when the root nested field is missing, default from schema:
+    - `Array` root fields default to `[]`
+    - everything else defaults to `{}`
+  - deeper missing ambiguous children still require a policy choice because Parse dot syntax has already lost the distinction there
+- Targeted greens after the change:
+  - `npm run build`
+  - `spec/SQLiteStorageAdapter.spec.js`
+    - `22 specs, 0 failures`
+    - includes:
+      - UTC-offset object-key regression
+      - mixed path regression:
+        - `payload.counters.1`
+        - `payload.rows.0.1`
+        - `payload.matrix.0.1`
+  - `spec/PushWorker.spec.js`
+    - `12 specs, 0 failures`
+  - `spec/ParseObject.spec.js --filter='can query array nested fields'`
+    - green when run serially
+- One false negative happened during validation:
+  - I mistakenly launched multiple server-backed jasmine runs in parallel against the shared Parse test port
+  - that produced a bogus `fetch failed` in the filtered `ParseObject` check
+  - direct adapter reproduction for:
+    - `items.1.value > 5`
+    - `items.0 < 3`
+    - `items.0 == 5`
+    - `items.0 != 5`
+    was already green, and the serial rerun of the server-backed spec was green too
+- Performance impact of this fix should be limited:
+  - ordinary dot paths still stay on SQLite native JSON operators
+  - only numerically ambiguous paths pay the dynamic-path cost
+  - this is the best current tradeoff between correctness and keeping hot paths out of JS
+  - quick synthetic extraction probe on `better-sqlite3` / in-memory SQLite:
+    - fixed `json_extract(...)`: ~`0.68 µs` / op
+    - dynamic/container-type-aware extraction shape: ~`1.18-1.45 µs` / op
+  - interpretation:
+    - the ambiguous-path logic is measurably slower than a fixed path
+    - but it is still low absolute overhead and does not hit ordinary non-ambiguous paths
+
+### 2026-07-07: Dotted Index Expressions Aligned With Query Expressions
+
+- Consultant note in `heuristics_redux.md` is also correct:
+  - SQLite expression indexes only help if query SQL and `CREATE INDEX` SQL use the same effective expression shape
+  - before this patch, dotted-path queries already used `transformDotField(...)`, but generic SQLite index creation still assumed flat storage columns
+- Fixed the drift in the adapter boundary:
+  - added `_normalizeIndexFieldPath(...)`
+  - added `_buildIndexFieldExpression(...)`
+  - `ensureIndex()`, `ensureUniqueness()`, and `createIndexes()` now compile dotted index keys through the same expression builder used by query/sort/aggregate reads
+  - dotted index validation now checks the root storage field instead of pretending the whole dotted path is a real SQLite column
+- Practical effect:
+  - index creation on paths like `payload.rows.0.1` now creates an expression index over the same runtime-type-aware `CASE ... json_extract(...) ...` expression used in `WHERE`
+  - this keeps planner matching viable for ambiguous numeric JSON segments
+- Regression coverage added:
+  - `spec/SQLiteStorageAdapter.spec.js`
+    - creates index on `payload.rows.0.1`
+    - runs `EXPLAIN QUERY PLAN`
+    - verifies SQLite reports use of the created index name
+  - rerun result after the patch:
+    - `spec/SQLiteStorageAdapter.spec.js`
+    - `23 specs, 0 failures`
+- Validation caveat logged:
+  - one failed run was my own mistake from launching the spec in parallel with `npm run build`
+  - rerunning after the build completed was green

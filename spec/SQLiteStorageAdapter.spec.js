@@ -256,6 +256,55 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
     ).toBeRejected();
   });
 
+  it('creates expression indexes for dotted array/object paths using the query expression', async () => {
+    const schema = {
+      className: 'IndexedNumericDotPathClass',
+      fields: {
+        objectId: { type: 'String' },
+        payload: { type: 'Object' },
+      },
+    };
+    await adapter.createClass('IndexedNumericDotPathClass', schema);
+    await adapter.createObject('IndexedNumericDotPathClass', schema, {
+      objectId: 'idx1',
+      payload: {
+        rows: [{ '1': 'match-me' }],
+      },
+    });
+    await adapter.createObject('IndexedNumericDotPathClass', schema, {
+      objectId: 'idx2',
+      payload: {
+        rows: [{ '1': 'other' }],
+      },
+    });
+
+    await adapter.createIndex(
+      'IndexedNumericDotPathClass',
+      { 'payload.rows.0.1': 1 },
+      { name: 'payload_rows_0_1' }
+    );
+
+    const where = adapter._buildWhereClause(
+      'IndexedNumericDotPathClass',
+      schema,
+      { 'payload.rows.0.1': 'match-me' }
+    );
+    const queryPlan = adapter
+      ._prepare(
+        `EXPLAIN QUERY PLAN SELECT "objectId" FROM ${adapter._tableName('IndexedNumericDotPathClass')} WHERE ${where.sql}`
+      )
+      .all(...where.params);
+
+    expect(
+      queryPlan.some(row => typeof row.detail === 'string' && row.detail.includes('payload_rows_0_1'))
+    ).toBeTrue();
+
+    const results = await adapter.find('IndexedNumericDotPathClass', schema, {
+      'payload.rows.0.1': 'match-me',
+    });
+    expect(results.map(result => result.objectId)).toEqual(['idx1']);
+  });
+
   it('cleans up FTS artifacts when deleting text indexes', async () => {
     const schema = {
       className: 'FTSIndexClass',
@@ -401,6 +450,87 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
     const results = await adapter.find('NestedArrayClass', schema, { objectId: 'nested1' });
     expect(results.length).toBe(1);
     expect(results[0].a).toEqual({ foo: ['b', 'c'] });
+  });
+
+  it('treats positive UTC offset keys as object members instead of array indexes', async () => {
+    const schema = {
+      className: 'PushStatusLikeClass',
+      fields: {
+        objectId: { type: 'String' },
+        sentPerUTCOffset: { type: 'Object' },
+        failedPerUTCOffset: { type: 'Object' },
+      },
+    };
+    await adapter.createClass('PushStatusLikeClass', schema);
+    await adapter.createObject('PushStatusLikeClass', schema, {
+      objectId: 'push1',
+    });
+
+    await adapter.updateObjectsByQuery(
+      'PushStatusLikeClass',
+      schema,
+      { objectId: 'push1' },
+      {
+        'sentPerUTCOffset.1': { __op: 'Increment', amount: 1 },
+        'failedPerUTCOffset.1': { __op: 'Increment', amount: 2 },
+      }
+    );
+
+    const results = await adapter.find('PushStatusLikeClass', schema, {
+      'sentPerUTCOffset.1': 1,
+      'failedPerUTCOffset.1': 2,
+    });
+    expect(results.length).toBe(1);
+    expect(results[0].sentPerUTCOffset).toEqual({ '1': 1 });
+    expect(results[0].failedPerUTCOffset).toEqual({ '1': 2 });
+  });
+
+  it('resolves numeric dot segments from the runtime parent container type', async () => {
+    const schema = {
+      className: 'NumericDotPathClass',
+      fields: {
+        objectId: { type: 'String' },
+        payload: { type: 'Object' },
+      },
+    };
+    await adapter.createClass('NumericDotPathClass', schema);
+    await adapter.createObject('NumericDotPathClass', schema, {
+      objectId: 'numeric1',
+      payload: {
+        counters: { '1': 11 },
+        rows: [{ '1': 'nested-object-key' }],
+        matrix: [[0, 7]],
+      },
+    });
+
+    let results = await adapter.find('NumericDotPathClass', schema, {
+      'payload.counters.1': 11,
+    });
+    expect(results.length).toBe(1);
+
+    results = await adapter.find('NumericDotPathClass', schema, {
+      'payload.rows.0.1': 'nested-object-key',
+    });
+    expect(results.length).toBe(1);
+
+    results = await adapter.find('NumericDotPathClass', schema, {
+      'payload.matrix.0.1': 7,
+    });
+    expect(results.length).toBe(1);
+
+    await adapter.updateObjectsByQuery(
+      'NumericDotPathClass',
+      schema,
+      { objectId: 'numeric1' },
+      {
+        'payload.rows.0.1': 'updated-object-key',
+      }
+    );
+
+    results = await adapter.find('NumericDotPathClass', schema, { objectId: 'numeric1' });
+    expect(results.length).toBe(1);
+    expect(results[0].payload.rows[0]).toEqual({ '1': 'updated-object-key' });
+    expect(results[0].payload.matrix[0][1]).toBe(7);
   });
 
   it('treats array object equality consistently across key order for addUnique/remove', async () => {
