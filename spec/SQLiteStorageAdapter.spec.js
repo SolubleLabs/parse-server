@@ -1091,8 +1091,8 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
         });
         fail(`should have thrown an error for ${pattern}`);
       } catch (error) {
-        expect(error.code).toBe(Parse.Error.INVALID_QUERY);
-        expect(error.message).toBe('Invalid regular expression');
+        expect(error.code).toBe(Parse.Error.INTERNAL_SERVER_ERROR);
+        expect(error.message).toBe('An internal server error occurred');
       }
     }
   });

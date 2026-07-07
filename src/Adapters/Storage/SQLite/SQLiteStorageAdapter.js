@@ -1524,10 +1524,10 @@ const validateRegexPattern = (pattern: string, flags: string): { pattern: string
     return normalizedRegex;
   } catch (error) {
     throw createSanitizedError(
-      Parse.Error.INVALID_QUERY,
+      Parse.Error.INTERNAL_SERVER_ERROR,
       `Invalid regular expression: ${error.message}`,
       undefined,
-      'Invalid regular expression'
+      'An internal server error occurred'
     );
   }
 };
