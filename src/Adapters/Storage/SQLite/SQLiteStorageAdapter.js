@@ -89,6 +89,7 @@ const aggregateDateMatchOperators = new Set([
 ]);
 const sqliteShutdownDrainDelayMs = 200;
 const nullFieldTrackerColumn = '_nullFields';
+const writeSequenceColumn = '_writeSeq';
 const sqliteEncodedTableNamePrefix = '__psa__';
 const implicitSQLiteUserColumnFields = Object.freeze({
   _hashed_password: { type: 'String' },
@@ -119,6 +120,9 @@ const userDateLikeStringFields = new Set([
   '_perishable_token_expires_at',
   '_password_changed_at',
 ]);
+
+const isAdapterInternalColumn = (fieldName: string): boolean =>
+  fieldName === nullFieldTrackerColumn || fieldName === writeSequenceColumn;
 
 const temporarySQLiteDirectories = new Set();
 let sharedMemorySQLiteDatabase;
@@ -388,6 +392,7 @@ const toParseSchema = schema => {
   delete fields._wperm;
   delete fields._rperm;
   delete fields[nullFieldTrackerColumn];
+  delete fields[writeSequenceColumn];
 
   let clps = defaultCLPS;
   if (schema.classLevelPermissions) {
@@ -431,9 +436,12 @@ const normalizeStoredSchemaObject = (className, schema) => {
     className: className || schema.className,
   };
   const fields = { ...((schema && schema.fields) || {}) };
-  Object.keys(fields).forEach(fieldName => {
+  for (const fieldName in fields) {
+    if (!Object.prototype.hasOwnProperty.call(fields, fieldName)) {
+      continue;
+    }
     fields[fieldName] = normalizeSchemaFieldDefinition(fields[fieldName]);
-  });
+  }
   normalizedSchema.fields = fields;
   return normalizedSchema;
 };
@@ -448,9 +456,12 @@ const toSQLiteSchema = schema => {
     schema.fields._rperm = { type: 'Array', contents: { type: 'String' } };
   }
   if (schema.className === '_User') {
-    Object.keys(implicitSQLiteUserColumnFields).forEach(fieldName => {
+    for (const fieldName in implicitSQLiteUserColumnFields) {
+      if (!Object.prototype.hasOwnProperty.call(implicitSQLiteUserColumnFields, fieldName)) {
+        continue;
+      }
       schema.fields[fieldName] = { ...implicitSQLiteUserColumnFields[fieldName] };
-    });
+    }
   }
   return schema;
 };
@@ -708,6 +719,25 @@ const toSQLiteValue = (value: any) => {
   return value;
 };
 
+const shouldTrackCoercedNullStorageValue = (value: any, sqliteValue: any): boolean => {
+  if (sqliteValue !== null) {
+    return false;
+  }
+  if (value === null) {
+    return true;
+  }
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+  if (value.__type === 'Pointer') {
+    return value.objectId == null;
+  }
+  if (value.__type === 'Date') {
+    return value.iso == null;
+  }
+  return false;
+};
+
 const getUpdateValueForSchemaInference = (fieldName: string, fieldValue: any): any => {
   if (fieldValue === null || typeof fieldValue === 'undefined') {
     return undefined;
@@ -763,11 +793,24 @@ const getExplicitNullFieldMatchExpression = (fieldName: string): { sql: string, 
 const waitForNextEventLoopTurn = (() => {
   let postMessageToNextTurn;
   if (typeof MessageChannel === 'function') {
-    const pendingResolvers = [];
+    let pendingResolvers = [];
+    let pendingResolverHead = 0;
     const { port1, port2 } = new MessageChannel();
+    if (typeof port1.unref === 'function') {
+      port1.unref();
+    }
+    if (typeof port2.unref === 'function') {
+      port2.unref();
+    }
     port1.onmessage = () => {
-      const resolve = pendingResolvers.shift();
+      const resolve = pendingResolvers[pendingResolverHead];
       if (resolve) {
+        pendingResolvers[pendingResolverHead] = undefined;
+        pendingResolverHead += 1;
+        if (pendingResolverHead > 1024 && pendingResolverHead * 2 >= pendingResolvers.length) {
+          pendingResolvers = pendingResolvers.slice(pendingResolverHead);
+          pendingResolverHead = 0;
+        }
         resolve();
       }
     };
@@ -1644,8 +1687,10 @@ export class SQLiteStorageAdapter implements StorageAdapter {
   _nullFieldTrackerReadyClasses: Set<string>;
   _schemaCache: Map<string, any>;
   _resolvedTableNames: Map<string, string>;
+  _tableColumnsCache: Map<string, Array<string>>;
   _temporaryDirectory: ?string;
   _usesSharedMemoryDatabase: boolean;
+  _lastWriteSequence: number;
 
   constructor(options: any = {}) {
     applySQLiteHandleIncludePatch();
@@ -1661,8 +1706,10 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     this._nullFieldTrackerReadyClasses = new Set();
     this._schemaCache = new Map();
     this._resolvedTableNames = new Map();
+    this._tableColumnsCache = new Map();
     this._temporaryDirectory = null;
     this._usesSharedMemoryDatabase = false;
+    this._lastWriteSequence = 0;
     this._isShutDown = false;
 
     const dbOptions = getDatabaseOptionsFromURI(this._uri);
@@ -1700,6 +1747,15 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     return stmt;
   }
 
+  _nextWriteSequence(): number {
+    const sequenceBase = Date.now() * 1000;
+    this._lastWriteSequence =
+      sequenceBase > this._lastWriteSequence
+        ? sequenceBase
+        : this._lastWriteSequence + 1;
+    return this._lastWriteSequence;
+  }
+
   _notifySchemaChange() {
     if (this.enableSchemaHooks) {
       this._onSchemaChange();
@@ -1729,6 +1785,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     this._nullFieldTrackerReadyClasses.clear();
     this._schemaCache.clear();
     this._resolvedTableNames.clear();
+    this._tableColumnsCache.clear();
     this._onSchemaChange = () => {};
     if (this._temporaryDirectory) {
       temporarySQLiteDirectories.delete(this._temporaryDirectory);
@@ -1774,6 +1831,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     this._nullFieldTrackerReadyClasses.clear();
     this._schemaCache.clear();
     this._resolvedTableNames.clear();
+    this._tableColumnsCache.clear();
     try {
       const rows = this._db.prepare('SELECT "className", "schema" FROM "_SCHEMA"').all();
       for (const row of rows) {
@@ -1835,15 +1893,13 @@ export class SQLiteStorageAdapter implements StorageAdapter {
       return;
     }
     const db = dbOverride || this._db;
-    const rawName = this._rawTableName(className, db);
-    const hasColumn = db
-      .prepare(`PRAGMA table_info(${this._quoteRawTableName(rawName)})`)
-      .all()
-      .some(col => col.name === nullFieldTrackerColumn);
+    const existingColumns = this._getTableColumns(className, db);
+    const hasColumn = existingColumns.includes(nullFieldTrackerColumn);
     if (!hasColumn) {
       db.exec(
         `ALTER TABLE ${this._tableName(className, db)} ADD COLUMN "${nullFieldTrackerColumn}" TEXT`
       );
+      this._setTableColumnsCache(className, [...existingColumns, nullFieldTrackerColumn], db);
     }
     this._nullFieldTrackerReadyClasses.add(className);
   }
@@ -1859,6 +1915,30 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     this._nullFieldTrackerReadyClasses.delete(className);
     this._schemaCache.delete(className);
     this._resolvedTableNames.delete(className);
+    this._tableColumnsCache.delete(className);
+  }
+
+  _shouldCacheTableColumns(connection?: any): boolean {
+    return !connection || connection === this._db;
+  }
+
+  _setTableColumnsCache(className: string, columns: Array<string>, connection?: any): Array<string> {
+    if (!this._shouldCacheTableColumns(connection)) {
+      return columns;
+    }
+    const normalizedColumns = [...columns];
+    this._tableColumnsCache.set(className, normalizedColumns);
+    return normalizedColumns;
+  }
+
+  _getFreshTableColumns(className: string, connection?: any): Array<string> {
+    const rawName = this._rawTableName(className, connection);
+    const db = connection || this._db;
+    const columns = db
+      .prepare(`PRAGMA table_info(${this._quoteRawTableName(rawName)})`)
+      .all()
+      .map(column => column.name);
+    return this._setTableColumnsCache(className, columns, connection);
   }
 
   async classExists(className: string, dbOverride?: any): Promise<boolean> {
@@ -1883,12 +1963,13 @@ export class SQLiteStorageAdapter implements StorageAdapter {
   }
 
   _getTableColumns(className: string, connection?: any): Array<string> {
-    const rawName = this._rawTableName(className, connection);
-    const db = connection || this._db;
-    return db
-      .prepare(`PRAGMA table_info(${this._quoteRawTableName(rawName)})`)
-      .all()
-      .map(column => column.name);
+    if (this._shouldCacheTableColumns(connection)) {
+      const cachedColumns = this._tableColumnsCache.get(className);
+      if (cachedColumns) {
+        return [...cachedColumns];
+      }
+    }
+    return this._getFreshTableColumns(className, connection);
   }
 
   _rawFTSTableName(className: string, fieldName: string, diacriticSensitive: boolean): string {
@@ -2012,18 +2093,26 @@ export class SQLiteStorageAdapter implements StorageAdapter {
   async _ensureColumnsExist(className: string, row: Object, schema?: SchemaType, dbOverride?: any): Promise<void> {
     const db = dbOverride || this._db;
     const tableName = this._tableName(className);
-    const rawName = this._rawTableName(className);
-    const tableInfo = db.prepare(`PRAGMA table_info(${this._quoteRawTableName(rawName)})`).all();
-    const existingCols = new Set(tableInfo.map(col => col.name));
+    const existingCols = new Set(this._getTableColumns(className, db));
 
     const fields = schema ? schema.fields || {} : {};
     const cachedSchema = this._schemaCache.get(className) || { fields: {} };
     let schemaChanged = false;
 
-    for (const key of Object.keys(row)) {
+    for (const key in row) {
+      if (!Object.prototype.hasOwnProperty.call(row, key)) {
+        continue;
+      }
       if (key === nullFieldTrackerColumn) {
         if (!existingCols.has(key)) {
           db.exec(`ALTER TABLE ${tableName} ADD COLUMN "${key}" TEXT`);
+          existingCols.add(key);
+        }
+        continue;
+      }
+      if (key === writeSequenceColumn) {
+        if (!existingCols.has(key)) {
+          db.exec(`ALTER TABLE ${tableName} ADD COLUMN "${key}" INTEGER`);
           existingCols.add(key);
         }
         continue;
@@ -2080,6 +2169,8 @@ export class SQLiteStorageAdapter implements StorageAdapter {
         dbOverride
       );
     }
+
+    this._setTableColumnsCache(className, [...existingCols], db);
   }
 
   async setClassLevelPermissions(className: string, clps: any): Promise<void> {
@@ -2121,10 +2212,13 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     const fields = Object.assign({}, sqliteSchema ? sqliteSchema.fields : {});
 
     const colDefs = [];
-    Object.keys(fields).forEach(fieldName => {
+    for (const fieldName in fields) {
+      if (!Object.prototype.hasOwnProperty.call(fields, fieldName)) {
+        continue;
+      }
       const fieldType = fields[fieldName];
       if (fieldType.type === 'Relation') {
-        return;
+        continue;
       }
       const sqliteType = parseTypeToSQLiteType(fieldType);
       if (fieldName === 'objectId') {
@@ -2132,15 +2226,36 @@ export class SQLiteStorageAdapter implements StorageAdapter {
       } else {
         colDefs.push(`"${fieldName.replace(/"/g, '""')}" ${sqliteType}`);
       }
-    });
+    }
 
     if (!fields.objectId) {
       colDefs.unshift(`"objectId" TEXT PRIMARY KEY`);
     }
     colDefs.push(`"${nullFieldTrackerColumn}" TEXT`);
+    colDefs.push(`"${writeSequenceColumn}" INTEGER`);
 
     const createStmt = `CREATE TABLE IF NOT EXISTS ${tableName} (${colDefs.join(', ')})`;
     db.exec(createStmt);
+    const createdColumns = [];
+    let hasObjectIdColumn = false;
+    for (const fieldName in fields) {
+      if (!Object.prototype.hasOwnProperty.call(fields, fieldName)) {
+        continue;
+      }
+      if (fields[fieldName].type === 'Relation') {
+        continue;
+      }
+      if (fieldName === 'objectId') {
+        hasObjectIdColumn = true;
+      }
+      createdColumns.push(fieldName);
+    }
+    if (!hasObjectIdColumn) {
+      createdColumns.unshift('objectId');
+    }
+    createdColumns.push(nullFieldTrackerColumn);
+    createdColumns.push(writeSequenceColumn);
+    this._setTableColumnsCache(className, createdColumns, db);
 
     const isParseClass = isSQLiteInternalClass(className) ? 0 : 1;
     const finalSchema = storedSchema;
@@ -2178,7 +2293,6 @@ export class SQLiteStorageAdapter implements StorageAdapter {
 
   async addFieldIfNotExists(className: string, fieldName: string, type: any): Promise<void> {
     const tableName = this._tableName(className);
-    const rawName = this._rawTableName(className);
 
     if (!(await this.classExists(className))) {
       await this._ensureClassExists(className, { fields: { [fieldName]: type } });
@@ -2202,13 +2316,14 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     }
 
     if (type.type !== 'Relation') {
-      const tableInfo = this._db.prepare(`PRAGMA table_info(${this._quoteRawTableName(rawName)})`).all();
-      const exists = tableInfo.some(col => col.name === fieldName);
+      const columns = this._getTableColumns(className);
+      const exists = columns.includes(fieldName);
       if (!exists) {
         const sqliteType = parseTypeToSQLiteType(type);
         this._db.exec(
           `ALTER TABLE ${tableName} ADD COLUMN "${fieldName.replace(/"/g, '""')}" ${sqliteType}`
         );
+        this._setTableColumnsCache(className, [...columns, fieldName]);
       }
     }
 
@@ -2242,12 +2357,15 @@ export class SQLiteStorageAdapter implements StorageAdapter {
       try {
         const schema = JSON.parse(row.schema);
         if (schema && schema.fields) {
-          Object.keys(schema.fields).forEach(field => {
+          for (const field in schema.fields) {
+            if (!Object.prototype.hasOwnProperty.call(schema.fields, field)) {
+              continue;
+            }
             if (schema.fields[field].type === 'Relation') {
               const joinTableName = this._tableName(this._joinTableClassName(field, className));
               this._db.exec(`DROP TABLE IF EXISTS ${joinTableName}`);
             }
-          });
+          }
         }
       } catch {
         /* */
@@ -2271,6 +2389,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     this._nullFieldTrackerReadyClasses.clear();
     this._schemaCache.clear();
     this._resolvedTableNames.clear();
+    this._tableColumnsCache.clear();
     this._initSchemaTable();
     this._notifySchemaChange();
   }
@@ -2297,13 +2416,23 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     }
 
     if (schemaObj.indexes) {
-      Object.keys(schemaObj.indexes).forEach(indexName => {
+      for (const indexName in schemaObj.indexes) {
+        if (!Object.prototype.hasOwnProperty.call(schemaObj.indexes, indexName)) {
+          continue;
+        }
         const index = schemaObj.indexes[indexName];
-        const indexFields = index ? Object.keys(index) : [];
+        const indexFields = [];
+        if (index) {
+          for (const fieldName in index) {
+            if (Object.prototype.hasOwnProperty.call(index, fieldName)) {
+              indexFields.push(fieldName);
+            }
+          }
+        }
         if (indexFields.some(fieldName => deletedFieldNames.has(fieldName))) {
           delete schemaObj.indexes[indexName];
         }
-      });
+      }
       if (Object.keys(schemaObj.indexes).length === 0) {
         delete schemaObj.indexes;
       }
@@ -2348,6 +2477,11 @@ export class SQLiteStorageAdapter implements StorageAdapter {
           `ALTER TABLE ${rebuildTableName} RENAME TO "${rawName.replace(/"/g, '""')}"`
         );
         this._stmtCache.clear();
+        this._setTableColumnsCache(
+          className,
+          keptColumns.map(column => column.name),
+          this._db
+        );
       }
     }
 
@@ -2503,8 +2637,12 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     const output = {};
     const legacyACL = {};
 
-    for (const key of Object.keys(row || {})) {
-      let value = row[key];
+    const sourceRow = row || {};
+    for (const key in sourceRow) {
+      if (!Object.prototype.hasOwnProperty.call(sourceRow, key) || isAdapterInternalColumn(key)) {
+        continue;
+      }
+      let value = sourceRow[key];
       if (typeof value === 'string') {
         try {
           value = JSON.parse(value);
@@ -2561,7 +2699,10 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     const copy = handleDotFields({ ...object });
     const explicitNullFields = new Set();
     validateNestedKeys(copy);
-    Object.keys(copy).forEach(key => {
+    for (const key in copy) {
+      if (!Object.prototype.hasOwnProperty.call(copy, key)) {
+        continue;
+      }
       const authDataMatch = key.match(/^_auth_data_([a-zA-Z0-9_]+)$/);
       if (authDataMatch) {
         const provider = authDataMatch[1];
@@ -2569,18 +2710,24 @@ export class SQLiteStorageAdapter implements StorageAdapter {
         copy.authData[provider] = copy[key];
         delete copy[key];
       }
-    });
-    Object.keys(copy).forEach(key => {
+    }
+    for (const key in copy) {
+      if (!Object.prototype.hasOwnProperty.call(copy, key)) {
+        continue;
+      }
       const val = copy[key];
       if (typeof val === 'undefined') {
-        return;
+        continue;
       }
       const sqliteValue = toSQLiteValue(val);
       row[key] = sqliteValue;
-      if (val === null && sqliteValue === null && shouldPersistExplicitNullField(className, key)) {
+      if (
+        shouldPersistExplicitNullField(className, key) &&
+        shouldTrackCoercedNullStorageValue(val, sqliteValue)
+      ) {
         explicitNullFields.add(key);
       }
-    });
+    }
     if (explicitNullFields.size > 0) {
       row[nullFieldTrackerColumn] = JSON.stringify([...explicitNullFields]);
     }
@@ -2596,39 +2743,39 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     const fields = Object.assign({}, cachedSchema ? cachedSchema.fields : {}, schema ? schema.fields : {});
     const explicitNullFields = parseTrackedNullFields(row[nullFieldTrackerColumn]);
 
-    Object.keys(row).forEach(key => {
-      if (key === nullFieldTrackerColumn) {
-        return;
+    for (const key in row) {
+      if (!Object.prototype.hasOwnProperty.call(row, key) || isAdapterInternalColumn(key)) {
+        continue;
       }
       const val = row[key];
       if (val === undefined) {
-        return;
+        continue;
       }
       if (val === null) {
         if (key === 'createdAt' || key === 'updatedAt' || key === '_created_at' || key === '_updated_at') {
-          return;
+          continue;
         }
         if (className === '_User' && (hiddenUserSchemaFields.has(key) || key === 'authData')) {
-          return;
+          continue;
         }
         if (explicitNullFields.has(key)) {
           object[key] = null;
         }
-        return;
+        continue;
       }
       if (key === 'createdAt' || key === 'updatedAt' || key === '_created_at' || key === '_updated_at') {
         const targetKey = key === '_created_at' ? 'createdAt' : key === '_updated_at' ? 'updatedAt' : key;
         object[targetKey] = typeof val === 'string' ? val : new Date(val).toISOString();
-        return;
+        continue;
       }
       if (className === '_Audience') {
         if (key === 'lastUsed' || key === '_last_used') {
           object.lastUsed = typeof val === 'string' ? new Date(val).toISOString() : new Date(val).toISOString();
-          return;
+          continue;
         }
         if (key === 'timesUsed' || key === 'times_used') {
           object.timesUsed = val;
-          return;
+          continue;
         }
       }
 
@@ -2647,7 +2794,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
             __type: 'Date',
             iso: new Date(val).toISOString(),
           };
-          return;
+          continue;
         }
         if (fieldSchema.type === 'Pointer' && typeof val === 'string') {
           object[key] = {
@@ -2655,33 +2802,33 @@ export class SQLiteStorageAdapter implements StorageAdapter {
             className: fieldSchema.targetClass,
             objectId: val,
           };
-          return;
+          continue;
         }
         if (fieldSchema.type === 'Relation') {
           object[key] = {
             __type: 'Relation',
             className: fieldSchema.targetClass,
           };
-          return;
+          continue;
         }
         if (fieldSchema.type === 'File' && typeof val === 'string') {
           object[key] = {
             __type: 'File',
             name: val,
           };
-          return;
+          continue;
         }
         if (fieldSchema.type === 'Date' && typeof val === 'string') {
           object[key] = {
             __type: 'Date',
             iso: val,
           };
-          return;
+          continue;
         }
       }
 
       object[key] = sqliteValueToParseValue(val, fieldSchema);
-    });
+    }
 
     // Explicit nulls may be tracked without a backing SQLite column when Parse
     // accepted a null write before the field had any concrete schema type.
@@ -2704,14 +2851,17 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     });
 
     if (fields) {
-      Object.keys(fields).forEach(key => {
+      for (const key in fields) {
+        if (!Object.prototype.hasOwnProperty.call(fields, key)) {
+          continue;
+        }
         if (fields[key].type === 'Relation' && !object[key]) {
           object[key] = {
             __type: 'Relation',
             className: fields[key].targetClass,
           };
         }
-      });
+      }
     }
 
     return object;
@@ -2735,6 +2885,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     }
     await this._ensureClassExists(className, schema, db);
     const row = this._parseObjectToSQLiteRow(className, object);
+    row[writeSequenceColumn] = this._nextWriteSequence();
     await this._ensureColumnsExist(className, row, schema, db);
     const existingTableColumns = new Set(this._getTableColumns(className, db));
     if (className === '_Idempotency') {
@@ -2742,15 +2893,26 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     }
 
     const persistedRow = {};
-    Object.keys(row).forEach(key => {
+    for (const key in row) {
+      if (!Object.prototype.hasOwnProperty.call(row, key)) {
+        continue;
+      }
       if (key === nullFieldTrackerColumn || row[key] !== null || existingTableColumns.has(key)) {
         persistedRow[key] = row[key];
       }
-    });
+    }
 
-    const cols = Object.keys(persistedRow).map(quoteColumnName);
-    const placeholders = Object.keys(persistedRow).map(() => '?');
-    const values = Object.keys(persistedRow).map(k => persistedRow[k]);
+    const cols = [];
+    const placeholders = [];
+    const values = [];
+    for (const key in persistedRow) {
+      if (!Object.prototype.hasOwnProperty.call(persistedRow, key)) {
+        continue;
+      }
+      cols.push(quoteColumnName(key));
+      placeholders.push('?');
+      values.push(persistedRow[key]);
+    }
 
     const stmtSql = `INSERT INTO ${this._tableName(className)} (${cols.join(', ')}) VALUES (${placeholders.join(', ')})`;
     try {
@@ -3577,8 +3739,13 @@ export class SQLiteStorageAdapter implements StorageAdapter {
 
     {
       const sortParts = [...where.orderBys];
+      let timestampSortDirection;
+      let hasExplicitStableSortKey = false;
       if (sort) {
-        for (const sortKey of Object.keys(sort)) {
+        for (const sortKey in sort) {
+          if (!Object.prototype.hasOwnProperty.call(sort, sortKey)) {
+            continue;
+          }
           if (sortKey === 'score' && sort[sortKey] && sort[sortKey].$meta === 'textScore') {
             sortParts.push(`${textScoreSql} DESC`);
             continue;
@@ -3586,6 +3753,11 @@ export class SQLiteStorageAdapter implements StorageAdapter {
           const normalizedSortKey =
             normalizeStorageFieldName(sortKey);
           const dir = sort[sortKey] > 0 ? 'ASC' : 'DESC';
+          if (normalizedSortKey === 'objectId') {
+            hasExplicitStableSortKey = true;
+          } else if (normalizedSortKey === 'createdAt' || normalizedSortKey === 'updatedAt') {
+            timestampSortDirection = dir;
+          }
           if (normalizedSortKey.indexOf('.') >= 0) {
             sortParts.push(`${transformDotField(normalizedSortKey)} ${dir}`);
           } else {
@@ -3593,6 +3765,17 @@ export class SQLiteStorageAdapter implements StorageAdapter {
             sortParts.push(`${quoteColumnName(normalizedSortKey)} ${dir}`);
           }
         }
+      }
+      if (timestampSortDirection && !hasExplicitStableSortKey) {
+        // Parse timestamps are millisecond-precision. Track write order in a
+        // hidden column so latest updates sort correctly without JS-side resorting.
+        const tableColumns = this._getTableColumns(className, db);
+        if (tableColumns.includes(writeSequenceColumn)) {
+          sortParts.push(
+            `COALESCE(${quoteColumnName(writeSequenceColumn)}, ${tableName}.rowid) ${timestampSortDirection}`
+          );
+        }
+        sortParts.push(`${tableName}.rowid ${timestampSortDirection}`);
       }
       if (sortParts.length > 0) {
         sql += ` ORDER BY ${sortParts.join(', ')}`;
@@ -3720,11 +3903,15 @@ export class SQLiteStorageAdapter implements StorageAdapter {
       },
     };
 
-    for (const fieldName of Object.keys((schema && schema.fields) || {})) {
+    const schemaFields = (schema && schema.fields) || {};
+    for (const fieldName in schemaFields) {
+      if (!Object.prototype.hasOwnProperty.call(schemaFields, fieldName)) {
+        continue;
+      }
       if (fieldName === 'objectId' || fieldName === 'createdAt' || fieldName === 'updatedAt') {
         continue;
       }
-      const field = schema.fields[fieldName];
+      const field = schemaFields[fieldName];
       if (field.type === 'Pointer') {
         nativeSchema.fields[`_p_${fieldName}`] = {
           ...field,
@@ -4500,7 +4687,10 @@ export class SQLiteStorageAdapter implements StorageAdapter {
 
   _applyAggregateSortStage(context: any, sortStage: any, rawFieldNames?: boolean): any {
     const sortParts = [];
-    for (const key of Object.keys(sortStage || {})) {
+    for (const key in sortStage || {}) {
+      if (!Object.prototype.hasOwnProperty.call(sortStage, key)) {
+        continue;
+      }
       const transformedKey = this._transformAggregateSortField(context, key, rawFieldNames);
       const dir = sortStage[key] > 0 ? 'ASC' : 'DESC';
       sortParts.push(
@@ -4896,7 +5086,10 @@ export class SQLiteStorageAdapter implements StorageAdapter {
           : null;
       let hasAuthDataUpdate = authDataUpdate !== null;
 
-      for (const fieldName of Object.keys(updateObject)) {
+      for (const fieldName in updateObject) {
+        if (!Object.prototype.hasOwnProperty.call(updateObject, fieldName)) {
+          continue;
+        }
         const authDataMatch = fieldName.match(/^_auth_data_([a-zA-Z0-9_]+)$/);
         if (!authDataMatch) {
           continue;
@@ -5097,7 +5290,10 @@ export class SQLiteStorageAdapter implements StorageAdapter {
           };
           let authDataExpression = existingAuthDataUpdate.expression;
           const authDataParams = [...existingAuthDataUpdate.params];
-          for (const provider of Object.keys(fieldValue)) {
+          for (const provider in fieldValue) {
+            if (!Object.prototype.hasOwnProperty.call(fieldValue, provider)) {
+              continue;
+            }
             let val = fieldValue[provider];
             if (val && val.__op === 'Delete') {
               val = null;
@@ -5137,17 +5333,26 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     };
 
     if (update.$set) {
-      for (const k of Object.keys(update.$set)) {
+      for (const k in update.$set) {
+        if (!Object.prototype.hasOwnProperty.call(update.$set, k)) {
+          continue;
+        }
         await handleOp(k, update.$set[k]);
       }
     }
     if (update.$inc) {
-      for (const k of Object.keys(update.$inc)) {
+      for (const k in update.$inc) {
+        if (!Object.prototype.hasOwnProperty.call(update.$inc, k)) {
+          continue;
+        }
         await handleOp(k, { __op: 'Increment', amount: update.$inc[k] });
       }
     }
     if (update.$unset) {
-      for (const k of Object.keys(update.$unset)) {
+      for (const k in update.$unset) {
+        if (!Object.prototype.hasOwnProperty.call(update.$unset, k)) {
+          continue;
+        }
         if (k.indexOf('.') >= 0) {
           const dotFieldPath = buildDotFieldPath(k);
           if (!existingTableColumns.has(dotFieldPath.rootFieldName)) {
@@ -5165,22 +5370,34 @@ export class SQLiteStorageAdapter implements StorageAdapter {
       }
     }
     if (update.$add) {
-      for (const k of Object.keys(update.$add)) {
+      for (const k in update.$add) {
+        if (!Object.prototype.hasOwnProperty.call(update.$add, k)) {
+          continue;
+        }
         await handleOp(k, { __op: 'Add', objects: update.$add[k] });
       }
     }
     if (update.$addUnique) {
-      for (const k of Object.keys(update.$addUnique)) {
+      for (const k in update.$addUnique) {
+        if (!Object.prototype.hasOwnProperty.call(update.$addUnique, k)) {
+          continue;
+        }
         await handleOp(k, { __op: 'AddUnique', objects: update.$addUnique[k] });
       }
     }
     if (update.$remove) {
-      for (const k of Object.keys(update.$remove)) {
+      for (const k in update.$remove) {
+        if (!Object.prototype.hasOwnProperty.call(update.$remove, k)) {
+          continue;
+        }
         await handleOp(k, { __op: 'Remove', objects: update.$remove[k] });
       }
     }
 
-    for (const k of Object.keys(update)) {
+    for (const k in update) {
+      if (!Object.prototype.hasOwnProperty.call(update, k)) {
+        continue;
+      }
       if (!k.startsWith('$')) {
         await handleOp(k, update[k]);
       }
@@ -5197,7 +5414,10 @@ export class SQLiteStorageAdapter implements StorageAdapter {
       params.push(...nullFieldTrackerUpdate.params);
     }
 
+    let updateChanges;
     if (setClauses.length > 0) {
+      setClauses.push(`${quoteColumnName(writeSequenceColumn)} = ?`);
+      params.push(this._nextWriteSequence());
       let sql = `UPDATE ${tableName} SET ${setClauses.join(', ')}`;
       if (where.sql) {
         sql += ` WHERE ${where.sql}`;
@@ -5207,10 +5427,26 @@ export class SQLiteStorageAdapter implements StorageAdapter {
         if (shouldYieldBeforeTopLevelSQLiteOperation(transactionalSession)) {
           await waitForNextEventLoopTurn();
         }
-        this._prepare(sql, transactionalSession).run(...params);
+        const result = this._prepare(sql, transactionalSession).run(...params);
+        updateChanges = typeof result.changes === 'number' ? result.changes : undefined;
       } catch (err) {
         throw this._transformDuplicateKeyError(err, className);
       }
+    }
+
+    if (updateChanges === 0) {
+      const stillMatching = await this.find(
+        className,
+        schema,
+        query,
+        { limit: existing.length },
+        {},
+        db
+      );
+      if (!stillMatching || stillMatching.length === 0) {
+        return [];
+      }
+      return stillMatching;
     }
 
     const ids = existing.map(o => o.objectId);
@@ -5247,30 +5483,45 @@ export class SQLiteStorageAdapter implements StorageAdapter {
         Object.assign(createObj, update.$set);
       }
       if (update.$inc) {
-        Object.keys(update.$inc).forEach(key => {
+        for (const key in update.$inc) {
+          if (!Object.prototype.hasOwnProperty.call(update.$inc, key)) {
+            continue;
+          }
           createObj[key] = update.$inc[key];
-        });
+        }
       }
       if (update.$add) {
-        Object.keys(update.$add).forEach(key => {
+        for (const key in update.$add) {
+          if (!Object.prototype.hasOwnProperty.call(update.$add, key)) {
+            continue;
+          }
           createObj[key] = update.$add[key];
-        });
+        }
       }
       if (update.$addUnique) {
-        Object.keys(update.$addUnique).forEach(key => {
+        for (const key in update.$addUnique) {
+          if (!Object.prototype.hasOwnProperty.call(update.$addUnique, key)) {
+            continue;
+          }
           createObj[key] = update.$addUnique[key];
-        });
+        }
       }
       if (update.$unset) {
-        Object.keys(update.$unset).forEach(key => {
+        for (const key in update.$unset) {
+          if (!Object.prototype.hasOwnProperty.call(update.$unset, key)) {
+            continue;
+          }
           delete createObj[key];
-        });
+        }
       }
-      Object.keys(update).forEach(key => {
+      for (const key in update) {
+        if (!Object.prototype.hasOwnProperty.call(update, key)) {
+          continue;
+        }
         if (!key.startsWith('$')) {
           createObj[key] = update[key];
         }
-      });
+      }
       await this.createObject(className, schema, createObj, db);
       return createObj;
     }

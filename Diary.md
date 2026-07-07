@@ -1505,3 +1505,48 @@
 
 ### Result
 - After the adapter fixes above, the external application's full SQLite suite passed in a fresh rerun.
+
+## 2026-07-07 SQLite Performance Audit
+
+### Stable Conclusions
+- The top-level async scheduling hop is cheap in absolute terms:
+  - `MessageChannel` wait once: about `0.0011 ms/op`
+  - `MessageChannel` wait twice: about `0.0018 ms/op`
+  - bare in-memory `better-sqlite3` insert: about `0.0010 ms/op`
+  - insert plus two waits: about `0.0030 ms/op`
+- The queue behind `waitForNextEventLoopTurn()` no longer uses `Array#shift()`:
+  - it now uses a head index and periodic compaction, so dequeue stays O(1)
+  - both message ports are `unref()`'d when the runtime supports it
+- The more important write-path cost was repeated schema probing, not the event-loop hop itself:
+  - steady-state `createObject()` on the adapter measured about `0.024 ms/op`
+  - forcing fresh `PRAGMA table_info(...)` reads on every write pushed the same path to about `0.041 ms/op`
+  - that is roughly a 69% slowdown on the measured micro-benchmark, so caching table columns is worthwhile
+
+### Current Adapter Direction
+- Main-connection table-column metadata is now cached and invalidated on class/field/schema rebuild paths.
+- Transactional side-connections still bypass that cache so uncommitted schema changes do not leak across connections.
+- Null tracking now also preserves typed values that coerce to storage-null, such as pointer payloads missing `objectId`.
+
+## 2026-07-07 SQLite Full-Suite Closure
+
+### Final Adapter Fixes
+- `updateObjectsByQuery()` now preserves optimistic-lock semantics for concurrent single-use token flows:
+  - if the adapter pre-read rows, but the actual `UPDATE ... WHERE ...` changes `0` rows and the original predicate no longer matches, it now returns `[]` instead of returning stale pre-read ids
+  - this fixed the concurrent SMS MFA token reuse regression without touching Parse Server core
+- Timestamp ordering now uses an adapter-local hidden write-sequence column:
+  - new tables include hidden `_writeSeq`
+  - create and update writes stamp `_writeSeq` with a monotonic in-process sequence
+  - `createdAt` / `updatedAt` sorts use `_writeSeq` as the secondary key and `rowid` as the tertiary fallback
+  - this fixed SQLite millisecond-tie ordering for `order by updatedAt` while keeping the behavior adapter-contained
+- Cleaned up several obvious hot-path own-key walks in the adapter:
+  - replaced repeated `Object.keys(...).forEach(...)` cases in create/update/schema paths with `for...in` plus own-property checks
+  - hid `_writeSeq` alongside `_nullFields` from Parse-visible schema and raw compatibility reads
+
+### Validation
+- Focused replay:
+  - `TESTING=1 PARSE_SERVER_TEST_DB=sqlite PARSE_SERVER_TEST_DATABASE_URI=sqlite://:memory: npx jasmine --filter='order by updatedAt' spec/ParseQuery.spec.js`
+  - result: green
+- Full SQLite suite replay:
+  - `TESTING=1 PARSE_SERVER_TEST_DB=sqlite PARSE_SERVER_TEST_DATABASE_URI=sqlite://:memory: npx jasmine --seed=49944 --fail-fast`
+  - result: exit code `0`
+  - summary: `Executed 4143 of 4442 specs (299 pending) in 14 mins 14 secs`
