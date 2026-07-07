@@ -4,6 +4,7 @@
 
 const stableStringify = require('safe-stable-stringify');
 const numericArrayIndexPattern = /^(0|[1-9]\d*)$/;
+const regexLiteralCharacterPattern = /[0-9 ]|\p{L}/u;
 
 // Keep object-key order deterministic so equality-sensitive array operations
 // behave consistently across logically equivalent payloads.
@@ -28,8 +29,7 @@ const removeRegexWhiteSpace = regex => {
   return normalizedRegex.replace(/([^\\])#.*\n/gim, '$1').replace(/^#.*\n/gim, '').replace(/([^\\])\s+/gim, '$1').replace(/^\s+/, '').trim();
 };
 const createLiteralRegex = remaining => remaining.split('').map(c => {
-  const regex = RegExp('[0-9 ]|\\p{L}', 'u');
-  if (c.match(regex) !== null) {
+  if (regexLiteralCharacterPattern.test(c)) {
     return c;
   }
   return /[.*+?^${}()|[\]\\]/.test(c) ? `\\${c}` : c;

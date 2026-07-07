@@ -73,7 +73,8 @@ const removeContainerEntry = (container: any, component: string) => {
   if (Array.isArray(container) && isNumericArrayIndexComponent(component)) {
     const index = Number(component);
     if (index >= 0 && index < container.length) {
-      container.splice(index, 1);
+      // Preserve dotted array positions; Delete should clear the slot, not compact the array.
+      container[index] = null;
     }
     return;
   }

@@ -71,6 +71,17 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
     );
   });
 
+  it('normalizes file sqlite URIs and ignores invalid numeric query options', () => {
+    expect(
+      getDatabaseOptionsFromURI('file:relative/test.sqlite?timeout=bad&cacheSizeKb=4096')
+    ).toEqual({
+      filename: 'relative/test.sqlite',
+      cacheSizeKb: 4096,
+    });
+
+    expect(getDatabaseOptionsFromURI('file::memory:?cache=shared').filename).toBe(':memory:');
+  });
+
   it('creates class and inserts objects', async () => {
     const schema = {
       className: 'TestClass',
@@ -497,6 +508,60 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
     const results = await adapter.find('NestedArrayClass', schema, { objectId: 'nested1' });
     expect(results.length).toBe(1);
     expect(results[0].a).toEqual({ foo: ['b', 'c'] });
+  });
+
+  it('preserves array indexes when deleting dotted numeric paths', async () => {
+    const schema = {
+      className: 'NestedArrayDeleteClass',
+      fields: {
+        objectId: { type: 'String' },
+        payload: { type: 'Object' },
+      },
+    };
+    await adapter.createClass('NestedArrayDeleteClass', schema);
+    await adapter.createObject('NestedArrayDeleteClass', schema, {
+      objectId: 'nested-delete-1',
+      payload: {
+        items: ['a', 'b', 'c'],
+      },
+    });
+
+    await adapter.updateObjectsByQuery(
+      'NestedArrayDeleteClass',
+      schema,
+      { objectId: 'nested-delete-1' },
+      {
+        'payload.items.1': { __op: 'Delete' },
+      }
+    );
+
+    const results = await adapter.find('NestedArrayDeleteClass', schema, {
+      'payload.items.2': 'c',
+    });
+    expect(results.length).toBe(1);
+    expect(results[0].payload.items).toEqual(['a', null, 'c']);
+  });
+
+  it('avoids repeating metadata lookups for cached classExists checks', async () => {
+    const schema = {
+      className: 'CachedClassExists',
+      fields: {
+        objectId: { type: 'String' },
+      },
+    };
+    await adapter.createClass('CachedClassExists', schema);
+    expect(await adapter.classExists('CachedClassExists')).toBeTrue();
+
+    spyOn(adapter._db, 'prepare').and.callThrough();
+
+    expect(await adapter.classExists('CachedClassExists')).toBeTrue();
+
+    const preparedSql = adapter._db.prepare.calls.allArgs().map(args => args[0]);
+    expect(
+      preparedSql.some(
+        sql => typeof sql === 'string' && (sql.includes('sqlite_master') || sql.includes('PRAGMA table_info'))
+      )
+    ).toBeFalse();
   });
 
   it('treats positive UTC offset keys as object members instead of array indexes', async () => {

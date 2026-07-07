@@ -1188,6 +1188,7 @@ class SQLiteStorageAdapter {
     this._onSchemaChange = () => {};
     this._stmtCache = new Map();
     this._existingClasses = new Set();
+    this._nullFieldTrackerReadyClasses = new Set();
     this._schemaCache = new Map();
     this._resolvedTableNames = new Map();
     this._temporaryDirectory = null;
@@ -1241,6 +1242,7 @@ class SQLiteStorageAdapter {
     }
     this._stmtCache.clear();
     this._existingClasses.clear();
+    this._nullFieldTrackerReadyClasses.clear();
     this._schemaCache.clear();
     this._onSchemaChange = () => {};
     if (this._temporaryDirectory) {
@@ -1279,6 +1281,7 @@ class SQLiteStorageAdapter {
   _reloadSchemaStateFromDatabase() {
     this._stmtCache.clear();
     this._existingClasses.clear();
+    this._nullFieldTrackerReadyClasses.clear();
     this._schemaCache.clear();
     this._resolvedTableNames.clear();
     try {
@@ -1338,24 +1341,32 @@ class SQLiteStorageAdapter {
     if (!hasColumn) {
       db.exec(`ALTER TABLE ${this._tableName(className, db)} ADD COLUMN "${nullFieldTrackerColumn}" TEXT`);
     }
+    this._nullFieldTrackerReadyClasses.add(className);
   }
   _tableExists(className, dbOverride) {
     const db = dbOverride || this._db;
     const rawName = this._rawTableName(className, db);
     return this._tableNameExistsByRawName(rawName, db);
   }
+  _forgetCachedClass(className) {
+    this._existingClasses.delete(className);
+    this._nullFieldTrackerReadyClasses.delete(className);
+    this._schemaCache.delete(className);
+    this._resolvedTableNames.delete(className);
+  }
   async classExists(className, dbOverride) {
     const db = dbOverride || this._db;
-    const tableExists = this._tableExists(className, db);
     if (this._existingClasses.has(className)) {
-      if (!tableExists) {
-        this._existingClasses.delete(className);
-        this._resolvedTableNames.delete(className);
-        return false;
+      if (!this._nullFieldTrackerReadyClasses.has(className)) {
+        if (!this._tableExists(className, db)) {
+          this._forgetCachedClass(className);
+          return false;
+        }
+        this._ensureNullFieldTrackerColumn(className, db);
       }
-      this._ensureNullFieldTrackerColumn(className, db);
       return true;
     }
+    const tableExists = this._tableExists(className, db);
     if (tableExists) {
       this._existingClasses.add(className);
       this._ensureNullFieldTrackerColumn(className, db);
@@ -1632,9 +1643,7 @@ class SQLiteStorageAdapter {
     this._dropFTS5ArtifactsForClass(className);
     this._db.exec(`DROP TABLE IF EXISTS ${tableName}`);
     this._prepare('DELETE FROM "_SCHEMA" WHERE "className" = ?').run(className);
-    this._existingClasses.delete(className);
-    this._schemaCache.delete(className);
-    this._resolvedTableNames.delete(className);
+    this._forgetCachedClass(className);
     this._notifySchemaChange();
     return className.indexOf('_Join:') !== 0;
   }
@@ -1645,6 +1654,7 @@ class SQLiteStorageAdapter {
     }
     this._stmtCache.clear();
     this._existingClasses.clear();
+    this._nullFieldTrackerReadyClasses.clear();
     this._schemaCache.clear();
     this._resolvedTableNames.clear();
     this._initSchemaTable();
@@ -1775,6 +1785,11 @@ class SQLiteStorageAdapter {
     this._prepare('INSERT INTO "_SCHEMA" ("className", "schema", "isParseClass") VALUES (?, ?, ?) ON CONFLICT("className") DO UPDATE SET "schema" = excluded."schema", "isParseClass" = excluded."isParseClass"', connection).run(className, JSON.stringify(normalizedSchemaObj), parseClassFlag);
     if (!connection || connection === this._db) {
       this._existingClasses.add(className);
+      if (className === '_SCHEMA' || isJoinTableClass(className)) {
+        this._nullFieldTrackerReadyClasses.delete(className);
+      } else {
+        this._nullFieldTrackerReadyClasses.add(className);
+      }
       this._schemaCache.set(className, normalizedSchemaObj);
     }
   }

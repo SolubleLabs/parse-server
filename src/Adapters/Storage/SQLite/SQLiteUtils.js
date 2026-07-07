@@ -2,6 +2,7 @@
 
 const stableStringify = require('safe-stable-stringify');
 const numericArrayIndexPattern = /^(0|[1-9]\d*)$/;
+const regexLiteralCharacterPattern = /[0-9 ]|\p{L}/u;
 
 // Keep object-key order deterministic so equality-sensitive array operations
 // behave consistently across logically equivalent payloads.
@@ -39,8 +40,7 @@ const createLiteralRegex = (remaining: string) =>
   remaining
     .split('')
     .map(c => {
-      const regex = RegExp('[0-9 ]|\\p{L}', 'u');
-      if (c.match(regex) !== null) {
+      if (regexLiteralCharacterPattern.test(c)) {
         return c;
       }
       return /[.*+?^${}()|[\]\\]/.test(c) ? `\\${c}` : c;

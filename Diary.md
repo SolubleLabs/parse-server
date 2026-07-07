@@ -3,7 +3,7 @@
 ### Constraints
 - Only touch the SQLite adapter boundary and adapter-focused tests.
 - Do not modify Parse Server core or unrelated code to accommodate SQLite.
-- Use nvm Node at `~/.nvm/versions/node/v22.22.0/bin/node` and matching `npm`.
+- Use the repo-declared Node version from `.nvmrc` / `package.json` and the matching `npm` from that same environment.
 
 ### Files Intentionally Modified
 - `src/Adapters/Storage/SQLite/SQLiteStorageAdapter.js`
@@ -1458,12 +1458,23 @@
 - `audit.md` findings verified and fixed where they were still real and contained:
   - `SQLiteClient` now preserves explicit `timeout: 0` instead of silently coercing it back to `5000`
   - `SQLiteConfigParser` now handles malformed percent-encoding in `sqlite://` paths without throwing
+  - `SQLiteConfigParser` now validates parsed numeric query options before assigning them, so malformed `timeout` / `cacheSizeKb` values no longer leak `NaN` into the client options
+  - `SQLiteConfigParser` now normalizes plain `file:` SQLite URIs to actual filenames and maps `file::memory:` forms back to `:memory:` instead of forwarding raw `file:` strings to `better-sqlite3`
   - `SQLiteUtils.getSimpleNormalizedRegexInfo()` now refuses unescaped mid-pattern `^` / `$`, so those patterns stay on the regex path instead of being lowered incorrectly to literal `LIKE`/`GLOB`
+  - dotted numeric `Delete` updates now preserve array slot positions by writing `null` instead of compacting with `splice()`, which keeps later dotted indexes stable
+  - cached `classExists()` calls now stop re-checking `sqlite_master` / `PRAGMA table_info` on hot-path hits after the null-field tracker has been verified once, while still invalidating stale `_SCHEMA` cache entries during the first post-reload check
 - Added red regression coverage in `spec/SQLiteStorageAdapter.spec.js` for:
   - explicit zero timeout
   - malformed URI decoding
+  - `file:` URI normalization and invalid numeric URI options
   - regex mid-anchor semantics
+  - dotted numeric delete preserving array indexes
+  - cached `classExists()` hits avoiding repeated metadata lookups
   - guarded `watch()` completion so the schema-hook unit test cannot finish multiple times
+- Validation after the second audit patch set:
+  - `npm run build`
+  - `PARSE_SERVER_TEST_DB=sqlite TESTING=1 node_modules/.bin/jasmine spec/SQLiteStorageAdapter.spec.js`
+  - result: `29 specs, 0 failures`
 - Intentionally not “fixed” from the audit:
   - the broader regex ReDoS concern is real in principle, but a safe fix is not the same thing as sprinkling heuristics over JavaScript `RegExp`; it needs an explicit compatibility/security policy rather than an ad-hoc partial blocklist
-  - `file:` URI semantics were not changed in this pass because they need a deliberate decision on supported SQLite URI forms instead of an unverified parser tweak
+  - full SQLite URI-filename semantics beyond adapter-owned options are still intentionally not claimed; `better-sqlite3` does not enable SQLite URI mode by default, so this adapter now normalizes ordinary `file:` paths instead of pretending the raw URI string is natively supported

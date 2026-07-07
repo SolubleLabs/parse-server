@@ -1496,6 +1496,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
   _onSchemaChange: () => mixed;
   _stmtCache: Map<string, any>;
   _existingClasses: Set<string>;
+  _nullFieldTrackerReadyClasses: Set<string>;
   _schemaCache: Map<string, any>;
   _resolvedTableNames: Map<string, string>;
   _temporaryDirectory: ?string;
@@ -1512,6 +1513,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     this._onSchemaChange = () => {};
     this._stmtCache = new Map();
     this._existingClasses = new Set();
+    this._nullFieldTrackerReadyClasses = new Set();
     this._schemaCache = new Map();
     this._resolvedTableNames = new Map();
     this._temporaryDirectory = null;
@@ -1571,6 +1573,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     }
     this._stmtCache.clear();
     this._existingClasses.clear();
+    this._nullFieldTrackerReadyClasses.clear();
     this._schemaCache.clear();
     this._onSchemaChange = () => {};
     if (this._temporaryDirectory) {
@@ -1614,6 +1617,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
   _reloadSchemaStateFromDatabase() {
     this._stmtCache.clear();
     this._existingClasses.clear();
+    this._nullFieldTrackerReadyClasses.clear();
     this._schemaCache.clear();
     this._resolvedTableNames.clear();
     try {
@@ -1687,6 +1691,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
         `ALTER TABLE ${this._tableName(className, db)} ADD COLUMN "${nullFieldTrackerColumn}" TEXT`
       );
     }
+    this._nullFieldTrackerReadyClasses.add(className);
   }
 
   _tableExists(className: string, dbOverride?: any): boolean {
@@ -1695,18 +1700,26 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     return this._tableNameExistsByRawName(rawName, db);
   }
 
+  _forgetCachedClass(className: string) {
+    this._existingClasses.delete(className);
+    this._nullFieldTrackerReadyClasses.delete(className);
+    this._schemaCache.delete(className);
+    this._resolvedTableNames.delete(className);
+  }
+
   async classExists(className: string, dbOverride?: any): Promise<boolean> {
     const db = dbOverride || this._db;
-    const tableExists = this._tableExists(className, db);
     if (this._existingClasses.has(className)) {
-      if (!tableExists) {
-        this._existingClasses.delete(className);
-        this._resolvedTableNames.delete(className);
-        return false;
+      if (!this._nullFieldTrackerReadyClasses.has(className)) {
+        if (!this._tableExists(className, db)) {
+          this._forgetCachedClass(className);
+          return false;
+        }
+        this._ensureNullFieldTrackerColumn(className, db);
       }
-      this._ensureNullFieldTrackerColumn(className, db);
       return true;
     }
+    const tableExists = this._tableExists(className, db);
     if (tableExists) {
       this._existingClasses.add(className);
       this._ensureNullFieldTrackerColumn(className, db);
@@ -2077,9 +2090,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     this._dropFTS5ArtifactsForClass(className);
     this._db.exec(`DROP TABLE IF EXISTS ${tableName}`);
     this._prepare('DELETE FROM "_SCHEMA" WHERE "className" = ?').run(className);
-    this._existingClasses.delete(className);
-    this._schemaCache.delete(className);
-    this._resolvedTableNames.delete(className);
+    this._forgetCachedClass(className);
     this._notifySchemaChange();
     return className.indexOf('_Join:') !== 0;
   }
@@ -2091,6 +2102,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     }
     this._stmtCache.clear();
     this._existingClasses.clear();
+    this._nullFieldTrackerReadyClasses.clear();
     this._schemaCache.clear();
     this._resolvedTableNames.clear();
     this._initSchemaTable();
@@ -2257,6 +2269,11 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     ).run(className, JSON.stringify(normalizedSchemaObj), parseClassFlag);
     if (!connection || connection === this._db) {
       this._existingClasses.add(className);
+      if (className === '_SCHEMA' || isJoinTableClass(className)) {
+        this._nullFieldTrackerReadyClasses.delete(className);
+      } else {
+        this._nullFieldTrackerReadyClasses.add(className);
+      }
       this._schemaCache.set(className, normalizedSchemaObj);
     }
   }
