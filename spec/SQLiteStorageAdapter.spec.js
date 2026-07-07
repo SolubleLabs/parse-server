@@ -1,4 +1,8 @@
 const SQLiteStorageAdapter = require('../lib/Adapters/Storage/SQLite/SQLiteStorageAdapter').default;
+const { createClient } = require('../lib/Adapters/Storage/SQLite/SQLiteClient');
+const {
+  getDatabaseOptionsFromURI,
+} = require('../lib/Adapters/Storage/SQLite/SQLiteConfigParser');
 const Parse = require('parse/node');
 
 describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
@@ -48,6 +52,23 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
     } finally {
       configuredAdapter.handleShutdown();
     }
+  });
+
+  it('preserves an explicit sqlite timeout of 0', () => {
+    const db = createClient({ filename: ':memory:', timeout: 0 });
+
+    try {
+      expect(db.pragma('busy_timeout', { simple: true })).toBe(0);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('does not throw on malformed percent-encoding in sqlite URIs', () => {
+    expect(() => getDatabaseOptionsFromURI('sqlite://bad%2path.sqlite')).not.toThrow();
+    expect(getDatabaseOptionsFromURI('sqlite://bad%2path.sqlite').filename).toBe(
+      'bad%2path.sqlite'
+    );
   });
 
   it('creates class and inserts objects', async () => {
@@ -101,10 +122,36 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
   });
 
   it('notifies schema hooks on watch()', done => {
+    let finished = false;
     adapter.watch(() => {
+      if (finished) {
+        return;
+      }
+      finished = true;
       done();
     });
     adapter.createClass('HookClass', { fields: { objectId: { type: 'String' } } });
+  });
+
+  it('does not treat mid-pattern anchors as literal LIKE-compatible regex text', async () => {
+    const schema = {
+      className: 'RegexAnchorClass',
+      fields: {
+        objectId: { type: 'String' },
+        text: { type: 'String' },
+      },
+    };
+    await adapter.createClass('RegexAnchorClass', schema);
+    await adapter.createObject('RegexAnchorClass', schema, {
+      objectId: 'anchor1',
+      text: 'foo^bar',
+    });
+
+    const results = await adapter.find('RegexAnchorClass', schema, {
+      text: { $regex: 'foo^bar' },
+    });
+
+    expect(results).toEqual([]);
   });
 
   it('supports geospatial queries ($nearSphere, $within)', async () => {

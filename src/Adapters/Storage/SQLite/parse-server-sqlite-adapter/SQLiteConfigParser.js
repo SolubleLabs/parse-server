@@ -2,6 +2,14 @@
 
 // Standalone package copy of the built SQLite URI parser.
 
+const decodeSQLitePath = path => {
+  try {
+    return decodeURIComponent(path);
+  } catch {
+    return path;
+  }
+};
+
 function getDatabaseOptionsFromURI(uri) {
   const options = {};
   if (!uri) {
@@ -14,7 +22,7 @@ function getDatabaseOptionsFromURI(uri) {
     if (pathPart === ':memory:' || pathPart === '') {
       options.filename = ':memory:';
     } else {
-      options.filename = decodeURIComponent(pathPart);
+      options.filename = decodeSQLitePath(pathPart);
     }
     if (queryPart) {
       const searchParams = new URLSearchParams(queryPart);

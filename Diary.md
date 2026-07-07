@@ -1453,3 +1453,17 @@
   - 30 repeated isolated reruns were green
   - the next full file-backed rerun was green
 - In-memory broad rerun was intentionally cancelled after the user said not to spend time on it because file-backed is the stricter path.
+
+### Audit Follow-Up
+- `audit.md` findings verified and fixed where they were still real and contained:
+  - `SQLiteClient` now preserves explicit `timeout: 0` instead of silently coercing it back to `5000`
+  - `SQLiteConfigParser` now handles malformed percent-encoding in `sqlite://` paths without throwing
+  - `SQLiteUtils.getSimpleNormalizedRegexInfo()` now refuses unescaped mid-pattern `^` / `$`, so those patterns stay on the regex path instead of being lowered incorrectly to literal `LIKE`/`GLOB`
+- Added red regression coverage in `spec/SQLiteStorageAdapter.spec.js` for:
+  - explicit zero timeout
+  - malformed URI decoding
+  - regex mid-anchor semantics
+  - guarded `watch()` completion so the schema-hook unit test cannot finish multiple times
+- Intentionally not “fixed” from the audit:
+  - the broader regex ReDoS concern is real in principle, but a safe fix is not the same thing as sprinkling heuristics over JavaScript `RegExp`; it needs an explicit compatibility/security policy rather than an ad-hoc partial blocklist
+  - `file:` URI semantics were not changed in this pass because they need a deliberate decision on supported SQLite URI forms instead of an unverified parser tweak

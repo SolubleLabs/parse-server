@@ -150,6 +150,9 @@ const getSimpleNormalizedRegexInfo = (
       }
       return null;
     }
+    if (char === '^' || char === '$') {
+      return null;
+    }
     if ('.*+?()|[{'.includes(char)) {
       return null;
     }

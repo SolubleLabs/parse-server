@@ -1,5 +1,13 @@
 // @flow
 
+const decodeSQLitePath = (path: string): string => {
+  try {
+    return decodeURIComponent(path);
+  } catch {
+    return path;
+  }
+};
+
 function getDatabaseOptionsFromURI(uri: string) {
   const options: Object = {};
   if (!uri) {
@@ -13,7 +21,7 @@ function getDatabaseOptionsFromURI(uri: string) {
     if (pathPart === ':memory:' || pathPart === '') {
       options.filename = ':memory:';
     } else {
-      options.filename = decodeURIComponent(pathPart);
+      options.filename = decodeSQLitePath(pathPart);
     }
     if (queryPart) {
       const searchParams = new URLSearchParams(queryPart);

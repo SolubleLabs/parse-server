@@ -112,6 +112,9 @@ const getSimpleNormalizedRegexInfo = (pattern, flags) => {
       }
       return null;
     }
+    if (char === '^' || char === '$') {
+      return null;
+    }
     if ('.*+?()|[{'.includes(char)) {
       return null;
     }

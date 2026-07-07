@@ -171,7 +171,7 @@ function createClient(options: Object) {
   const filename = options.filename || ':memory:';
   const dbOptions = {
     fileMustExist: options.fileMustExist || false,
-    timeout: options.timeout || 5000,
+    timeout: options.timeout ?? 5000,
     verbose: options.verbose || null,
   };
   const cacheSizeKb = getSQLiteCacheSizeKb(options);
