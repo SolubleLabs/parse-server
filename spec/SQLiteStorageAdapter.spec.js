@@ -132,6 +132,162 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
     expect(results.map(result => result.objectId)).toEqual(['match-me']);
   });
 
+  it('handles large pointer $in queries on scalar pointer fields', async () => {
+    const childSchema = {
+      className: 'LargePointerChild',
+      fields: {
+        objectId: { type: 'String' },
+      },
+    };
+    const schema = {
+      className: 'LargePointerScalarClass',
+      fields: {
+        objectId: { type: 'String' },
+        child: { type: 'Pointer', targetClass: 'LargePointerChild' },
+      },
+    };
+    await adapter.createClass('LargePointerChild', childSchema);
+    await adapter.createClass('LargePointerScalarClass', schema);
+    await adapter.createObject('LargePointerChild', childSchema, {
+      objectId: 'child-match',
+    });
+    await adapter.createObject('LargePointerScalarClass', schema, {
+      objectId: 'parent-match',
+      child: {
+        __type: 'Pointer',
+        className: 'LargePointerChild',
+        objectId: 'child-match',
+      },
+    });
+
+    const longPointerList = [];
+    for (let i = 0; i < 1500; i += 1) {
+      longPointerList.push({
+        __type: 'Pointer',
+        className: 'LargePointerChild',
+        objectId: `missing-child-${i}`,
+      });
+    }
+    longPointerList.push({
+      __type: 'Pointer',
+      className: 'LargePointerChild',
+      objectId: 'child-match',
+    });
+
+    const results = await adapter.find('LargePointerScalarClass', schema, {
+      child: { $in: longPointerList },
+    });
+
+    expect(results.map(result => result.objectId)).toEqual(['parent-match']);
+  });
+
+  it('handles large pointer $in queries on array fields', async () => {
+    const schema = {
+      className: 'LargePointerArrayClass',
+      fields: {
+        objectId: { type: 'String' },
+        children: { type: 'Array' },
+      },
+    };
+    await adapter.createClass('LargePointerArrayClass', schema);
+    await adapter.createObject('LargePointerArrayClass', schema, {
+      objectId: 'parent-array-match',
+      children: [
+        {
+          __type: 'Pointer',
+          className: 'LargePointerArrayChild',
+          objectId: 'child-array-match',
+        },
+      ],
+    });
+
+    const longPointerList = [];
+    for (let i = 0; i < 1500; i += 1) {
+      longPointerList.push({
+        __type: 'Pointer',
+        className: 'LargePointerArrayChild',
+        objectId: `missing-array-child-${i}`,
+      });
+    }
+    longPointerList.push({
+      __type: 'Pointer',
+      className: 'LargePointerArrayChild',
+      objectId: 'child-array-match',
+    });
+
+    const results = await adapter.find('LargePointerArrayClass', schema, {
+      children: { $in: longPointerList },
+    });
+
+    expect(results.map(result => result.objectId)).toEqual(['parent-array-match']);
+  });
+
+  it('handles large date $in queries on scalar date fields', async () => {
+    const schema = {
+      className: 'LargeDateScalarClass',
+      fields: {
+        objectId: { type: 'String' },
+        happenedAt: { type: 'Date' },
+      },
+    };
+    await adapter.createClass('LargeDateScalarClass', schema);
+    await adapter.createObject('LargeDateScalarClass', schema, {
+      objectId: 'date-scalar-match',
+      happenedAt: { __type: 'Date', iso: '2026-07-08T00:00:00.000Z' },
+    });
+
+    const longDateList = [];
+    for (let i = 0; i < 1500; i += 1) {
+      longDateList.push({
+        __type: 'Date',
+        iso: `2026-07-09T00:00:${String(i % 60).padStart(2, '0')}.000Z`,
+      });
+    }
+    longDateList.push({
+      __type: 'Date',
+      iso: '2026-07-08T00:00:00.000Z',
+    });
+
+    const results = await adapter.find('LargeDateScalarClass', schema, {
+      happenedAt: { $in: longDateList },
+    });
+
+    expect(results.map(result => result.objectId)).toEqual(['date-scalar-match']);
+  });
+
+  it('handles large date $in queries on array fields', async () => {
+    const schema = {
+      className: 'LargeDateArrayClass',
+      fields: {
+        objectId: { type: 'String' },
+        importantDates: { type: 'Array' },
+      },
+    };
+    await adapter.createClass('LargeDateArrayClass', schema);
+    await adapter.createObject('LargeDateArrayClass', schema, {
+      objectId: 'date-array-match',
+      importantDates: [{ __type: 'Date', iso: '2026-07-08T00:00:00.000Z' }],
+    });
+
+    const longDateList = [];
+    for (let i = 0; i < 1500; i += 1) {
+      longDateList.push({
+        __type: 'Date',
+        iso: `2026-07-10T00:00:${String(i % 60).padStart(2, '0')}.000Z`,
+      });
+    }
+    longDateList.push({
+      __type: 'Date',
+      iso: '2026-07-08T00:00:00.000Z',
+    });
+
+    const results = await adapter.find('LargeDateArrayClass', schema, {
+      importantDates: { $in: longDateList },
+    });
+
+    expect(results.map(result => result.objectId)).toEqual(['date-array-match']);
+  });
+
   it('treats late storage probes after shutdown as empty results', async () => {
     const schema = {
       className: 'LateShutdownClass',

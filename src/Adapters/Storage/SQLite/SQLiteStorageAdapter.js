@@ -1441,6 +1441,74 @@ const isSQLitePrimitiveSetComparisonValue = (value: any): boolean => {
   return typeof value === 'number' && Number.isFinite(value);
 };
 
+const appendSQLiteSetMembershipClause = (
+  sqlParts: Array<string>,
+  params: Array<any>,
+  valueExpression: string,
+  comparisonValues: Array<any>
+) => {
+  if (comparisonValues.length === 0) {
+    return;
+  }
+  sqlParts.push(`(${valueExpression} IN (SELECT value FROM json_each(?)))`);
+  params.push(JSON.stringify(comparisonValues));
+};
+
+const appendSQLitePointerAnyMatchClauses = (
+  sqlParts: Array<string>,
+  params: Array<any>,
+  valueExpression: string,
+  pointerObjectIds: Array<string>,
+  pointerObjectIdsByClassName: Map<string, Array<string>>
+) => {
+  if (pointerObjectIds.length === 0) {
+    return;
+  }
+
+  appendSQLiteSetMembershipClause(sqlParts, params, valueExpression, pointerObjectIds);
+
+  const pointerJsonClauses = [];
+  for (const [className, classObjectIds] of pointerObjectIdsByClassName) {
+    pointerJsonClauses.push(
+      `(json_extract(${valueExpression}, '$.className') = ? AND ` +
+        `json_extract(${valueExpression}, '$.objectId') IN (SELECT value FROM json_each(?)))`
+    );
+    params.push(className, JSON.stringify(classObjectIds));
+  }
+
+  if (pointerJsonClauses.length > 0) {
+    // Pointer lists are usually same-class, so grouping by class keeps the SQL tree
+    // shallow while still matching JSON-stored pointers by both class and objectId.
+    sqlParts.push(
+      `(json_valid(${valueExpression}) AND json_type(${valueExpression}) = 'object' AND ` +
+        `json_extract(${valueExpression}, '$.__type') = 'Pointer' AND ` +
+        `(${pointerJsonClauses.join(' OR ')}))`
+    );
+  }
+};
+
+const appendSQLiteDateAnyMatchClauses = (
+  sqlParts: Array<string>,
+  params: Array<any>,
+  valueExpression: string,
+  dateIsoValues: Array<string>
+) => {
+  if (dateIsoValues.length === 0) {
+    return;
+  }
+
+  appendSQLiteSetMembershipClause(sqlParts, params, valueExpression, dateIsoValues);
+
+  if (dateIsoValues.length > 0) {
+    sqlParts.push(
+      `(json_valid(${valueExpression}) AND json_type(${valueExpression}) = 'object' AND ` +
+        `json_extract(${valueExpression}, '$.__type') = 'Date' AND ` +
+        `json_extract(${valueExpression}, '$.iso') IN (SELECT value FROM json_each(?)))`
+    );
+    params.push(JSON.stringify(dateIsoValues));
+  }
+};
+
 const getSQLiteAnyMatchExpression = (
   valueExpression: string,
   comparisonValues: Array<any>,
@@ -1452,10 +1520,40 @@ const getSQLiteAnyMatchExpression = (
   const sqlParts = [];
   const params = [];
   const primitiveValues = [];
+  const pointerObjectIds = [];
+  const pointerObjectIdsByClassName = new Map();
+  const dateIsoValues = [];
 
   for (const comparisonValue of comparisonValues) {
     if (isSQLitePrimitiveSetComparisonValue(comparisonValue)) {
       primitiveValues.push(toSQLiteValue(comparisonValue));
+      continue;
+    }
+    if (isPointerValue(comparisonValue)) {
+      pointerObjectIds.push(comparisonValue.objectId);
+      const classObjectIds = pointerObjectIdsByClassName.get(comparisonValue.className);
+      if (classObjectIds) {
+        classObjectIds.push(comparisonValue.objectId);
+      } else {
+        pointerObjectIdsByClassName.set(comparisonValue.className, [comparisonValue.objectId]);
+      }
+      continue;
+    }
+    const sqliteDateValue =
+      comparisonValue &&
+      typeof comparisonValue === 'object' &&
+      !Array.isArray(comparisonValue) &&
+      comparisonValue.__type === 'Date'
+        ? toSQLiteValue(comparisonValue)
+        : null;
+    if (
+      comparisonValue &&
+      typeof comparisonValue === 'object' &&
+      !Array.isArray(comparisonValue) &&
+      comparisonValue.__type === 'Date' &&
+      sqliteDateValue != null
+    ) {
+      dateIsoValues.push(sqliteDateValue);
       continue;
     }
 
@@ -1464,12 +1562,17 @@ const getSQLiteAnyMatchExpression = (
     params.push(...expression.params);
   }
 
-  if (primitiveValues.length > 0) {
-    // Bind large primitive containedIn sets once so SQLite does not hit
-    // expression-depth limits from thousands of generated OR predicates.
-    sqlParts.unshift(`(${valueExpression} IN (SELECT value FROM json_each(?)))`);
-    params.unshift(JSON.stringify(primitiveValues));
-  }
+  // Bind large containedIn sets once so SQLite does not hit expression-depth
+  // limits from thousands of generated OR predicates.
+  appendSQLiteSetMembershipClause(sqlParts, params, valueExpression, primitiveValues);
+  appendSQLitePointerAnyMatchClauses(
+    sqlParts,
+    params,
+    valueExpression,
+    pointerObjectIds,
+    pointerObjectIdsByClassName
+  );
+  appendSQLiteDateAnyMatchClauses(sqlParts, params, valueExpression, dateIsoValues);
 
   return {
     sql: sqlParts.join(' OR '),

@@ -1662,3 +1662,40 @@
 ### Validation
 - Added a SQLite adapter regression spec for a large primitive `$in` query.
 - Ran a direct adapter sanity query with about `33000` objectIds; it returned the expected row instead of throwing.
+
+## 2026-07-08 Pointer And Date Large `$in` Follow-Up
+
+### Finding
+- Primitive-only set lowering was not enough for production workloads that query large lists of Parse pointers / Parse Objects / Parse Dates.
+- Those values were still on the old per-value matcher path, so very large `$in` lists could still explode the SQLite expression tree.
+
+### Fix
+- Added set-based lowering for:
+  - scalar pointer fields
+  - JSON-stored pointer values inside arrays / nested objects
+  - scalar Date fields
+  - JSON-stored Date values inside arrays / nested objects
+- Tightened the hot path so query values are classified once in a single pass:
+  - primitive values
+  - pointer objectIds grouped by class
+  - Date ISO strings
+
+### Validation
+- Added SQLite adapter regressions for large `$in` lists covering:
+  - scalar pointers
+  - array pointers
+  - scalar Dates
+  - array Dates
+- `spec/SQLiteStorageAdapter.spec.js` is green after the follow-up.
+
+## 2026-07-08 ContainedIn Indexing And Type Notes
+
+### Indexing
+- SQLite scalar `IN (SELECT value FROM json_each(?))` keeps the indexed column on the left-hand side, so top-level `objectId` and top-level pointer-objectId matches remain the easy/index-friendly case.
+- Nested pointer-object `containedIn` is different: the matcher checks both extracted `className` and extracted `objectId`, so the ideal index shape is on those extracted subfields rather than only on the whole extracted JSON value.
+
+### Type Behavior
+- SQLite mismatch behavior is mostly "no match, no throw" for `$in` values of the wrong primitive type or wrong object shape.
+- Verified edge case:
+  - SQLite does not match numeric `1` against string `"1"` in the JSON-each set path.
+  - SQLite JSON booleans surface as integer `1` / `0`, so boolean-vs-number is the one fuzzy primitive case to keep in mind.
