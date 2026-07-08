@@ -1631,3 +1631,34 @@
 ### Conclusion
 - Default the SQLite shutdown drain to `2ms`.
 - Keep `PARSE_SQLITE_SHUTDOWN_DRAIN_MS` as the override for local experimentation, including forcing `0`.
+
+### `_Idempotency` Core Ownership Note
+- `_Idempotency` is a real Parse Server core system / volatile class, not just adapter-private glue.
+- Core request middleware owns the runtime behavior:
+  - it reads `x-parse-request-id`
+  - matches configured `idempotencyOptions.paths`
+  - writes `{ reqId, expire }` into `_Idempotency`
+  - duplicate `reqId` becomes `Parse.Error.DUPLICATE_REQUEST`
+- Core bootstrap also owns schema / index setup:
+  - always enforces `_Idempotency` exists
+  - always enforces uniqueness on `reqId`
+  - only creates expiry / TTL-style support for Mongo / Postgres via explicit adapter conditionals
+- Current SQLite support reaches this code path because the adapter prototype chain makes it satisfy `instanceof PostgresStorageAdapter`.
+- Conclusion:
+  - this feature is not adapter-local
+  - a clean upstream shape would be a storage capability hook instead of hard-coded `instanceof` checks
+
+## 2026-07-08 Large Primitive `$in` SQLite Fix
+
+### Finding
+- Large primitive `$in` / `containedIn` sets were still expanding into thousands of `OR` predicates in the SQLite adapter.
+- Real-world imports with very large lookup lists could therefore fail before execution with:
+  - `SqliteError: Expression tree is too large (maximum depth 1000)`
+
+### Fix
+- Primitive string / number / boolean membership now binds once through `json_each(?)` instead of generating one SQL branch per value.
+- Pointer / Parse Date / object comparisons still use the existing per-value matcher because they need the current scalar-vs-JSON equality behavior.
+
+### Validation
+- Added a SQLite adapter regression spec for a large primitive `$in` query.
+- Ran a direct adapter sanity query with about `33000` objectIds; it returned the expected row instead of throwing.

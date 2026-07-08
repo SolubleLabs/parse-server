@@ -1434,16 +1434,54 @@ const getJsonValueMatchExpression = (
   };
 };
 
+const isSQLitePrimitiveSetComparisonValue = (value: any): boolean => {
+  if (typeof value === 'string' || typeof value === 'boolean') {
+    return true;
+  }
+  return typeof value === 'number' && Number.isFinite(value);
+};
+
+const getSQLiteAnyMatchExpression = (
+  valueExpression: string,
+  comparisonValues: Array<any>,
+  getMatchExpression: (valueExpression: string, comparisonValue: any) => {
+    sql: string,
+    params: Array<any>,
+  }
+): { sql: string, params: Array<any> } => {
+  const sqlParts = [];
+  const params = [];
+  const primitiveValues = [];
+
+  for (const comparisonValue of comparisonValues) {
+    if (isSQLitePrimitiveSetComparisonValue(comparisonValue)) {
+      primitiveValues.push(toSQLiteValue(comparisonValue));
+      continue;
+    }
+
+    const expression = getMatchExpression(valueExpression, comparisonValue);
+    sqlParts.push(`(${expression.sql})`);
+    params.push(...expression.params);
+  }
+
+  if (primitiveValues.length > 0) {
+    // Bind large primitive containedIn sets once so SQLite does not hit
+    // expression-depth limits from thousands of generated OR predicates.
+    sqlParts.unshift(`(${valueExpression} IN (SELECT value FROM json_each(?)))`);
+    params.unshift(JSON.stringify(primitiveValues));
+  }
+
+  return {
+    sql: sqlParts.join(' OR '),
+    params,
+  };
+};
+
 const getJsonValueAnyMatchExpression = (
   valueExpression: string,
   comparisonValues: Array<any>
-): { sql: string, params: Array<any> } => {
-  const expressions = comparisonValues.map(value => getJsonValueMatchExpression(valueExpression, value));
-  return {
-    sql: expressions.map(expression => `(${expression.sql})`).join(' OR '),
-    params: expressions.flatMap(expression => expression.params),
-  };
-};
+): { sql: string, params: Array<any> } =>
+  getSQLiteAnyMatchExpression(valueExpression, comparisonValues, getJsonValueMatchExpression);
 
 const getArrayElementMatchExpression = (
   targetSql: string,
@@ -1520,13 +1558,8 @@ const getScalarValueMatchExpression = (
 const getScalarAnyMatchExpression = (
   targetSql: string,
   comparisonValues: Array<any>
-): { sql: string, params: Array<any> } => {
-  const expressions = comparisonValues.map(value => getScalarValueMatchExpression(targetSql, value));
-  return {
-    sql: expressions.map(expression => `(${expression.sql})`).join(' OR '),
-    params: expressions.flatMap(expression => expression.params),
-  };
-};
+): { sql: string, params: Array<any> } =>
+  getSQLiteAnyMatchExpression(targetSql, comparisonValues, getScalarValueMatchExpression);
 
 const validateRegexPattern = (pattern: string, flags: string): { pattern: string, flags: string } => {
   try {

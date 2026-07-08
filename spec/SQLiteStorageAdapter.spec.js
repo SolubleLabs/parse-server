@@ -107,6 +107,31 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
     expect(results[0].age).toBe(30);
   });
 
+  it('handles large primitive $in queries without hitting sqlite expression limits', async () => {
+    const schema = {
+      className: 'LargeInClass',
+      fields: {
+        objectId: { type: 'String' },
+      },
+    };
+    await adapter.createClass('LargeInClass', schema);
+    await adapter.createObject('LargeInClass', schema, {
+      objectId: 'match-me',
+    });
+
+    const longListOfObjectIds = [];
+    for (let i = 0; i < 1500; i += 1) {
+      longListOfObjectIds.push(`missing-${i}`);
+    }
+    longListOfObjectIds.push('match-me');
+
+    const results = await adapter.find('LargeInClass', schema, {
+      objectId: { $in: longListOfObjectIds },
+    });
+
+    expect(results.map(result => result.objectId)).toEqual(['match-me']);
+  });
+
   it('treats late storage probes after shutdown as empty results', async () => {
     const schema = {
       className: 'LateShutdownClass',
