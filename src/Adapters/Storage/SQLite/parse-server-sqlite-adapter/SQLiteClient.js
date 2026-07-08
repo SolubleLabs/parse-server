@@ -2,6 +2,8 @@
 
 // Standalone package copy of the built SQLite client helpers.
 
+const fs = require('fs');
+const path = require('path');
 const Database = require('better-sqlite3');
 const {
   canonicalJSONStringify,
@@ -10,6 +12,20 @@ const {
   parseJSONArray
 } = require('./SQLiteUtils');
 const DEFAULT_SQLITE_CACHE_SIZE_KB = 32768;
+function resolveBetterSQLiteNativeBindingPath() {
+  // Bundled runtimes already copy the native addon into `build/Release` beside the built entrypoint.
+  const runtimeCandidatePaths = [path.resolve(__dirname, 'build', 'Release', 'better_sqlite3.node'), path.resolve(process.cwd(), 'build', 'Release', 'better_sqlite3.node')];
+  for (const candidatePath of runtimeCandidatePaths) {
+    if (fs.existsSync(candidatePath)) {
+      return candidatePath;
+    }
+  }
+  try {
+    return require.resolve('better-sqlite3/build/Release/better_sqlite3.node');
+  } catch {
+    return null;
+  }
+}
 function getSQLiteCacheSizeKb(options) {
   const rawValue = options.cacheSizeKb;
   if (rawValue === undefined || rawValue === null) {
@@ -150,6 +166,11 @@ function createClient(options) {
     timeout: options.timeout ?? 5000,
     verbose: options.verbose || null
   };
+  const nativeBindingPath = resolveBetterSQLiteNativeBindingPath();
+  if (nativeBindingPath) {
+    // Linux bundled runs can lose the right caller frame for `bindings()`. Hand the addon path in directly.
+    dbOptions.nativeBinding = nativeBindingPath;
+  }
   const cacheSizeKb = getSQLiteCacheSizeKb(options);
   const db = new Database(filename, dbOptions);
 
