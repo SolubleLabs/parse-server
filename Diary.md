@@ -1601,3 +1601,33 @@
 - `TESTING=1 PARSE_SERVER_TEST_DB=sqlite PARSE_SERVER_TEST_DATABASE_URI=sqlite://:memory: npx jasmine spec/SQLiteStorageAdapter.spec.js`
 - `TESTING=1 PARSE_SERVER_TEST_DB=sqlite PARSE_SERVER_TEST_DATABASE_URI=sqlite://:memory: npx jasmine --filter='startsWith|endsWith|containsAllStartingWith|still accepts valid string \\$regex in query' spec/ParseQuery.spec.js`
 - result: green
+
+
+## 2026-07-08
+
+### Current Diagnostic Boundary
+- Full `ParseLiveQuery.spec.js` is green in isolated SQLite runs, including the same random seed that failed inside the full public suite.
+- The remaining public-suite-only red appears to be a LiveQuery client/shutdown ordering race outside the SQLite adapter's data semantics.
+- Per current direction, stop pursuing that public-suite-only issue here and validate the adapter against the real integration repo instead.
+
+## 2026-07-08 SQLite Shutdown Drain Follow-Up
+
+### Finding
+- The old fixed `200ms` SQLite shutdown drain was not required for correctness in this repo and was materially inflating restart-heavy SQLite runs.
+- A default `0ms` drain was too aggressive:
+  - targeted restart-heavy files like `RouteAllowList.spec.js` still passed
+  - but the full SQLite suite failed (`4 FAILED`) with missing responses / `socket hang up`
+  - `schemas.spec.js` also reproduced a real `0ms` race in isolation on seed `74305`
+
+### Validated Floor
+- A tiny explicit drain is sufficient here.
+- `spec/schemas.spec.js --random=true --seed=74305`:
+  - `PARSE_SQLITE_SHUTDOWN_DRAIN_MS=0`: failed
+  - `PARSE_SQLITE_SHUTDOWN_DRAIN_MS=2`: green
+- Full SQLite suite:
+  - `PARSE_SQLITE_SHUTDOWN_DRAIN_MS=0 npm run test:sqlite:testonly`: `4 FAILED`, `299 PENDING`, `real 295.85s`
+  - `PARSE_SQLITE_SHUTDOWN_DRAIN_MS=2 npm run test:sqlite:testonly`: `0 FAILED`, `299 PENDING`, `real 282.04s`
+
+### Conclusion
+- Default the SQLite shutdown drain to `2ms`.
+- Keep `PARSE_SQLITE_SHUTDOWN_DRAIN_MS` as the override for local experimentation, including forcing `0`.

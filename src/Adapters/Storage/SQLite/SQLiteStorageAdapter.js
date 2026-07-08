@@ -87,7 +87,10 @@ const aggregateDateMatchOperators = new Set([
   '$all',
   '$exists',
 ]);
-const sqliteShutdownDrainDelayMs = 200;
+const sqliteShutdownDrainDelayMs = Math.max(
+  0,
+  Number.parseInt(process.env.PARSE_SQLITE_SHUTDOWN_DRAIN_MS || '2', 10) || 0
+);
 const nullFieldTrackerColumn = '_nullFields';
 // Hidden write-order tie-breaker for Parse timestamps, which are only
 // millisecond-precision once serialized for storage.
@@ -887,6 +890,14 @@ const shouldYieldBeforeTopLevelSQLiteOperation = (transactionalSession?: any): b
 
 const shouldIgnoreSQLiteOperationAfterShutdown = (dbHandle: any, isShutDown: boolean): boolean =>
   !dbHandle && isShutDown;
+
+const waitForSQLiteShutdownDrainWindow = async () => {
+  if (sqliteShutdownDrainDelayMs > 0) {
+    await new Promise(resolve => setTimeout(resolve, sqliteShutdownDrainDelayMs));
+  } else {
+    await new Promise(resolve => setImmediate(resolve));
+  }
+};
 
 const toSQLiteJSONObjectValue = (value: any) => stringifySQLiteJSONValue(value);
 
@@ -1857,9 +1868,10 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     }
     releaseSQLiteHandleIncludePatch();
 
-    // SQLite teardown is synchronous; give the HTTP layer a brief drain window
-    // before a test immediately restarts Parse Server on the same port.
-    await new Promise(resolve => setTimeout(resolve, sqliteShutdownDrainDelayMs));
+    // SQLite teardown is synchronous, but immediate Parse restarts can still
+    // race late shutdown callbacks. Keep the default drain window tiny and let
+    // callers override it with PARSE_SQLITE_SHUTDOWN_DRAIN_MS.
+    await waitForSQLiteShutdownDrainWindow();
   }
 
   _deleteExpiredIdempotencyRecords(dbOverride?: any) {
