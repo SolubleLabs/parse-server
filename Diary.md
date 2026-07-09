@@ -1783,3 +1783,21 @@
   - `npm run build`
   - `PARSE_SERVER_TEST_DB=sqlite PARSE_SERVER_TEST_DATABASE_URI=sqlite://:memory: TESTING=1 npx jasmine spec/SQLiteStorageAdapter.spec.js`
   - `npx eslint src/Adapters/Storage/SQLite/SQLiteUtils.js src/Adapters/Storage/SQLite/SQLiteStorageAdapter.js spec/SQLiteStorageAdapter.spec.js --flag unstable_config_lookup_from_file`
+
+- Deep-array hidden-index follow-up:
+  - audited which Parse query operators on indexed Array paths and indexed dotted paths under Array roots were still falling back to per-row `json_each(...)`
+  - fixed the remaining misses for `notEqualTo`, `containedIn`, `notContainedIn`, dotted-path null equality, and dotted-path scalar range operators (`$lt`, `$lte`, `$gt`, `$gte`)
+  - kept large indexed `containedIn` sets tolerant of SQLite expression-depth limits by binding grouped comparison families once through `json_each(?)` over the parameter instead of expanding one predicate per value
+  - extended the shadow array-element lookup format so deep-array Date and Pointer comparisons can stay indexed too:
+    - Dates store as `valueType = 'date'`, `value = isoString`
+    - Pointers store as `valueType = 'pointer'`, `value = className + unit-separator + objectId`
+- Added targeted SQLite specs covering:
+  - indexed Array-field `containedIn` / `notContainedIn` / `notEqualTo`
+  - a large indexed `containedIn` set to guard against `Expression tree is too large`
+  - indexed deep-array dotted-path set operators and scalar range operators
+  - indexed deep-array Date and Pointer membership
+- Validated with:
+  - `npm run build`
+  - `PARSE_SERVER_TEST_DB=sqlite PARSE_SERVER_TEST_DATABASE_URI=sqlite://:memory: TESTING=1 npx jasmine spec/SQLiteStorageAdapter.spec.js`
+  - `npx eslint src/Adapters/Storage/SQLite/SQLiteStorageAdapter.js spec/SQLiteStorageAdapter.spec.js --flag unstable_config_lookup_from_file`
+  - result: `68 specs, 0 failures`

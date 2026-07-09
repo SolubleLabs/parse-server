@@ -692,6 +692,307 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
     ]);
   });
 
+  it('uses hidden array-element indexes for set operators on Array fields', async () => {
+    const schema = {
+      className: 'IndexedArraySetOperatorsClass',
+      fields: {
+        objectId: { type: 'String' },
+        tags: { type: 'Array', contents: { type: 'String' } },
+      },
+    };
+    await adapter.createClass('IndexedArraySetOperatorsClass', schema);
+    await adapter.createIndex('IndexedArraySetOperatorsClass', { tags: 1 }, { name: 'indexed_tags' });
+    await adapter.createObject('IndexedArraySetOperatorsClass', schema, {
+      objectId: 'arraySet1',
+      tags: ['anna', 'beth'],
+    });
+    await adapter.createObject('IndexedArraySetOperatorsClass', schema, {
+      objectId: 'arraySet2',
+      tags: ['cara'],
+    });
+
+    const inWhere = adapter._buildWhereClause('IndexedArraySetOperatorsClass', schema, {
+      tags: { $in: ['anna', 'zoe'] },
+    });
+    const ninWhere = adapter._buildWhereClause('IndexedArraySetOperatorsClass', schema, {
+      tags: { $nin: ['cara'] },
+    });
+    const neWhere = adapter._buildWhereClause('IndexedArraySetOperatorsClass', schema, {
+      tags: { $ne: 'cara' },
+    });
+    const inPlan = adapter
+      ._prepare(
+        `EXPLAIN QUERY PLAN SELECT "objectId" FROM ${adapter._tableName('IndexedArraySetOperatorsClass')} WHERE ${inWhere.sql}`
+      )
+      .all(...inWhere.params);
+    const ninPlan = adapter
+      ._prepare(
+        `EXPLAIN QUERY PLAN SELECT "objectId" FROM ${adapter._tableName('IndexedArraySetOperatorsClass')} WHERE ${ninWhere.sql}`
+      )
+      .all(...ninWhere.params);
+    const nePlan = adapter
+      ._prepare(
+        `EXPLAIN QUERY PLAN SELECT "objectId" FROM ${adapter._tableName('IndexedArraySetOperatorsClass')} WHERE ${neWhere.sql}`
+      )
+      .all(...neWhere.params);
+
+    expect(inWhere.sql.includes('EXISTS (SELECT 1 FROM json_each(')).toBeFalse();
+    expect(ninWhere.sql.includes('EXISTS (SELECT 1 FROM json_each(')).toBeFalse();
+    expect(neWhere.sql.includes('EXISTS (SELECT 1 FROM json_each(')).toBeFalse();
+    expect(
+      inPlan.some(row => typeof row.detail === 'string' && row.detail.toLowerCase().includes('arridx'))
+    ).toBeTrue();
+    expect(
+      ninPlan.some(
+        row => typeof row.detail === 'string' && row.detail.toLowerCase().includes('arridx')
+      )
+    ).toBeTrue();
+    expect(
+      nePlan.some(row => typeof row.detail === 'string' && row.detail.toLowerCase().includes('arridx'))
+    ).toBeTrue();
+    expect(
+      (await adapter.find('IndexedArraySetOperatorsClass', schema, { tags: { $in: ['anna', 'zoe'] } })).map(
+        result => result.objectId
+      )
+    ).toEqual(['arraySet1']);
+    expect(
+      (await adapter.find('IndexedArraySetOperatorsClass', schema, { tags: { $nin: ['cara'] } })).map(
+        result => result.objectId
+      )
+    ).toEqual(['arraySet1']);
+    expect(
+      (await adapter.find('IndexedArraySetOperatorsClass', schema, { tags: { $ne: 'cara' } })).map(
+        result => result.objectId
+      )
+    ).toEqual(['arraySet1']);
+  });
+
+  it('keeps indexed array containedIn queries under SQLite expression-depth limits', async () => {
+    const schema = {
+      className: 'IndexedArrayLargeContainedInClass',
+      fields: {
+        objectId: { type: 'String' },
+        tags: { type: 'Array', contents: { type: 'String' } },
+      },
+    };
+    await adapter.createClass('IndexedArrayLargeContainedInClass', schema);
+    await adapter.createIndex(
+      'IndexedArrayLargeContainedInClass',
+      { tags: 1 },
+      { name: 'indexed_tags' }
+    );
+    await adapter.createObject('IndexedArrayLargeContainedInClass', schema, {
+      objectId: 'arrayLarge1',
+      tags: ['value-1499'],
+    });
+
+    const values = Array.from({ length: 1501 }, (_, i) => `value-${i}`);
+    const where = adapter._buildWhereClause('IndexedArrayLargeContainedInClass', schema, {
+      tags: { $in: values },
+    });
+    const results = await adapter.find('IndexedArrayLargeContainedInClass', schema, {
+      tags: { $in: values },
+    });
+
+    expect(where.params.length).toBe(2);
+    expect(where.sql.includes('EXISTS (SELECT 1 FROM json_each(')).toBeFalse();
+    expect(results.map(result => result.objectId)).toEqual(['arrayLarge1']);
+  });
+
+  it('uses hidden array-element indexes for deep-array set and range operators', async () => {
+    const schema = {
+      className: 'IndexedDeepArrayOperatorsClass',
+      fields: {
+        objectId: { type: 'String' },
+        contacts: { type: 'Array' },
+      },
+    };
+    await adapter.createClass('IndexedDeepArrayOperatorsClass', schema);
+    await adapter.createIndex(
+      'IndexedDeepArrayOperatorsClass',
+      { 'contacts.name': 1 },
+      { name: 'indexed_contacts_name' }
+    );
+    await adapter.createIndex(
+      'IndexedDeepArrayOperatorsClass',
+      { 'contacts.age': 1 },
+      { name: 'indexed_contacts_age' }
+    );
+    await adapter.createObject('IndexedDeepArrayOperatorsClass', schema, {
+      objectId: 'deepOps1',
+      contacts: [{ name: 'anna', age: 30 }, { name: 'beth', age: 25 }],
+    });
+    await adapter.createObject('IndexedDeepArrayOperatorsClass', schema, {
+      objectId: 'deepOps2',
+      contacts: [{ name: 'cara', age: 35 }],
+    });
+
+    const inWhere = adapter._buildWhereClause('IndexedDeepArrayOperatorsClass', schema, {
+      'contacts.name': { $in: ['anna', 'zoe'] },
+    });
+    const ninWhere = adapter._buildWhereClause('IndexedDeepArrayOperatorsClass', schema, {
+      'contacts.name': { $nin: ['cara'] },
+    });
+    const neWhere = adapter._buildWhereClause('IndexedDeepArrayOperatorsClass', schema, {
+      'contacts.name': { $ne: 'cara' },
+    });
+    const ltWhere = adapter._buildWhereClause('IndexedDeepArrayOperatorsClass', schema, {
+      'contacts.age': { $lt: 30 },
+    });
+    const inPlan = adapter
+      ._prepare(
+        `EXPLAIN QUERY PLAN SELECT "objectId" FROM ${adapter._tableName('IndexedDeepArrayOperatorsClass')} WHERE ${inWhere.sql}`
+      )
+      .all(...inWhere.params);
+    const ninPlan = adapter
+      ._prepare(
+        `EXPLAIN QUERY PLAN SELECT "objectId" FROM ${adapter._tableName('IndexedDeepArrayOperatorsClass')} WHERE ${ninWhere.sql}`
+      )
+      .all(...ninWhere.params);
+    const nePlan = adapter
+      ._prepare(
+        `EXPLAIN QUERY PLAN SELECT "objectId" FROM ${adapter._tableName('IndexedDeepArrayOperatorsClass')} WHERE ${neWhere.sql}`
+      )
+      .all(...neWhere.params);
+    const ltPlan = adapter
+      ._prepare(
+        `EXPLAIN QUERY PLAN SELECT "objectId" FROM ${adapter._tableName('IndexedDeepArrayOperatorsClass')} WHERE ${ltWhere.sql}`
+      )
+      .all(...ltWhere.params);
+
+    expect(inWhere.sql.includes('EXISTS (SELECT 1 FROM json_each(')).toBeFalse();
+    expect(ninWhere.sql.includes('EXISTS (SELECT 1 FROM json_each(')).toBeFalse();
+    expect(neWhere.sql.includes('EXISTS (SELECT 1 FROM json_each(')).toBeFalse();
+    expect(ltWhere.sql.includes('EXISTS (SELECT 1 FROM json_each(')).toBeFalse();
+    expect(
+      inPlan.some(row => typeof row.detail === 'string' && row.detail.toLowerCase().includes('arridx'))
+    ).toBeTrue();
+    expect(
+      ninPlan.some(
+        row => typeof row.detail === 'string' && row.detail.toLowerCase().includes('arridx')
+      )
+    ).toBeTrue();
+    expect(
+      nePlan.some(row => typeof row.detail === 'string' && row.detail.toLowerCase().includes('arridx'))
+    ).toBeTrue();
+    expect(
+      ltPlan.some(row => typeof row.detail === 'string' && row.detail.toLowerCase().includes('arridx'))
+    ).toBeTrue();
+    expect(
+      (
+        await adapter.find('IndexedDeepArrayOperatorsClass', schema, {
+          'contacts.name': { $in: ['anna', 'zoe'] },
+        })
+      ).map(result => result.objectId)
+    ).toEqual(['deepOps1']);
+    expect(
+      (
+        await adapter.find('IndexedDeepArrayOperatorsClass', schema, {
+          'contacts.name': { $nin: ['cara'] },
+        })
+      ).map(result => result.objectId)
+    ).toEqual(['deepOps1']);
+    expect(
+      (
+        await adapter.find('IndexedDeepArrayOperatorsClass', schema, {
+          'contacts.name': { $ne: 'cara' },
+        })
+      ).map(result => result.objectId)
+    ).toEqual(['deepOps1']);
+    expect(
+      (
+        await adapter.find('IndexedDeepArrayOperatorsClass', schema, {
+          'contacts.age': { $lt: 30 },
+        })
+      ).map(result => result.objectId)
+    ).toEqual(['deepOps1']);
+  });
+
+  it('uses hidden array-element indexes for deep-array Date and Pointer membership', async () => {
+    const schema = {
+      className: 'IndexedDeepArrayTypedValuesClass',
+      fields: {
+        objectId: { type: 'String' },
+        entries: { type: 'Array' },
+      },
+    };
+    const firstDate = { __type: 'Date', iso: '2025-01-02T03:04:05.678Z' };
+    const secondDate = { __type: 'Date', iso: '2025-03-04T03:04:05.678Z' };
+    const firstPointer = {
+      __type: 'Pointer',
+      className: '_User',
+      objectId: 'userA',
+    };
+    const secondPointer = {
+      __type: 'Pointer',
+      className: '_User',
+      objectId: 'userB',
+    };
+    await adapter.createClass('IndexedDeepArrayTypedValuesClass', schema);
+    await adapter.createIndex(
+      'IndexedDeepArrayTypedValuesClass',
+      { 'entries.when': 1 },
+      { name: 'indexed_entries_when' }
+    );
+    await adapter.createIndex(
+      'IndexedDeepArrayTypedValuesClass',
+      { 'entries.owner': 1 },
+      { name: 'indexed_entries_owner' }
+    );
+    await adapter.createObject('IndexedDeepArrayTypedValuesClass', schema, {
+      objectId: 'deepTyped1',
+      entries: [{ when: firstDate, owner: firstPointer }],
+    });
+    await adapter.createObject('IndexedDeepArrayTypedValuesClass', schema, {
+      objectId: 'deepTyped2',
+      entries: [{ when: secondDate, owner: secondPointer }],
+    });
+
+    const dateWhere = adapter._buildWhereClause('IndexedDeepArrayTypedValuesClass', schema, {
+      'entries.when': { $in: [firstDate] },
+    });
+    const pointerWhere = adapter._buildWhereClause('IndexedDeepArrayTypedValuesClass', schema, {
+      'entries.owner': { $in: [firstPointer] },
+    });
+    const datePlan = adapter
+      ._prepare(
+        `EXPLAIN QUERY PLAN SELECT "objectId" FROM ${adapter._tableName('IndexedDeepArrayTypedValuesClass')} WHERE ${dateWhere.sql}`
+      )
+      .all(...dateWhere.params);
+    const pointerPlan = adapter
+      ._prepare(
+        `EXPLAIN QUERY PLAN SELECT "objectId" FROM ${adapter._tableName('IndexedDeepArrayTypedValuesClass')} WHERE ${pointerWhere.sql}`
+      )
+      .all(...pointerWhere.params);
+
+    expect(dateWhere.sql.includes('EXISTS (SELECT 1 FROM json_each(')).toBeFalse();
+    expect(pointerWhere.sql.includes('EXISTS (SELECT 1 FROM json_each(')).toBeFalse();
+    expect(
+      datePlan.some(
+        row => typeof row.detail === 'string' && row.detail.toLowerCase().includes('arridx')
+      )
+    ).toBeTrue();
+    expect(
+      pointerPlan.some(
+        row => typeof row.detail === 'string' && row.detail.toLowerCase().includes('arridx')
+      )
+    ).toBeTrue();
+    expect(
+      (
+        await adapter.find('IndexedDeepArrayTypedValuesClass', schema, {
+          'entries.when': { $in: [firstDate] },
+        })
+      ).map(result => result.objectId)
+    ).toEqual(['deepTyped1']);
+    expect(
+      (
+        await adapter.find('IndexedDeepArrayTypedValuesClass', schema, {
+          'entries.owner': { $in: [firstPointer] },
+        })
+      ).map(result => result.objectId)
+    ).toEqual(['deepTyped1']);
+  });
+
   it('keeps anchored regex prefix queries on plain String columns index-friendly', async () => {
     const schema = {
       className: 'IndexedRegexClass',

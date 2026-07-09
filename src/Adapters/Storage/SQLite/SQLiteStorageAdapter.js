@@ -102,6 +102,9 @@ const sqliteArrayIndexTableNamePrefix = '__arridx__';
 const authDataFieldPrefix = '_auth_data_';
 const arrayIndexValueTypeColumn = 'valueType';
 const arrayIndexValueColumn = 'value';
+const sqliteArrayIndexPointerSeparator = '\u001F';
+// The shadow array-member table stores SQLite scalars directly, then derives a
+// couple of object-shaped Parse primitives into lookupable text keys too.
 const sqliteIndexedArrayScalarTypeNames = Object.freeze([
   'text',
   'integer',
@@ -1672,7 +1675,42 @@ const getArrayAnyMatchExpression = (
   };
 };
 
-const getSQLiteArrayIndexScalarLookup = (
+const getSQLiteArrayIndexPointerLookupValue = (className: string, objectId: string): string =>
+  `${className}${sqliteArrayIndexPointerSeparator}${objectId}`;
+
+const getSQLiteArrayIndexStoredValueTypeExpression = (
+  typeExpression: string,
+  valueExpression: string
+): string =>
+  `CASE ` +
+  `WHEN ${typeExpression} IN (${sqliteIndexedArrayScalarTypeNameSQL}) THEN ${typeExpression} ` +
+  `WHEN json_valid(${valueExpression}) AND json_type(${valueExpression}) = 'object' ` +
+  `AND json_extract(${valueExpression}, '$.__type') = 'Date' ` +
+  `AND json_extract(${valueExpression}, '$.iso') IS NOT NULL THEN 'date' ` +
+  `WHEN json_valid(${valueExpression}) AND json_type(${valueExpression}) = 'object' ` +
+  `AND json_extract(${valueExpression}, '$.__type') = 'Pointer' ` +
+  `AND json_extract(${valueExpression}, '$.className') IS NOT NULL ` +
+  `AND json_extract(${valueExpression}, '$.objectId') IS NOT NULL THEN 'pointer' ` +
+  `ELSE NULL END`;
+
+const getSQLiteArrayIndexStoredValueExpression = (
+  typeExpression: string,
+  valueExpression: string
+): string =>
+  `CASE ` +
+  `WHEN ${typeExpression} IN (${sqliteIndexedArrayScalarTypeNameSQL}) THEN ${valueExpression} ` +
+  `WHEN json_valid(${valueExpression}) AND json_type(${valueExpression}) = 'object' ` +
+  `AND json_extract(${valueExpression}, '$.__type') = 'Date' ` +
+  `AND json_extract(${valueExpression}, '$.iso') IS NOT NULL THEN json_extract(${valueExpression}, '$.iso') ` +
+  `WHEN json_valid(${valueExpression}) AND json_type(${valueExpression}) = 'object' ` +
+  `AND json_extract(${valueExpression}, '$.__type') = 'Pointer' ` +
+  `AND json_extract(${valueExpression}, '$.className') IS NOT NULL ` +
+  `AND json_extract(${valueExpression}, '$.objectId') IS NOT NULL THEN ` +
+  `json_extract(${valueExpression}, '$.className') || '${sqliteArrayIndexPointerSeparator}' || ` +
+  `json_extract(${valueExpression}, '$.objectId') ` +
+  `ELSE NULL END`;
+
+const getSQLiteArrayIndexLookup = (
   comparisonValue: any
 ): { valueType: string, value: any } | null => {
   if (comparisonValue === null) {
@@ -1699,6 +1737,21 @@ const getSQLiteArrayIndexScalarLookup = (
       value: comparisonValue,
     };
   }
+  if (comparisonValue && typeof comparisonValue === 'object' && comparisonValue.__type === 'Date') {
+    const sqliteDateValue = toSQLiteValue(comparisonValue);
+    if (sqliteDateValue != null) {
+      return {
+        valueType: 'date',
+        value: sqliteDateValue,
+      };
+    }
+  }
+  if (isPointerValue(comparisonValue)) {
+    return {
+      valueType: 'pointer',
+      value: getSQLiteArrayIndexPointerLookupValue(comparisonValue.className, comparisonValue.objectId),
+    };
+  }
   return null;
 };
 
@@ -1706,7 +1759,7 @@ const getSQLiteArrayIndexValueMatchExpression = (
   arrayIndexTableName: string,
   comparisonValue: any
 ): { sql: string, params: Array<any> } | null => {
-  const lookup = getSQLiteArrayIndexScalarLookup(comparisonValue);
+  const lookup = getSQLiteArrayIndexLookup(comparisonValue);
   if (!lookup) {
     return null;
   }
@@ -1719,6 +1772,130 @@ const getSQLiteArrayIndexValueMatchExpression = (
       `AND ${quoteColumnName(arrayIndexValueColumn)} = ?` +
       `)`,
     params: [lookup.valueType, lookup.value],
+  };
+};
+
+const getSQLiteArrayIndexAnyMatchExpression = (
+  arrayIndexTableName: ?string,
+  comparisonValues: Array<any>,
+  getFallbackAnyMatchExpression: (comparisonValues: Array<any>) => {
+    sql: string,
+    params: Array<any>,
+  }
+): { sql: string, params: Array<any> } => {
+  const sqlParts = [];
+  const params = [];
+  const fallbackValues = [];
+  const indexedValuesByType = new Map();
+
+  for (const comparisonValue of comparisonValues) {
+    const lookup = arrayIndexTableName ? getSQLiteArrayIndexLookup(comparisonValue) : null;
+    if (lookup && lookup.valueType !== 'null') {
+      const existingValues = indexedValuesByType.get(lookup.valueType);
+      if (existingValues) {
+        existingValues.push(lookup.value);
+      } else {
+        indexedValuesByType.set(lookup.valueType, [lookup.value]);
+      }
+    } else {
+      // Non-scalar JSON values still need the slower JSON walk because the
+      // shadow table only stores scalar array members.
+      fallbackValues.push(comparisonValue);
+    }
+  }
+
+  if (arrayIndexTableName && indexedValuesByType.size > 0) {
+    const indexedValueClauses = [];
+    for (const [valueType, valueGroup] of indexedValuesByType) {
+      indexedValueClauses.push(
+        `(${quoteColumnName(arrayIndexValueTypeColumn)} = ? AND ` +
+          `${quoteColumnName(arrayIndexValueColumn)} IN (SELECT value FROM json_each(?)))`
+      );
+      params.push(valueType, JSON.stringify(valueGroup));
+    }
+    sqlParts.push(
+      `${quoteColumnName('objectId')} IN (` +
+        `SELECT ${quoteColumnName('objectId')} FROM ${arrayIndexTableName} ` +
+        `WHERE ${indexedValueClauses.join(' OR ')}` +
+        `)`
+    );
+  }
+
+  if (fallbackValues.length > 0) {
+    const fallbackMatch = getFallbackAnyMatchExpression(fallbackValues);
+    sqlParts.push(`(${fallbackMatch.sql})`);
+    params.push(...fallbackMatch.params);
+  }
+
+  return {
+    sql: sqlParts.join(' OR '),
+    params,
+  };
+};
+
+const getSQLiteArrayIndexNullMatchExpression = (
+  arrayIndexTableName: string
+): { sql: string, params: Array<any> } => ({
+  sql:
+    `${quoteColumnName('objectId')} IN (` +
+    `SELECT ${quoteColumnName('objectId')} FROM ${arrayIndexTableName} ` +
+    `WHERE ${quoteColumnName(arrayIndexValueTypeColumn)} = 'null'` +
+    `)`,
+  params: [],
+});
+
+const getSQLiteArrayIndexRangeMatchExpression = (
+  arrayIndexTableName: string,
+  comparisonValue: any,
+  operator: '<' | '<=' | '>' | '>='
+): { sql: string, params: Array<any> } | null => {
+  const rangeClauses = [];
+  const params = [];
+
+  if (typeof comparisonValue === 'string') {
+    rangeClauses.push(
+      `(${quoteColumnName(arrayIndexValueTypeColumn)} = 'text' AND ` +
+        `${quoteColumnName(arrayIndexValueColumn)} ${operator} ?)`
+    );
+    params.push(comparisonValue);
+  } else if (
+    comparisonValue &&
+    typeof comparisonValue === 'object' &&
+    comparisonValue.__type === 'Date'
+  ) {
+    const sqliteDateValue = toSQLiteValue(comparisonValue);
+    if (sqliteDateValue == null) {
+      return null;
+    }
+    rangeClauses.push(
+      `(${quoteColumnName(arrayIndexValueTypeColumn)} = 'date' AND ` +
+        `${quoteColumnName(arrayIndexValueColumn)} ${operator} ?)`
+    );
+    params.push(sqliteDateValue);
+  } else if (typeof comparisonValue === 'number' && Number.isFinite(comparisonValue)) {
+    // Integer and real array members share Parse's numeric ordering semantics, so
+    // the shadow lookup has to probe both numeric buckets.
+    rangeClauses.push(
+      `(${quoteColumnName(arrayIndexValueTypeColumn)} = 'integer' AND ` +
+        `${quoteColumnName(arrayIndexValueColumn)} ${operator} ?)`
+    );
+    params.push(comparisonValue);
+    rangeClauses.push(
+      `(${quoteColumnName(arrayIndexValueTypeColumn)} = 'real' AND ` +
+        `${quoteColumnName(arrayIndexValueColumn)} ${operator} ?)`
+    );
+    params.push(comparisonValue);
+  } else {
+    return null;
+  }
+
+  return {
+    sql:
+      `${quoteColumnName('objectId')} IN (` +
+      `SELECT ${quoteColumnName('objectId')} FROM ${arrayIndexTableName} ` +
+      `WHERE ${rangeClauses.join(' OR ')}` +
+      `)`,
+    params,
   };
 };
 
@@ -2676,6 +2853,14 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     const quotedObjectId = quoteColumnName('objectId');
     const quotedValueType = quoteColumnName(arrayIndexValueTypeColumn);
     const quotedValue = quoteColumnName(arrayIndexValueColumn);
+    const storedValueTypeExpression = getSQLiteArrayIndexStoredValueTypeExpression(
+      arrayIndexField.typeExpression,
+      arrayIndexField.valueExpression
+    );
+    const storedValueExpression = getSQLiteArrayIndexStoredValueExpression(
+      arrayIndexField.typeExpression,
+      arrayIndexField.valueExpression
+    );
 
     // Array membership semantics only care whether one element matches, so the
     // shadow table can tolerate duplicate rows from duplicate array elements.
@@ -2701,9 +2886,9 @@ export class SQLiteStorageAdapter implements StorageAdapter {
       `CREATE TRIGGER IF NOT EXISTS ${insertTrigger} AFTER INSERT ON ${tableName} BEGIN ` +
         `DELETE FROM ${arrayIndexTableName} WHERE ${quotedObjectId} = new.${quotedObjectId}; ` +
         `INSERT INTO ${arrayIndexTableName}(${quotedObjectId}, ${quotedValueType}, ${quotedValue}) ` +
-        `SELECT new.${quotedObjectId}, ${arrayIndexField.typeExpression}, ${arrayIndexField.valueExpression} ` +
+        `SELECT new.${quotedObjectId}, ${storedValueTypeExpression}, ${storedValueExpression} ` +
         `FROM json_each(COALESCE(${rootColumnSql}, '[]')) AS array_index_item ` +
-        `WHERE ${arrayIndexField.typeExpression} IN (${sqliteIndexedArrayScalarTypeNameSQL}); ` +
+        `WHERE ${storedValueTypeExpression} IS NOT NULL; ` +
         `END`
     );
     db.exec(
@@ -2717,9 +2902,9 @@ export class SQLiteStorageAdapter implements StorageAdapter {
       )} ON ${tableName} BEGIN ` +
         `DELETE FROM ${arrayIndexTableName} WHERE ${quotedObjectId} = old.${quotedObjectId}; ` +
         `INSERT INTO ${arrayIndexTableName}(${quotedObjectId}, ${quotedValueType}, ${quotedValue}) ` +
-        `SELECT new.${quotedObjectId}, ${arrayIndexField.typeExpression}, ${arrayIndexField.valueExpression} ` +
+        `SELECT new.${quotedObjectId}, ${storedValueTypeExpression}, ${storedValueExpression} ` +
         `FROM json_each(COALESCE(${rootColumnSql}, '[]')) AS array_index_item ` +
-        `WHERE ${arrayIndexField.typeExpression} IN (${sqliteIndexedArrayScalarTypeNameSQL}); ` +
+        `WHERE ${storedValueTypeExpression} IS NOT NULL; ` +
         `END`
     );
 
@@ -2732,12 +2917,20 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     }
 
     db.exec(`DELETE FROM ${arrayIndexTableName}`);
+    const backfillStoredValueTypeExpression = getSQLiteArrayIndexStoredValueTypeExpression(
+      backfillField.typeExpression,
+      backfillField.valueExpression
+    );
+    const backfillStoredValueExpression = getSQLiteArrayIndexStoredValueExpression(
+      backfillField.typeExpression,
+      backfillField.valueExpression
+    );
     db.exec(
       `INSERT INTO ${arrayIndexTableName}(${quotedObjectId}, ${quotedValueType}, ${quotedValue}) ` +
-        `SELECT base.${quotedObjectId}, ${backfillField.typeExpression}, ${backfillField.valueExpression} ` +
+        `SELECT base.${quotedObjectId}, ${backfillStoredValueTypeExpression}, ${backfillStoredValueExpression} ` +
         `FROM ${tableName} AS base, ` +
         `json_each(COALESCE(base.${quoteColumnName(backfillField.rootFieldName)}, '[]')) AS array_index_item ` +
-        `WHERE ${backfillField.typeExpression} IN (${sqliteIndexedArrayScalarTypeNameSQL})`
+        `WHERE ${backfillStoredValueTypeExpression} IS NOT NULL`
     );
   }
 
@@ -3873,9 +4066,17 @@ export class SQLiteStorageAdapter implements StorageAdapter {
 
       if (val === null || val === undefined) {
         if (dotFieldArraySourceSql) {
-          conditions.push(
-            `EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${targetSql} IS NULL)`
-          );
+          const indexedArrayNullMatch = indexedArrayElementTableName
+            ? getSQLiteArrayIndexNullMatchExpression(indexedArrayElementTableName)
+            : null;
+          if (indexedArrayNullMatch) {
+            conditions.push(indexedArrayNullMatch.sql);
+            params.push(...indexedArrayNullMatch.params);
+          } else {
+            conditions.push(
+              `EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${targetSql} IS NULL)`
+            );
+          }
         } else {
           conditions.push(`${targetSql} IS NULL`);
         }
@@ -3891,9 +4092,17 @@ export class SQLiteStorageAdapter implements StorageAdapter {
           if (op === '$eq') {
             if (opVal === null) {
               if (dotFieldArraySourceSql) {
-                conditions.push(
-                  `EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${targetSql} IS NULL)`
-                );
+                const indexedArrayNullMatch = indexedArrayElementTableName
+                  ? getSQLiteArrayIndexNullMatchExpression(indexedArrayElementTableName)
+                  : null;
+                if (indexedArrayNullMatch) {
+                  conditions.push(indexedArrayNullMatch.sql);
+                  params.push(...indexedArrayNullMatch.params);
+                } else {
+                  conditions.push(
+                    `EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${targetSql} IS NULL)`
+                  );
+                }
               } else {
                 conditions.push(`${targetSql} IS NULL`);
               }
@@ -3947,17 +4156,33 @@ export class SQLiteStorageAdapter implements StorageAdapter {
                 conditions.push(`${targetSql} IS NOT NULL`);
               }
             } else if (isArrayField) {
-              const elementMatch = getArrayElementMatchExpression(targetSql, opVal);
-              conditions.push(`(${targetSql} IS NULL OR NOT (${elementMatch.sql}))`);
-              params.push(...elementMatch.params);
+              const indexedArrayValueMatch = indexedArrayElementTableName
+                ? getSQLiteArrayIndexValueMatchExpression(indexedArrayElementTableName, opVal)
+                : null;
+              if (indexedArrayValueMatch) {
+                conditions.push(`(${targetSql} IS NULL OR NOT (${indexedArrayValueMatch.sql}))`);
+                params.push(...indexedArrayValueMatch.params);
+              } else {
+                const elementMatch = getArrayElementMatchExpression(targetSql, opVal);
+                conditions.push(`(${targetSql} IS NULL OR NOT (${elementMatch.sql}))`);
+                params.push(...elementMatch.params);
+              }
             } else if (dotFieldArraySourceSql) {
-              const valueMatch = getArrayRootDotValueMatchExpression(
-                dotFieldArraySourceSql,
-                targetSql,
-                opVal
-              );
-              conditions.push(`NOT (${valueMatch.sql})`);
-              params.push(...valueMatch.params);
+              const indexedArrayValueMatch = indexedArrayElementTableName
+                ? getSQLiteArrayIndexValueMatchExpression(indexedArrayElementTableName, opVal)
+                : null;
+              if (indexedArrayValueMatch) {
+                conditions.push(`NOT (${indexedArrayValueMatch.sql})`);
+                params.push(...indexedArrayValueMatch.params);
+              } else {
+                const valueMatch = getArrayRootDotValueMatchExpression(
+                  dotFieldArraySourceSql,
+                  targetSql,
+                  opVal
+                );
+                conditions.push(`NOT (${valueMatch.sql})`);
+                params.push(...valueMatch.params);
+              }
             } else if (usesCaseInsensitiveComparison && typeof opVal === 'string') {
               conditions.push(`(${targetSql} IS NULL OR LOWER(${targetSql}) != LOWER(?))`);
               params.push(opVal);
@@ -3968,40 +4193,76 @@ export class SQLiteStorageAdapter implements StorageAdapter {
             }
           } else if (op === '$lt') {
             if (dotFieldArraySourceSql) {
-              conditions.push(
-                `EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${targetSql} < ?)`
-              );
+              const indexedArrayRangeMatch = indexedArrayElementTableName
+                ? getSQLiteArrayIndexRangeMatchExpression(indexedArrayElementTableName, opVal, '<')
+                : null;
+              if (indexedArrayRangeMatch) {
+                conditions.push(indexedArrayRangeMatch.sql);
+                params.push(...indexedArrayRangeMatch.params);
+              } else {
+                conditions.push(
+                  `EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${targetSql} < ?)`
+                );
+                params.push(toSQLiteValue(opVal));
+              }
             } else {
               conditions.push(`${targetSql} < ?`);
+              params.push(toSQLiteValue(opVal));
             }
-            params.push(toSQLiteValue(opVal));
           } else if (op === '$lte') {
             if (dotFieldArraySourceSql) {
-              conditions.push(
-                `EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${targetSql} <= ?)`
-              );
+              const indexedArrayRangeMatch = indexedArrayElementTableName
+                ? getSQLiteArrayIndexRangeMatchExpression(indexedArrayElementTableName, opVal, '<=')
+                : null;
+              if (indexedArrayRangeMatch) {
+                conditions.push(indexedArrayRangeMatch.sql);
+                params.push(...indexedArrayRangeMatch.params);
+              } else {
+                conditions.push(
+                  `EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${targetSql} <= ?)`
+                );
+                params.push(toSQLiteValue(opVal));
+              }
             } else {
               conditions.push(`${targetSql} <= ?`);
+              params.push(toSQLiteValue(opVal));
             }
-            params.push(toSQLiteValue(opVal));
           } else if (op === '$gt') {
             if (dotFieldArraySourceSql) {
-              conditions.push(
-                `EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${targetSql} > ?)`
-              );
+              const indexedArrayRangeMatch = indexedArrayElementTableName
+                ? getSQLiteArrayIndexRangeMatchExpression(indexedArrayElementTableName, opVal, '>')
+                : null;
+              if (indexedArrayRangeMatch) {
+                conditions.push(indexedArrayRangeMatch.sql);
+                params.push(...indexedArrayRangeMatch.params);
+              } else {
+                conditions.push(
+                  `EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${targetSql} > ?)`
+                );
+                params.push(toSQLiteValue(opVal));
+              }
             } else {
               conditions.push(`${targetSql} > ?`);
+              params.push(toSQLiteValue(opVal));
             }
-            params.push(toSQLiteValue(opVal));
           } else if (op === '$gte') {
             if (dotFieldArraySourceSql) {
-              conditions.push(
-                `EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${targetSql} >= ?)`
-              );
+              const indexedArrayRangeMatch = indexedArrayElementTableName
+                ? getSQLiteArrayIndexRangeMatchExpression(indexedArrayElementTableName, opVal, '>=')
+                : null;
+              if (indexedArrayRangeMatch) {
+                conditions.push(indexedArrayRangeMatch.sql);
+                params.push(...indexedArrayRangeMatch.params);
+              } else {
+                conditions.push(
+                  `EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${targetSql} >= ?)`
+                );
+                params.push(toSQLiteValue(opVal));
+              }
             } else {
               conditions.push(`${targetSql} >= ?`);
+              params.push(toSQLiteValue(opVal));
             }
-            params.push(toSQLiteValue(opVal));
           } else if (op === '$in') {
             if (!Array.isArray(opVal)) {
               throw new Parse.Error(Parse.Error.INVALID_JSON, 'bad $in value');
@@ -4014,7 +4275,11 @@ export class SQLiteStorageAdapter implements StorageAdapter {
             if (hasInValues) {
               if (isArrayField) {
                 if (nonNulls.length > 0) {
-                  const anyMatch = getArrayAnyMatchExpression(targetSql, nonNulls);
+                  const anyMatch = getSQLiteArrayIndexAnyMatchExpression(
+                    indexedArrayElementTableName,
+                    nonNulls,
+                    comparisonValues => getArrayAnyMatchExpression(targetSql, comparisonValues)
+                  );
                   if (hasNull) {
                     conditions.push(`(${targetSql} IS NULL OR (${anyMatch.sql}))`);
                   } else {
@@ -4028,23 +4293,46 @@ export class SQLiteStorageAdapter implements StorageAdapter {
                 }
               } else if (dotFieldArraySourceSql) {
                 if (nonNulls.length > 0) {
-                  const anyMatch = getArrayRootDotAnyMatchExpression(
-                    dotFieldArraySourceSql,
-                    targetSql,
-                    nonNulls
+                  const anyMatch = getSQLiteArrayIndexAnyMatchExpression(
+                    indexedArrayElementTableName,
+                    nonNulls,
+                    comparisonValues =>
+                      getArrayRootDotAnyMatchExpression(
+                        dotFieldArraySourceSql,
+                        targetSql,
+                        comparisonValues
+                      )
                   );
                   if (hasNull) {
+                    const indexedArrayNullMatch = indexedArrayElementTableName
+                      ? getSQLiteArrayIndexNullMatchExpression(indexedArrayElementTableName)
+                      : null;
                     conditions.push(
-                      `(${anyMatch.sql} OR EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${targetSql} IS NULL))`
+                      indexedArrayNullMatch
+                        ? `(${anyMatch.sql} OR ${indexedArrayNullMatch.sql})`
+                        : `(${anyMatch.sql} OR EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${targetSql} IS NULL))`
                     );
+                    if (indexedArrayNullMatch) {
+                      params.push(...anyMatch.params, ...indexedArrayNullMatch.params);
+                    } else {
+                      params.push(...anyMatch.params);
+                    }
                   } else {
                     conditions.push(`(${anyMatch.sql})`);
+                    params.push(...anyMatch.params);
                   }
-                  params.push(...anyMatch.params);
                 } else if (hasNull) {
-                  conditions.push(
-                    `EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${targetSql} IS NULL)`
-                  );
+                  const indexedArrayNullMatch = indexedArrayElementTableName
+                    ? getSQLiteArrayIndexNullMatchExpression(indexedArrayElementTableName)
+                    : null;
+                  if (indexedArrayNullMatch) {
+                    conditions.push(indexedArrayNullMatch.sql);
+                    params.push(...indexedArrayNullMatch.params);
+                  } else {
+                    conditions.push(
+                      `EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${targetSql} IS NULL)`
+                    );
+                  }
                 } else {
                   conditions.push('1 = 0');
                 }
@@ -4103,7 +4391,11 @@ export class SQLiteStorageAdapter implements StorageAdapter {
             if (hasNinValues) {
               if (isArrayField) {
                 if (nonNulls.length > 0) {
-                  const anyMatch = getArrayAnyMatchExpression(targetSql, nonNulls);
+                  const anyMatch = getSQLiteArrayIndexAnyMatchExpression(
+                    indexedArrayElementTableName,
+                    nonNulls,
+                    comparisonValues => getArrayAnyMatchExpression(targetSql, comparisonValues)
+                  );
                   if (hasNull) {
                     conditions.push(`(${targetSql} IS NOT NULL AND NOT (${anyMatch.sql}))`);
                   } else {
@@ -4115,10 +4407,15 @@ export class SQLiteStorageAdapter implements StorageAdapter {
                 }
               } else if (dotFieldArraySourceSql) {
                 if (nonNulls.length > 0) {
-                  const anyMatch = getArrayRootDotAnyMatchExpression(
-                    dotFieldArraySourceSql,
-                    targetSql,
-                    nonNulls
+                  const anyMatch = getSQLiteArrayIndexAnyMatchExpression(
+                    indexedArrayElementTableName,
+                    nonNulls,
+                    comparisonValues =>
+                      getArrayRootDotAnyMatchExpression(
+                        dotFieldArraySourceSql,
+                        targetSql,
+                        comparisonValues
+                      )
                   );
                   if (hasNull) {
                     const existsMatch = getArrayRootDotExistsExpression(
