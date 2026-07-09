@@ -12,11 +12,9 @@ const {
 const DEFAULT_SQLITE_CACHE_SIZE_KB = 32768;
 
 function resolveBetterSQLiteNativeBindingPath(): ?string {
-  // Bundled runtimes already copy the native addon into `build/Release` beside the built entrypoint.
-  const runtimeCandidatePaths = [
-    path.resolve(__dirname, 'build', 'Release', 'better_sqlite3.node'),
-    path.resolve(process.cwd(), 'build', 'Release', 'better_sqlite3.node'),
-  ];
+  // Keep native addon discovery scoped to the adapter package itself so a caller's
+  // working directory cannot redirect us to an unrelated binary.
+  const runtimeCandidatePaths = [path.resolve(__dirname, 'build', 'Release', 'better_sqlite3.node')];
   for (const candidatePath of runtimeCandidatePaths) {
     if (fs.existsSync(candidatePath)) {
       return candidatePath;

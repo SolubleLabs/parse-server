@@ -237,10 +237,11 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
     });
 
     const longDateList = [];
+    const longDateListStart = Date.parse('2026-07-09T00:00:00.000Z');
     for (let i = 0; i < 1500; i += 1) {
       longDateList.push({
         __type: 'Date',
-        iso: `2026-07-09T00:00:${String(i % 60).padStart(2, '0')}.000Z`,
+        iso: new Date(longDateListStart + i * 1000).toISOString(),
       });
     }
     longDateList.push({
@@ -270,10 +271,11 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
     });
 
     const longDateList = [];
+    const longDateListStart = Date.parse('2026-07-10T00:00:00.000Z');
     for (let i = 0; i < 1500; i += 1) {
       longDateList.push({
         __type: 'Date',
-        iso: `2026-07-10T00:00:${String(i % 60).padStart(2, '0')}.000Z`,
+        iso: new Date(longDateListStart + i * 1000).toISOString(),
       });
     }
     longDateList.push({

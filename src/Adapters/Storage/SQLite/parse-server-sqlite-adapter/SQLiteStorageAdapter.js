@@ -2092,6 +2092,7 @@ class SQLiteStorageAdapter {
       lookupIndex,
       objectIdIndex
     } = this._getArrayElementIndexArtifactNames(rawArrayIndexTableName);
+    const shouldBackfillArrayIndexTable = !this._tableNameExistsByRawName(rawArrayIndexTableName, db);
     const rootColumnSql = `new.${quoteColumnName(arrayIndexField.rootFieldName)}`;
     const quotedObjectId = quoteColumnName('objectId');
     const quotedValueType = quoteColumnName(arrayIndexValueTypeColumn);
@@ -2110,6 +2111,12 @@ class SQLiteStorageAdapter {
     db.exec(`CREATE TRIGGER IF NOT EXISTS ${updateTrigger} AFTER UPDATE OF ${quoteColumnName(arrayIndexField.rootFieldName)} ON ${tableName} BEGIN ` + `DELETE FROM ${arrayIndexTableName} WHERE ${quotedObjectId} = old.${quotedObjectId}; ` + `INSERT INTO ${arrayIndexTableName}(${quotedObjectId}, ${quotedValueType}, ${quotedValue}) ` + `SELECT new.${quotedObjectId}, derived.__arridx_value_type, derived.__arridx_value ` + `FROM (${derivedInsertRowsSql}) AS derived ` + `WHERE derived.__arridx_value_type IS NOT NULL; ` + `END`);
     const backfillField = this._getArrayElementIndexFieldInfo(schemaFields, arrayIndexField.normalizedFieldName);
     if (!backfillField) {
+      return;
+    }
+
+    // The trigger set keeps the shadow table current after first creation, so
+    // only the initial build needs a full backfill pass.
+    if (!shouldBackfillArrayIndexTable) {
       return;
     }
     db.exec(`DELETE FROM ${arrayIndexTableName}`);

@@ -99,6 +99,15 @@ const createLiteralRegex = (remaining: string) =>
     })
     .join('');
 
+const maxRegexPlannerQuantifierBound = 128;
+const parseRegexPlannerQuantifierBound = (valueText: string): number | null => {
+  const value = Number(valueText);
+  if (!Number.isSafeInteger(value) || value > maxRegexPlannerQuantifierBound) {
+    return null;
+  }
+  return value;
+};
+
 const literalizeRegexPart = (s: string) => {
   const matcher1 = /\\Q((?!\\E).*)\\E$/;
   const result1: any = s.match(matcher1);
@@ -369,10 +378,15 @@ const readRegexQuantifier = (
     return null;
   }
 
+  const minimumValue = parseRegexPlannerQuantifierBound(minimumText);
+  if (minimumValue === null) {
+    return null;
+  }
+
   if (pattern[cursor] === '}') {
     return {
-      min: Number(minimumText),
-      max: Number(minimumText),
+      min: minimumValue,
+      max: minimumValue,
       endIndex: cursor + 1,
     };
   }
@@ -384,7 +398,7 @@ const readRegexQuantifier = (
   cursor += 1;
   if (pattern[cursor] === '}') {
     return {
-      min: Number(minimumText),
+      min: minimumValue,
       max: null,
       endIndex: cursor + 1,
     };
@@ -400,9 +414,14 @@ const readRegexQuantifier = (
     return null;
   }
 
+  const maximumValue = parseRegexPlannerQuantifierBound(maximumText);
+  if (maximumValue === null || maximumValue < minimumValue) {
+    return null;
+  }
+
   return {
-    min: Number(minimumText),
-    max: Number(maximumText),
+    min: minimumValue,
+    max: maximumValue,
     endIndex: cursor + 1,
   };
 };
@@ -575,7 +594,7 @@ const collapseRegexPrefixSet = (
   return collapsedPrefixes;
 };
 
-const maxRegexLeadingFiniteValues = 128;
+const maxRegexLeadingFiniteValues = maxRegexPlannerQuantifierBound;
 
 const mergeFiniteRegexValues = (
   currentValues: Array<string>,

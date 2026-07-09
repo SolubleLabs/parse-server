@@ -2849,6 +2849,10 @@ export class SQLiteStorageAdapter implements StorageAdapter {
       lookupIndex,
       objectIdIndex,
     } = this._getArrayElementIndexArtifactNames(rawArrayIndexTableName);
+    const shouldBackfillArrayIndexTable = !this._tableNameExistsByRawName(
+      rawArrayIndexTableName,
+      db
+    );
     const rootColumnSql = `new.${quoteColumnName(arrayIndexField.rootFieldName)}`;
     const quotedObjectId = quoteColumnName('objectId');
     const quotedValueType = quoteColumnName(arrayIndexValueTypeColumn);
@@ -2918,6 +2922,12 @@ export class SQLiteStorageAdapter implements StorageAdapter {
       arrayIndexField.normalizedFieldName
     );
     if (!backfillField) {
+      return;
+    }
+
+    // The trigger set keeps the shadow table current after first creation, so
+    // only the initial build needs a full backfill pass.
+    if (!shouldBackfillArrayIndexTable) {
       return;
     }
 
