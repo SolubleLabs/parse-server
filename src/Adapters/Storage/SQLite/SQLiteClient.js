@@ -214,15 +214,25 @@ function createClient(options: Object) {
   db.pragma(`cache_size = -${cacheSizeKb}`);
   db.pragma('foreign_keys = ON');
   // Reuse compiled regexes for a query's repeated row-level UDF calls.
+  const maxCompiledRegexCacheSize = 256;
   const compiledRegexCache = new Map();
   const getCompiledRegex = (pattern: string, flags?: string) => {
     const normalizedRegex = normalizeRegexPattern(String(pattern), flags ? String(flags) : '');
     const cacheKey = `${normalizedRegex.flags}\u0000${normalizedRegex.pattern}`;
     let compiledRegex = compiledRegexCache.get(cacheKey);
-    if (!compiledRegex) {
-      compiledRegex = new RegExp(normalizedRegex.pattern, normalizedRegex.flags);
+    if (compiledRegex) {
+      compiledRegexCache.delete(cacheKey);
       compiledRegexCache.set(cacheKey, compiledRegex);
+      return compiledRegex;
     }
+    compiledRegex = new RegExp(normalizedRegex.pattern, normalizedRegex.flags);
+    if (compiledRegexCache.size >= maxCompiledRegexCacheSize) {
+      const oldestCacheKey = compiledRegexCache.keys().next().value;
+      if (oldestCacheKey !== undefined) {
+        compiledRegexCache.delete(oldestCacheKey);
+      }
+    }
+    compiledRegexCache.set(cacheKey, compiledRegex);
     return compiledRegex;
   };
 

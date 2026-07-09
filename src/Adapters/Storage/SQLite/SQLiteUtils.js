@@ -113,8 +113,18 @@ const hasPotentiallyUnsafeRegexBacktracking = (pattern: string): boolean => {
     }
 
     if (char === '(') {
-      if (pattern[i + 1] === '?' && pattern[i + 2] !== ':') {
-        return true;
+      if (pattern[i + 1] === '?') {
+        const groupPrefix = pattern[i + 2];
+
+        // These `(?...)` forms still go through the normal stack check below.
+        if (
+          groupPrefix !== ':' &&
+          groupPrefix !== '=' &&
+          groupPrefix !== '!' &&
+          groupPrefix !== '<'
+        ) {
+          return true;
+        }
       }
       stack.push({ hasQuantifier: false, hasAlternation: false });
     } else if (char === '|') {
