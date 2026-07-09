@@ -3,6 +3,7 @@
 const stableStringify = require('safe-stable-stringify');
 const numericArrayIndexPattern = /^(0|[1-9]\d*)$/;
 const regexLiteralCharacterPattern = /[0-9 ]|\p{L}/u;
+const asciiOnlyStringPattern = /^[\x00-\x7F]*$/;
 
 // Keep object-key order deterministic so equality-sensitive array operations
 // behave consistently across logically equivalent payloads.
@@ -21,6 +22,8 @@ const parseJSONArray = (value: any): Array<any> => {
 // Values like "01" stay object keys because Parse field paths can target both.
 const isNumericArrayIndexComponent = (value: any): boolean =>
   typeof value === 'string' && numericArrayIndexPattern.test(value);
+
+const isASCIIOnlyString = (value: string): boolean => asciiOnlyStringPattern.test(value);
 
 const removeRegexWhiteSpace = (regex: string) => {
   let normalizedRegex = regex;
@@ -251,8 +254,224 @@ const getSimpleNormalizedRegexInfo = (
   };
 };
 
+const readRegexQuantifier = (
+  pattern: string,
+  index: number
+): { min: number, endIndex: number } | null => {
+  const char = pattern[index];
+
+  if (char === '*') {
+    return {
+      min: 0,
+      endIndex: index + 1,
+    };
+  }
+  if (char === '+') {
+    return {
+      min: 1,
+      endIndex: index + 1,
+    };
+  }
+  if (char === '?') {
+    return {
+      min: 0,
+      endIndex: index + 1,
+    };
+  }
+  if (char !== '{') {
+    return null;
+  }
+
+  let cursor = index + 1;
+  let minimumText = '';
+
+  while (cursor < pattern.length && /\d/.test(pattern[cursor])) {
+    minimumText += pattern[cursor];
+    cursor += 1;
+  }
+
+  if (!minimumText) {
+    return null;
+  }
+
+  if (pattern[cursor] === '}') {
+    return {
+      min: Number(minimumText),
+      endIndex: cursor + 1,
+    };
+  }
+
+  if (pattern[cursor] !== ',') {
+    return null;
+  }
+
+  cursor += 1;
+  while (cursor < pattern.length && /\d/.test(pattern[cursor])) {
+    cursor += 1;
+  }
+
+  if (pattern[cursor] !== '}') {
+    return null;
+  }
+
+  return {
+    min: Number(minimumText),
+    endIndex: cursor + 1,
+  };
+};
+
+const getRegexLiteralAtom = (
+  pattern: string,
+  index: number
+): { literal: string, nextIndex: number } | null => {
+  const char = pattern[index];
+
+  if (char === '\\') {
+    const escapedChar = pattern[index + 1];
+
+    if (!escapedChar) {
+      return null;
+    }
+
+    if ('\\.^$|?*+()[]{}'.includes(escapedChar)) {
+      return {
+        literal: escapedChar,
+        nextIndex: index + 2,
+      };
+    }
+
+    if (escapedChar === 'f') {
+      return {
+        literal: '\f',
+        nextIndex: index + 2,
+      };
+    }
+    if (escapedChar === 'n') {
+      return {
+        literal: '\n',
+        nextIndex: index + 2,
+      };
+    }
+    if (escapedChar === 'r') {
+      return {
+        literal: '\r',
+        nextIndex: index + 2,
+      };
+    }
+    if (escapedChar === 't') {
+      return {
+        literal: '\t',
+        nextIndex: index + 2,
+      };
+    }
+    if (escapedChar === 'v') {
+      return {
+        literal: '\v',
+        nextIndex: index + 2,
+      };
+    }
+
+    return null;
+  }
+
+  if (char === '.' || char === '[' || char === '(' || char === ')' || char === '|') {
+    return null;
+  }
+
+  if (char === '^' || char === '$' || char === '{' || char === '}' || char === '*' || char === '+' || char === '?') {
+    return null;
+  }
+
+  return {
+    literal: char,
+    nextIndex: index + 1,
+  };
+};
+
+const getUncasedRegexPrefix = (prefix: string): string => {
+  let uncasedPrefix = '';
+
+  for (const char of prefix) {
+    if (char.toLocaleLowerCase('und') !== char.toLocaleUpperCase('und')) {
+      break;
+    }
+
+    uncasedPrefix += char;
+  }
+
+  return uncasedPrefix;
+};
+
+const getRegexPrefixPrefilterInfo = (
+  pattern: string,
+  flags?: string
+):
+  | {
+      literalPrefix: string,
+      mode: 'caseSensitive' | 'caseInsensitiveASCII' | 'caseInsensitiveUncased',
+    }
+  | null => {
+  const distinctFlags = Array.from(new Set((flags || '').split('').filter(Boolean)));
+  const caseInsensitive = distinctFlags.includes('i');
+
+  // `m` changes `^` into line-start semantics, so a plain string-prefix filter is no longer safe.
+  if (distinctFlags.includes('m') || !pattern.startsWith('^')) {
+    return null;
+  }
+
+  let index = 1;
+  let literalPrefix = '';
+
+  while (index < pattern.length) {
+    const literalAtom = getRegexLiteralAtom(pattern, index);
+
+    if (!literalAtom) {
+      break;
+    }
+
+    const quantifier = readRegexQuantifier(pattern, literalAtom.nextIndex);
+    const minimumCount = quantifier ? quantifier.min : 1;
+
+    if (minimumCount === 0) {
+      break;
+    }
+
+    literalPrefix += literalAtom.literal.repeat(minimumCount);
+    index = quantifier ? quantifier.endIndex : literalAtom.nextIndex;
+  }
+
+  if (!literalPrefix) {
+    return null;
+  }
+
+  if (!caseInsensitive) {
+    return {
+      literalPrefix,
+      mode: 'caseSensitive',
+    };
+  }
+
+  if (isASCIIOnlyString(literalPrefix)) {
+    return {
+      literalPrefix,
+      mode: 'caseInsensitiveASCII',
+    };
+  }
+
+  const uncasedPrefix = getUncasedRegexPrefix(literalPrefix);
+  if (!uncasedPrefix) {
+    return null;
+  }
+
+  return {
+    literalPrefix: uncasedPrefix,
+    mode: 'caseInsensitiveUncased',
+  };
+};
+
 module.exports = {
   canonicalJSONStringify,
+  getRegexPrefixPrefilterInfo,
   getSimpleNormalizedRegexInfo,
   isNumericArrayIndexComponent,
   normalizeRegexPattern,

@@ -1717,3 +1717,35 @@
   - `npm run build`
   - `PARSE_SERVER_TEST_DB=sqlite PARSE_SERVER_TEST_DATABASE_URI=sqlite://:memory: TESTING=1 npx jasmine spec/SQLiteStorageAdapter.spec.js`
   - `45 specs, 0 failures`
+
+2026-07-09
+- Regex lowering perf follow-up after the `CAST(... AS TEXT)` fix.
+- No extra package added. Prefix planner is local code in `SQLiteUtils.js`.
+- New planner shape:
+  - keep full simple lowering for exact / plain prefix / suffix / contains
+  - for more complex anchored regex on plain scalar text columns, extract one guaranteed literal prefix
+  - push that prefix into SQLite as an indexable prefilter
+  - keep `REGEXP` / `regexp_flags` as the residual correctness check
+- Unicode-friendly rule:
+  - ASCII `/i` prefixes still use `LIKE ...` and the NOCASE helper index
+  - uncased leading prefixes like Thai stay eligible for `GLOB 'prefix*'` prefilter even under `/i`
+  - no fake Unicode case-folding attempt for cased non-ASCII text
+- Scope stays deliberately tight:
+  - plain scalar text-ish columns only
+  - no array/dot/authData prefix planner yet
+  - residual regex always stays for complex patterns
+- Validation:
+  - `npm run build`
+  - `PARSE_SERVER_TEST_DB=sqlite PARSE_SERVER_TEST_DATABASE_URI=sqlite://:memory: TESTING=1 npx jasmine spec/SQLiteStorageAdapter.spec.js`
+  - `47 specs, 0 failures`
+- Array index follow-up:
+  - current `Array` equality / containment path uses `EXISTS (SELECT 1 FROM json_each(...) WHERE ...)`
+  - normal SQLite index on the raw JSON column does not help that path
+  - if `createIndex({ arrayField: 1 })` is expected to help Parse-style `equalTo` membership, adapter needs hidden multikey-style shadow indexing and write-path maintenance
+  - index must also work when created before data exists, so future writes need to populate the shadow structure automatically
+- Full-suite follow-up:
+  - real runner check for the master-key TTL path is green: `PARSE_SERVER_TEST_DB=sqlite PARSE_SERVER_TEST_DATABASE_URI=sqlite://:memory: TESTING=1 npx jasmine --filter='masterKey'`
+  - this covers `should load masterKey` and `should reload masterKey if ttl is set and expired`
+  - conclusion: the earlier `secondMasterKey` failure is not a currently reproducible standalone adapter bug
+  - raw `spec/index.spec.js` runs in isolation are misleading for this path and should not be used as the deciding signal
+  - separate issue remains: full-suite serial run can still hit a late `ParseLiveQuery` timeout cascade, but `spec/ParseLiveQuery.spec.js` also passes cleanly in isolation with the same seed (`99115`), so that hang is cross-suite contamination rather than an intrinsic failure inside the LiveQuery spec file

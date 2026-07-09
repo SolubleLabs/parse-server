@@ -294,33 +294,6 @@ function createClient(options) {
     if (!Array.isArray(coords) || coords.length === 0) {
       return 0;
     }
-    const normalizeCoordinate = coordinate => {
-      if (Array.isArray(coordinate) && coordinate.length === 2) {
-        const latitude = Number(coordinate[0]);
-        const longitude = Number(coordinate[1]);
-        if (Number.isFinite(latitude) && Number.isFinite(longitude)) {
-          return [latitude, longitude];
-        }
-        return null;
-      }
-      if (coordinate && typeof coordinate === 'object') {
-        const latitude = Number(coordinate.latitude);
-        const longitude = Number(coordinate.longitude);
-        if (Number.isFinite(latitude) && Number.isFinite(longitude)) {
-          return [latitude, longitude];
-        }
-      }
-      return null;
-    };
-    const normalizedCoords = [];
-    for (const coordinate of coords) {
-      const normalizedCoordinate = normalizeCoordinate(coordinate);
-      if (!normalizedCoordinate) {
-        return 0;
-      }
-      normalizedCoords.push(normalizedCoordinate);
-    }
-    coords = normalizedCoords;
     const isSameCoordinate = (left, right) => Array.isArray(left) && Array.isArray(right) && left.length === 2 && right.length === 2 && Number(left[0]) === Number(right[0]) && Number(left[1]) === Number(right[1]);
     if (coords.length > 1 && isSameCoordinate(coords[0], coords[coords.length - 1])) {
       coords = coords.slice(0, -1);
@@ -348,10 +321,10 @@ function createClient(options) {
     for (let i = 0, j = coords.length - 1; i < coords.length; j = i++) {
       const p1 = coords[i];
       const p2 = coords[j];
-      const xi = p1[0];
-      const yi = p1[1];
-      const xj = p2[0];
-      const yj = p2[1];
+      const xi = Array.isArray(p1) ? p1[0] : p1.latitude;
+      const yi = Array.isArray(p1) ? p1[1] : p1.longitude;
+      const xj = Array.isArray(p2) ? p2[0] : p2.latitude;
+      const yj = Array.isArray(p2) ? p2[1] : p2.longitude;
       if (isPointOnSegment(lat, lng, xi, yi, xj, yj)) {
         return 1;
       }

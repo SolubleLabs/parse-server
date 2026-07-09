@@ -558,6 +558,140 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
     expect(results.map(result => result.objectId)).toEqual(['idx1']);
   });
 
+  it('uses hidden array-element indexes for equalTo membership on Array fields', async () => {
+    const schema = {
+      className: 'IndexedArrayFieldClass',
+      fields: {
+        objectId: { type: 'String' },
+        tags: { type: 'Array', contents: { type: 'String' } },
+      },
+    };
+    await adapter.createClass('IndexedArrayFieldClass', schema);
+    await adapter.createIndex('IndexedArrayFieldClass', { tags: 1 }, { name: 'indexed_tags' });
+    await adapter.createObject('IndexedArrayFieldClass', schema, {
+      objectId: 'arrayEq1',
+      tags: ['anna', 'beth'],
+    });
+    await adapter.createObject('IndexedArrayFieldClass', schema, {
+      objectId: 'arrayEq2',
+      tags: ['cara'],
+    });
+
+    const where = adapter._buildWhereClause('IndexedArrayFieldClass', schema, {
+      tags: 'anna',
+    });
+    const queryPlan = adapter
+      ._prepare(
+        `EXPLAIN QUERY PLAN SELECT "objectId" FROM ${adapter._tableName('IndexedArrayFieldClass')} WHERE ${where.sql}`
+      )
+      .all(...where.params);
+    const results = await adapter.find('IndexedArrayFieldClass', schema, {
+      tags: 'anna',
+    });
+
+    expect(where.sql.includes('json_each')).toBeFalse();
+    expect(where.sql.includes('IN (SELECT "objectId"')).toBeTrue();
+    expect(
+      queryPlan.some(
+        row => typeof row.detail === 'string' && row.detail.toLowerCase().includes('arridx')
+      )
+    ).toBeTrue();
+    expect(results.map(result => result.objectId)).toEqual(['arrayEq1']);
+  });
+
+  it('uses hidden array-element indexes for dotted paths under Array roots', async () => {
+    const schema = {
+      className: 'IndexedArrayRootDotPathClass',
+      fields: {
+        objectId: { type: 'String' },
+        contacts: { type: 'Array' },
+      },
+    };
+    await adapter.createClass('IndexedArrayRootDotPathClass', schema);
+    await adapter.createIndex(
+      'IndexedArrayRootDotPathClass',
+      { 'contacts.name': 1 },
+      { name: 'indexed_contacts_name' }
+    );
+    await adapter.createObject('IndexedArrayRootDotPathClass', schema, {
+      objectId: 'arrayDot1',
+      contacts: [{ name: 'anna' }, { name: 'beth' }],
+    });
+    await adapter.createObject('IndexedArrayRootDotPathClass', schema, {
+      objectId: 'arrayDot2',
+      contacts: [{ name: 'cara' }],
+    });
+
+    const where = adapter._buildWhereClause('IndexedArrayRootDotPathClass', schema, {
+      'contacts.name': 'anna',
+    });
+    const queryPlan = adapter
+      ._prepare(
+        `EXPLAIN QUERY PLAN SELECT "objectId" FROM ${adapter._tableName('IndexedArrayRootDotPathClass')} WHERE ${where.sql}`
+      )
+      .all(...where.params);
+    const results = await adapter.find('IndexedArrayRootDotPathClass', schema, {
+      'contacts.name': 'anna',
+    });
+
+    expect(where.sql.includes('json_each')).toBeFalse();
+    expect(where.sql.includes('IN (SELECT "objectId"')).toBeTrue();
+    expect(
+      queryPlan.some(
+        row => typeof row.detail === 'string' && row.detail.toLowerCase().includes('arridx')
+      )
+    ).toBeTrue();
+    expect(results.map(result => result.objectId)).toEqual(['arrayDot1']);
+  });
+
+  it('uses hidden array-element indexes as regex prefilters on string arrays', async () => {
+    const schema = {
+      className: 'IndexedArrayRegexClass',
+      fields: {
+        objectId: { type: 'String' },
+        tags: { type: 'Array', contents: { type: 'String' } },
+      },
+    };
+    await adapter.createClass('IndexedArrayRegexClass', schema);
+    await adapter.createIndex('IndexedArrayRegexClass', { tags: 1 }, { name: 'indexed_tags' });
+    await adapter.createObject('IndexedArrayRegexClass', schema, {
+      objectId: 'arrayRegex1',
+      tags: ['annason', 'beth'],
+    });
+    await adapter.createObject('IndexedArrayRegexClass', schema, {
+      objectId: 'arrayRegex2',
+      tags: ['ANNa_big_son'],
+    });
+    await adapter.createObject('IndexedArrayRegexClass', schema, {
+      objectId: 'arrayRegex3',
+      tags: ['bobson'],
+    });
+
+    const where = adapter._buildWhereClause('IndexedArrayRegexClass', schema, {
+      tags: { $regex: '^ann.*son', $options: 'i' },
+    });
+    const queryPlan = adapter
+      ._prepare(
+        `EXPLAIN QUERY PLAN SELECT "objectId" FROM ${adapter._tableName('IndexedArrayRegexClass')} WHERE ${where.sql}`
+      )
+      .all(...where.params);
+    const results = await adapter.find('IndexedArrayRegexClass', schema, {
+      tags: { $regex: '^ann.*son', $options: 'i' },
+    });
+
+    expect(where.sql.includes('"value" LIKE ?')).toBeTrue();
+    expect(where.sql.includes('regexp_flags')).toBeTrue();
+    expect(
+      queryPlan.some(
+        row => typeof row.detail === 'string' && row.detail.toLowerCase().includes('arridx')
+      )
+    ).toBeTrue();
+    expect(results.map(result => result.objectId).sort()).toEqual([
+      'arrayRegex1',
+      'arrayRegex2',
+    ]);
+  });
+
   it('keeps anchored regex prefix queries on plain String columns index-friendly', async () => {
     const schema = {
       className: 'IndexedRegexClass',
@@ -620,6 +754,108 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
         row => typeof row.detail === 'string' && row.detail.includes('case_insensitive_username')
       )
     ).toBeTrue();
+  });
+
+  it('uses the Parse case-insensitive helper index as a prefix prefilter for more complex anchored regex', async () => {
+    const schema = {
+      className: 'IndexedRegexResidualClass',
+      fields: {
+        objectId: { type: 'String' },
+        username: { type: 'String' },
+      },
+    };
+    await adapter.createClass('IndexedRegexResidualClass', schema);
+    await adapter.createObject('IndexedRegexResidualClass', schema, {
+      objectId: 'regexResidual1',
+      username: 'annason',
+    });
+    await adapter.createObject('IndexedRegexResidualClass', schema, {
+      objectId: 'regexResidual2',
+      username: 'ANN_big_son',
+    });
+    await adapter.createObject('IndexedRegexResidualClass', schema, {
+      objectId: 'regexResidual3',
+      username: 'bobson',
+    });
+    await adapter.ensureIndex(
+      'IndexedRegexResidualClass',
+      schema,
+      ['username'],
+      'case_insensitive_username',
+      true
+    );
+
+    const where = adapter._buildWhereClause('IndexedRegexResidualClass', schema, {
+      username: { $regex: '^ann.*son', $options: 'i' },
+    });
+    const queryPlan = adapter
+      ._prepare(
+        `EXPLAIN QUERY PLAN SELECT "objectId" FROM ${adapter._tableName('IndexedRegexResidualClass')} WHERE ${where.sql}`
+      )
+      .all(...where.params);
+    const results = await adapter.find('IndexedRegexResidualClass', schema, {
+      username: { $regex: '^ann.*son', $options: 'i' },
+    });
+
+    expect(where.sql.includes('"username" LIKE ?')).toBeTrue();
+    expect(where.sql.includes('regexp_flags')).toBeTrue();
+    expect(
+      queryPlan.some(
+        row => typeof row.detail === 'string' && row.detail.includes('case_insensitive_username')
+      )
+    ).toBeTrue();
+    expect(results.map(result => result.objectId).sort()).toEqual([
+      'regexResidual1',
+      'regexResidual2',
+    ]);
+  });
+
+  it('uses uncased Thai prefixes as regex prefilters without losing unicode matches', async () => {
+    const schema = {
+      className: 'IndexedRegexThaiClass',
+      fields: {
+        objectId: { type: 'String' },
+        name: { type: 'String' },
+      },
+    };
+    await adapter.createClass('IndexedRegexThaiClass', schema);
+    await adapter.createObject('IndexedRegexThaiClass', schema, {
+      objectId: 'thaiRegex1',
+      name: 'สมชายใจดี',
+    });
+    await adapter.createObject('IndexedRegexThaiClass', schema, {
+      objectId: 'thaiRegex2',
+      name: 'สมหญิงใจกว้าง',
+    });
+    await adapter.createObject('IndexedRegexThaiClass', schema, {
+      objectId: 'thaiRegex3',
+      name: 'จอยใจดี',
+    });
+    await adapter.createIndex('IndexedRegexThaiClass', { name: 1 }, { name: 'indexed_regex_thai_name' });
+
+    const where = adapter._buildWhereClause('IndexedRegexThaiClass', schema, {
+      name: { $regex: '^สม.*ใจ', $options: 'i' },
+    });
+    const queryPlan = adapter
+      ._prepare(
+        `EXPLAIN QUERY PLAN SELECT "objectId" FROM ${adapter._tableName('IndexedRegexThaiClass')} WHERE ${where.sql}`
+      )
+      .all(...where.params);
+    const results = await adapter.find('IndexedRegexThaiClass', schema, {
+      name: { $regex: '^สม.*ใจ', $options: 'i' },
+    });
+
+    expect(where.sql.includes('"name" GLOB ?')).toBeTrue();
+    expect(where.sql.includes('regexp_flags')).toBeTrue();
+    expect(
+      queryPlan.some(
+        row => typeof row.detail === 'string' && row.detail.includes('indexed_regex_thai_name')
+      )
+    ).toBeTrue();
+    expect(results.map(result => result.objectId).sort()).toEqual([
+      'thaiRegex1',
+      'thaiRegex2',
+    ]);
   });
 
   it('cleans up FTS artifacts when deleting text indexes', async () => {

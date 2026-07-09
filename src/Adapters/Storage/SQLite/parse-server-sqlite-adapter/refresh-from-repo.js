@@ -53,6 +53,7 @@ const importRewrite = {
 const utilsCompatSearch = [
   "const {\n",
   "  getSimpleNormalizedRegexInfo,\n",
+  "  getRegexPrefixPrefilterInfo,\n",
   "  isNumericArrayIndexComponent,\n",
   "  normalizeRegexPattern\n",
   "} = require('./SQLiteUtils');\n",
