@@ -558,6 +558,70 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
     expect(results.map(result => result.objectId)).toEqual(['idx1']);
   });
 
+  it('keeps anchored regex prefix queries on plain String columns index-friendly', async () => {
+    const schema = {
+      className: 'IndexedRegexClass',
+      fields: {
+        objectId: { type: 'String' },
+        name: { type: 'String' },
+      },
+    };
+    await adapter.createClass('IndexedRegexClass', schema);
+    await adapter.createIndex('IndexedRegexClass', { name: 1 }, { name: 'indexed_regex_name' });
+
+    const where = adapter._buildWhereClause('IndexedRegexClass', schema, {
+      name: { $regex: '^ann' },
+    });
+    const queryPlan = adapter
+      ._prepare(
+        `EXPLAIN QUERY PLAN SELECT "objectId" FROM ${adapter._tableName('IndexedRegexClass')} WHERE ${where.sql}`
+      )
+      .all(...where.params);
+
+    expect(where.sql.includes('CAST(')).toBeFalse();
+    expect(where.sql.includes('"name" GLOB ?')).toBeTrue();
+    expect(
+      queryPlan.some(
+        row => typeof row.detail === 'string' && row.detail.includes('indexed_regex_name')
+      )
+    ).toBeTrue();
+  });
+
+  it('uses the Parse case-insensitive helper index for lowered regex prefix lookups', async () => {
+    const schema = {
+      className: 'IndexedRegexInsensitiveClass',
+      fields: {
+        objectId: { type: 'String' },
+        username: { type: 'String' },
+      },
+    };
+    await adapter.createClass('IndexedRegexInsensitiveClass', schema);
+    await adapter.ensureIndex(
+      'IndexedRegexInsensitiveClass',
+      schema,
+      ['username'],
+      'case_insensitive_username',
+      true
+    );
+
+    const where = adapter._buildWhereClause('IndexedRegexInsensitiveClass', schema, {
+      username: { $regex: '^ann', $options: 'i' },
+    });
+    const queryPlan = adapter
+      ._prepare(
+        `EXPLAIN QUERY PLAN SELECT "objectId" FROM ${adapter._tableName('IndexedRegexInsensitiveClass')} WHERE ${where.sql}`
+      )
+      .all(...where.params);
+
+    expect(where.sql.includes('CAST(')).toBeFalse();
+    expect(where.sql.includes('"username" LIKE ?')).toBeTrue();
+    expect(
+      queryPlan.some(
+        row => typeof row.detail === 'string' && row.detail.includes('case_insensitive_username')
+      )
+    ).toBeTrue();
+  });
+
   it('cleans up FTS artifacts when deleting text indexes', async () => {
     const schema = {
       className: 'FTSIndexClass',

@@ -1687,16 +1687,37 @@ const escapeSQLiteGlobPattern = (literal: string): string =>
 
 const isASCIIOnlyString = (value: string): boolean => /^[\x00-\x7F]*$/.test(value);
 
+/** Only bare text-ish columns can drop CAST() and still keep regex lowering semantics sane. */
+const isLowerableRegexTextColumn = (
+  schemaFields: { [string]: any },
+  fieldName: string
+): boolean => {
+  if (fieldName === 'objectId' || fieldName === 'createdAt' || fieldName === 'updatedAt') {
+    return true;
+  }
+
+  const field = schemaFields[fieldName];
+  if (!field || typeof field !== 'object') {
+    return false;
+  }
+
+  return field.type === 'String' || field.type === 'Date';
+};
+
 const getSimpleRegexMatchExpression = (
   targetSql: string,
-  normalizedRegex: { pattern: string, flags: string }
+  normalizedRegex: { pattern: string, flags: string },
+  options?: {
+    useRawTextTarget?: boolean,
+  }
 ): { sql: string, params: Array<any> } | null => {
   const regexInfo = getSimpleNormalizedRegexInfo(normalizedRegex.pattern, normalizedRegex.flags);
   if (!regexInfo) {
     return null;
   }
 
-  const textTargetSql = `CAST(${targetSql} AS TEXT)`;
+  // Raw text columns can use their normal index. JSON extracts and mixed-type slots still need CAST().
+  const textTargetSql = options && options.useRawTextTarget ? targetSql : `CAST(${targetSql} AS TEXT)`;
   if (regexInfo.caseInsensitive) {
     if (!isASCIIOnlyString(regexInfo.literal)) {
       return null;
@@ -3285,6 +3306,13 @@ export class SQLiteStorageAdapter implements StorageAdapter {
         shouldTrackExplicitNullFields(className) && !authDataProvider && !isDotNotation
           ? getExplicitNullFieldMatchExpression(normalizedKey)
           : null;
+      /** Bare text columns can keep index-friendly LIKE/GLOB/=`...` lowering without CAST(... AS TEXT). */
+      const canUseLoweredRegexRawTextTarget =
+        !authDataProvider &&
+        !isDotNotation &&
+        !isArrayField &&
+        targetSql !== 'NULL' &&
+        isLowerableRegexTextColumn(schemaFields, normalizedKey);
 
       if (val === null || val === undefined) {
         if (dotFieldArraySourceSql) {
@@ -3613,7 +3641,10 @@ export class SQLiteStorageAdapter implements StorageAdapter {
             const normalizedRegex = validateRegexPattern(opVal, val.$options || '');
             const regexMatch = getSimpleRegexMatchExpression(
               isArrayField ? 'value' : targetSql,
-              normalizedRegex
+              normalizedRegex,
+              {
+                useRawTextTarget: canUseLoweredRegexRawTextTarget,
+              }
             );
             if (isArrayField) {
               if (regexMatch) {
@@ -5747,12 +5778,9 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     schema: SchemaType,
     fieldNames: string[],
     indexName?: string,
-    _caseSensitive?: boolean = false,
+    caseInsensitive?: boolean = false,
     options?: Object = {}
   ): Promise<any> {
-    if (_caseSensitive) {
-      // SQLite indexes are case sensitive by default for text comparisons unless NOCASE is specified
-    }
     if (!(await this.classExists(className))) {
       const fields = {};
       fieldNames.forEach(f => {
@@ -5763,7 +5791,17 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     const tableName = this._tableName(className);
     const idxName = indexName || `parse_default_${fieldNames.sort().join('_')}`;
     const safeIdxName = `"${idxName.replace(/"/g, '""')}"`;
-    const colExprs = fieldNames.map(fieldName => this._buildIndexFieldExpression(fieldName).expression);
+    const colExprs = fieldNames.map(fieldName => {
+      const fieldExpression = this._buildIndexFieldExpression(fieldName).expression;
+
+      // Parse asks for these username/email helper indexes so lowered `LIKE 'foo%'`
+      // can seek with SQLite's NOCASE collation instead of walking the whole table.
+      if (caseInsensitive) {
+        return `${fieldExpression} COLLATE NOCASE`;
+      } else {
+        return fieldExpression;
+      }
+    });
 
     let sql = `CREATE INDEX IF NOT EXISTS ${safeIdxName} ON ${tableName} (${colExprs.join(', ')})`;
     if (options.ttl) {

@@ -1317,12 +1317,26 @@ const validateRegexPattern = (pattern, flags) => {
 const escapeSQLiteLikePattern = literal => literal.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
 const escapeSQLiteGlobPattern = literal => literal.replace(/\[/g, '[[]').replace(/\*/g, '[*]').replace(/\?/g, '[?]');
 const isASCIIOnlyString = value => /^[\x00-\x7F]*$/.test(value);
-const getSimpleRegexMatchExpression = (targetSql, normalizedRegex) => {
+
+/** Only bare text-ish columns can drop CAST() and still keep regex lowering semantics sane. */
+const isLowerableRegexTextColumn = (schemaFields, fieldName) => {
+  if (fieldName === 'objectId' || fieldName === 'createdAt' || fieldName === 'updatedAt') {
+    return true;
+  }
+  const field = schemaFields[fieldName];
+  if (!field || typeof field !== 'object') {
+    return false;
+  }
+  return field.type === 'String' || field.type === 'Date';
+};
+const getSimpleRegexMatchExpression = (targetSql, normalizedRegex, options) => {
   const regexInfo = getSimpleNormalizedRegexInfo(normalizedRegex.pattern, normalizedRegex.flags);
   if (!regexInfo) {
     return null;
   }
-  const textTargetSql = `CAST(${targetSql} AS TEXT)`;
+
+  // Raw text columns can use their normal index. JSON extracts and mixed-type slots still need CAST().
+  const textTargetSql = options && options.useRawTextTarget ? targetSql : `CAST(${targetSql} AS TEXT)`;
   if (regexInfo.caseInsensitive) {
     if (!isASCIIOnlyString(regexInfo.literal)) {
       return null;
@@ -2585,6 +2599,8 @@ class SQLiteStorageAdapter {
       const usesCaseInsensitiveComparison = caseInsensitive && !authDataProvider && !isDotNotation && (normalizedKey === 'username' || normalizedKey === 'email');
       const isArrayField = normalizedKey === '_rperm' || normalizedKey === '_wperm' || schemaFields[normalizedKey] && schemaFields[normalizedKey].type === 'Array';
       const explicitNullFieldMatch = shouldTrackExplicitNullFields(className) && !authDataProvider && !isDotNotation ? getExplicitNullFieldMatchExpression(normalizedKey) : null;
+      /** Bare text columns can keep index-friendly LIKE/GLOB/=`...` lowering without CAST(... AS TEXT). */
+      const canUseLoweredRegexRawTextTarget = !authDataProvider && !isDotNotation && !isArrayField && targetSql !== 'NULL' && isLowerableRegexTextColumn(schemaFields, normalizedKey);
       if (val === null || val === undefined) {
         if (dotFieldArraySourceSql) {
           conditions.push(`EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${targetSql} IS NULL)`);
@@ -2841,7 +2857,9 @@ class SQLiteStorageAdapter {
             }
           } else if (op === '$regex') {
             const normalizedRegex = validateRegexPattern(opVal, val.$options || '');
-            const regexMatch = getSimpleRegexMatchExpression(isArrayField ? 'value' : targetSql, normalizedRegex);
+            const regexMatch = getSimpleRegexMatchExpression(isArrayField ? 'value' : targetSql, normalizedRegex, {
+              useRawTextTarget: canUseLoweredRegexRawTextTarget
+            });
             if (isArrayField) {
               if (regexMatch) {
                 conditions.push(`EXISTS (SELECT 1 FROM json_each(${targetSql}) WHERE ${regexMatch.sql})`);
@@ -4685,10 +4703,7 @@ class SQLiteStorageAdapter {
       return createObj;
     }
   }
-  async ensureIndex(className, schema, fieldNames, indexName, _caseSensitive = false, options = {}) {
-    if (_caseSensitive) {
-      // SQLite indexes are case sensitive by default for text comparisons unless NOCASE is specified
-    }
+  async ensureIndex(className, schema, fieldNames, indexName, caseInsensitive = false, options = {}) {
     if (!(await this.classExists(className))) {
       const fields = {};
       fieldNames.forEach(f => {
@@ -4703,7 +4718,17 @@ class SQLiteStorageAdapter {
     const tableName = this._tableName(className);
     const idxName = indexName || `parse_default_${fieldNames.sort().join('_')}`;
     const safeIdxName = `"${idxName.replace(/"/g, '""')}"`;
-    const colExprs = fieldNames.map(fieldName => this._buildIndexFieldExpression(fieldName).expression);
+    const colExprs = fieldNames.map(fieldName => {
+      const fieldExpression = this._buildIndexFieldExpression(fieldName).expression;
+
+      // Parse asks for these username/email helper indexes so lowered `LIKE 'foo%'`
+      // can seek with SQLite's NOCASE collation instead of walking the whole table.
+      if (caseInsensitive) {
+        return `${fieldExpression} COLLATE NOCASE`;
+      } else {
+        return fieldExpression;
+      }
+    });
     let sql = `CREATE INDEX IF NOT EXISTS ${safeIdxName} ON ${tableName} (${colExprs.join(', ')})`;
     if (options.ttl) {
       sql = `CREATE INDEX IF NOT EXISTS ${safeIdxName} ON ${tableName} ("_expiresAt")`;

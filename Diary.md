@@ -1699,3 +1699,21 @@
 - Verified edge case:
   - SQLite does not match numeric `1` against string `"1"` in the JSON-each set path.
   - SQLite JSON booleans surface as integer `1` / `0`, so boolean-vs-number is the one fuzzy primitive case to keep in mind.
+
+2026-07-09
+- Regex lowering perf follow-up from `expert_opinion.md`.
+- Verified with the real local SQLite planner, not guesswork:
+  - `name GLOB 'ann*'` uses a normal index
+  - `CAST(name AS TEXT) GLOB 'ann*'` scans
+  - `username LIKE 'ann%' ESCAPE '\'` uses a `COLLATE NOCASE` index
+- Landed source-only fix in `SQLiteStorageAdapter.js`:
+  - simple lowered regex keeps raw column SQL for bare text columns (`String`, `Date`, `objectId`, `createdAt`, `updatedAt`)
+  - JSON extracts / dot paths / arrays still keep `CAST(... AS TEXT)` so mixed-type regex semantics do not drift
+  - `ensureIndex(..., caseInsensitive=true)` now really builds `COLLATE NOCASE` index expressions for Parse's username/email helper indexes
+- Added focused SQLite unit specs proving planner use for:
+  - anchored case-sensitive regex prefix on a plain String column
+  - anchored case-insensitive regex prefix using the Parse helper index
+- Validation:
+  - `npm run build`
+  - `PARSE_SERVER_TEST_DB=sqlite PARSE_SERVER_TEST_DATABASE_URI=sqlite://:memory: TESTING=1 npx jasmine spec/SQLiteStorageAdapter.spec.js`
+  - `45 specs, 0 failures`
