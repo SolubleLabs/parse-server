@@ -858,7 +858,7 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
     ]);
   });
 
-  it('lowers anchored exact regex alternations to IN without paying the REGEXP path', async () => {
+  it('lowers anchored exact regex alternations to IN while keeping end-anchor semantics correct', async () => {
     const schema = {
       className: 'IndexedRegexExactAlternationClass',
       fields: {
@@ -902,7 +902,7 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
     });
 
     expect(where.sql.includes(' IN (')).toBeTrue();
-    expect(where.sql.includes('REGEXP')).toBeFalse();
+    expect(where.sql.includes('REGEXP')).toBeTrue();
     expect(
       queryPlan.some(
         row =>
@@ -968,7 +968,7 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
 
     expect(where.sql.includes('COLLATE NOCASE')).toBeTrue();
     expect(where.sql.includes(' IN (')).toBeTrue();
-    expect(where.sql.includes('regexp_flags')).toBeFalse();
+    expect(where.sql.includes('regexp_flags')).toBeTrue();
     expect(
       queryPlan.some(
         row => typeof row.detail === 'string' && row.detail.includes('case_insensitive_username')
@@ -980,7 +980,7 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
     ]);
   });
 
-  it('lowers finite char-class exact regex to IN without falling back to REGEXP', async () => {
+  it('lowers finite char-class exact regex to IN while keeping end-anchor semantics correct', async () => {
     const schema = {
       className: 'IndexedRegexFiniteCharClassClass',
       fields: {
@@ -1020,8 +1020,9 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
     });
 
     expect(where.sql.includes(' IN (')).toBeTrue();
-    expect(where.sql.includes('REGEXP')).toBeFalse();
-    expect(where.params.sort()).toEqual(['anna', 'anne']);
+    expect(where.sql.includes('REGEXP')).toBeTrue();
+    expect(where.params.slice(0, 2).sort()).toEqual(['anna', 'anne']);
+    expect(where.params[2]).toBe('^ann[ae]$');
     expect(
       queryPlan.some(
         row =>
@@ -1079,8 +1080,14 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
     });
 
     expect(where.sql.includes(' IN (')).toBeTrue();
-    expect(where.sql.includes('REGEXP')).toBeFalse();
-    expect(where.params.sort()).toEqual(['Dr. Ann', 'Dr. Bob', 'Mr. Ann', 'Mr. Bob']);
+    expect(where.sql.includes('REGEXP')).toBeTrue();
+    expect(where.params.slice(0, 4).sort()).toEqual([
+      'Dr. Ann',
+      'Dr. Bob',
+      'Mr. Ann',
+      'Mr. Bob',
+    ]);
+    expect(where.params[4]).toBe('^(Dr|Mr)\\. (Ann|Bob)$');
     expect(
       queryPlan.some(
         row =>
@@ -1186,6 +1193,228 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
           row.detail.includes('indexed_regex_finite_optional_prefix_word')
       )
     ).toBeTrue();
+  });
+
+  it('does not underfilter ungrouped top-level alternation regex with a misleading prefix prefilter', async () => {
+    const schema = {
+      className: 'IndexedRegexTopLevelAlternationClass',
+      fields: {
+        objectId: { type: 'String' },
+        name: { type: 'String' },
+      },
+    };
+    await adapter.createClass('IndexedRegexTopLevelAlternationClass', schema);
+    await adapter.createObject('IndexedRegexTopLevelAlternationClass', schema, {
+      objectId: 'regexTopAlt1',
+      name: 'annx',
+    });
+    await adapter.createObject('IndexedRegexTopLevelAlternationClass', schema, {
+      objectId: 'regexTopAlt2',
+      name: 'xxbob',
+    });
+    await adapter.createIndex(
+      'IndexedRegexTopLevelAlternationClass',
+      { name: 1 },
+      { name: 'indexed_regex_top_level_alt_name' }
+    );
+
+    const where = adapter._buildWhereClause('IndexedRegexTopLevelAlternationClass', schema, {
+      name: { $regex: '^ann|bob$' },
+    });
+    const results = await adapter.find('IndexedRegexTopLevelAlternationClass', schema, {
+      name: { $regex: '^ann|bob$' },
+    });
+
+    expect(where.sql.includes('GLOB')).toBeFalse();
+    expect(where.sql.includes('LIKE')).toBeFalse();
+    expect(where.sql.includes('REGEXP')).toBeTrue();
+    expect(results.map(result => result.objectId).sort()).toEqual([
+      'regexTopAlt1',
+      'regexTopAlt2',
+    ]);
+  });
+
+  it('keeps residual regex checks on non-indexed array fields when prefix lowering is only a prefilter', async () => {
+    const schema = {
+      className: 'ArrayRegexResidualClass',
+      fields: {
+        objectId: { type: 'String' },
+        tags: { type: 'Array' },
+      },
+    };
+    await adapter.createClass('ArrayRegexResidualClass', schema);
+    await adapter.createObject('ArrayRegexResidualClass', schema, {
+      objectId: 'arrayRegexResidual1',
+      tags: ['annx'],
+    });
+    await adapter.createObject('ArrayRegexResidualClass', schema, {
+      objectId: 'arrayRegexResidual2',
+      tags: ['annason'],
+    });
+
+    const where = adapter._buildWhereClause('ArrayRegexResidualClass', schema, {
+      tags: { $regex: '^ann.*son' },
+    });
+    const results = await adapter.find('ArrayRegexResidualClass', schema, {
+      tags: { $regex: '^ann.*son' },
+    });
+
+    expect(where.sql.includes('EXISTS')).toBeTrue();
+    expect(where.sql.includes('REGEXP')).toBeTrue();
+    expect(results.map(result => result.objectId)).toEqual(['arrayRegexResidual2']);
+  });
+
+  it('keeps residual regex checks on non-indexed dotted array paths too', async () => {
+    const schema = {
+      className: 'DotArrayRegexResidualClass',
+      fields: {
+        objectId: { type: 'String' },
+        members: { type: 'Array' },
+      },
+    };
+    await adapter.createClass('DotArrayRegexResidualClass', schema);
+    await adapter.createObject('DotArrayRegexResidualClass', schema, {
+      objectId: 'dotArrayRegexResidual1',
+      members: [{ name: 'annx' }],
+    });
+    await adapter.createObject('DotArrayRegexResidualClass', schema, {
+      objectId: 'dotArrayRegexResidual2',
+      members: [{ name: 'annason' }],
+    });
+
+    const where = adapter._buildWhereClause('DotArrayRegexResidualClass', schema, {
+      'members.name': { $regex: '^ann.*son' },
+    });
+    const results = await adapter.find('DotArrayRegexResidualClass', schema, {
+      'members.name': { $regex: '^ann.*son' },
+    });
+
+    expect(where.sql.includes('EXISTS')).toBeTrue();
+    expect(where.sql.includes('REGEXP')).toBeTrue();
+    expect(results.map(result => result.objectId)).toEqual(['dotArrayRegexResidual2']);
+  });
+
+  it('rejects stateful regex flags that would make cached RegExp.test nondeterministic', async () => {
+    const schema = {
+      className: 'RegexInvalidFlagClass',
+      fields: {
+        objectId: { type: 'String' },
+        name: { type: 'String' },
+      },
+    };
+    await adapter.createClass('RegexInvalidFlagClass', schema);
+
+    expect(() =>
+      adapter._buildWhereClause('RegexInvalidFlagClass', schema, {
+        name: { $regex: '^ann', $options: 'g' },
+      })
+    ).toThrowError(/An internal server error occurred/);
+    expect(() =>
+      adapter._buildWhereClause('RegexInvalidFlagClass', schema, {
+        name: { $regex: '^ann', $options: 'y' },
+      })
+    ).toThrowError(/An internal server error occurred/);
+  });
+
+  it('keeps end-anchor regex lowering aligned with JavaScript newline semantics', async () => {
+    const schema = {
+      className: 'RegexEndAnchorSemanticsClass',
+      fields: {
+        objectId: { type: 'String' },
+        name: { type: 'String' },
+      },
+    };
+    const fixtures = [
+      { objectId: 'regexEndAnchor1', name: 'ann' },
+      { objectId: 'regexEndAnchor2', name: 'ann\n' },
+      { objectId: 'regexEndAnchor3', name: 'ann\r' },
+      { objectId: 'regexEndAnchor4', name: 'ann\r\n' },
+      { objectId: 'regexEndAnchor5', name: `ann${String.fromCharCode(0x2028)}` },
+      { objectId: 'regexEndAnchor6', name: `ann${String.fromCharCode(0x2029)}` },
+      { objectId: 'regexEndAnchor7', name: 'ann\nx' },
+    ];
+    await adapter.createClass('RegexEndAnchorSemanticsClass', schema);
+    for (const fixture of fixtures) {
+      await adapter.createObject('RegexEndAnchorSemanticsClass', schema, fixture);
+    }
+    await adapter.createIndex(
+      'RegexEndAnchorSemanticsClass',
+      { name: 1 },
+      { name: 'indexed_regex_end_anchor_name' }
+    );
+
+    const exactWhere = adapter._buildWhereClause('RegexEndAnchorSemanticsClass', schema, {
+      name: { $regex: '^ann$' },
+    });
+    const prefixWhere = adapter._buildWhereClause('RegexEndAnchorSemanticsClass', schema, {
+      name: { $regex: '^ann.*$' },
+    });
+    const exactResults = await adapter.find('RegexEndAnchorSemanticsClass', schema, {
+      name: { $regex: '^ann$' },
+    });
+    const prefixResults = await adapter.find('RegexEndAnchorSemanticsClass', schema, {
+      name: { $regex: '^ann.*$' },
+    });
+    const exactRegex = new RegExp('^ann$');
+    const prefixRegex = new RegExp('^ann.*$');
+
+    expect(exactWhere.sql.includes('REGEXP')).toBeTrue();
+    expect(prefixWhere.sql.includes('REGEXP')).toBeTrue();
+    expect(exactResults.map(result => result.objectId).sort()).toEqual(
+      fixtures
+        .filter(fixture => exactRegex.test(fixture.name))
+        .map(fixture => fixture.objectId)
+        .sort()
+    );
+    expect(prefixResults.map(result => result.objectId).sort()).toEqual(
+      fixtures
+        .filter(fixture => prefixRegex.test(fixture.name))
+        .map(fixture => fixture.objectId)
+        .sort()
+    );
+  });
+
+  it('keeps open-ended exact-ish prefixes as prefix filters plus residual instead of collapsing them to equality', async () => {
+    const schema = {
+      className: 'RegexOpenEndedExactClass',
+      fields: {
+        objectId: { type: 'String' },
+        name: { type: 'String' },
+      },
+    };
+    await adapter.createClass('RegexOpenEndedExactClass', schema);
+    await adapter.createObject('RegexOpenEndedExactClass', schema, {
+      objectId: 'regexOpenEnded1',
+      name: 'an',
+    });
+    await adapter.createObject('RegexOpenEndedExactClass', schema, {
+      objectId: 'regexOpenEnded2',
+      name: 'ann',
+    });
+    await adapter.createObject('RegexOpenEndedExactClass', schema, {
+      objectId: 'regexOpenEnded3',
+      name: 'anx',
+    });
+    await adapter.createIndex(
+      'RegexOpenEndedExactClass',
+      { name: 1 },
+      { name: 'indexed_regex_open_ended_exact_name' }
+    );
+
+    const where = adapter._buildWhereClause('RegexOpenEndedExactClass', schema, {
+      name: { $regex: '^an+$' },
+    });
+    const results = await adapter.find('RegexOpenEndedExactClass', schema, {
+      name: { $regex: '^an+$' },
+    });
+
+    expect(where.sql.includes('GLOB')).toBeTrue();
+    expect(where.sql.includes('REGEXP')).toBeTrue();
+    expect(where.sql.includes(' IN (')).toBeFalse();
+    expect(results.map(result => result.objectId).sort()).toEqual([
+      'regexOpenEnded1',
+      'regexOpenEnded2',
+    ]);
   });
 
   it('keeps pure ^prefix.* regex fully native instead of adding a redundant residual regex', async () => {

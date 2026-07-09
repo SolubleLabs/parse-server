@@ -3,6 +3,7 @@
 const stableStringify = require('safe-stable-stringify');
 const numericArrayIndexPattern = /^(0|[1-9]\d*)$/;
 const regexLiteralCharacterPattern = /[0-9 ]|\p{L}/u;
+const allowedSQLiteRegexFlags = new Set(['i', 'm', 's', 'u', 'x']);
 // eslint-disable-next-line no-control-regex
 const asciiOnlyStringPattern = /^[\u0000-\u007F]*$/;
 
@@ -167,6 +168,13 @@ const normalizeRegexPattern = (
 ): { pattern: string, flags: string } => {
   let normalizedPattern = pattern;
   let normalizedFlags = flags || '';
+  const distinctFlags = getDistinctRegexFlags(normalizedFlags);
+  for (const flag of distinctFlags) {
+    if (!allowedSQLiteRegexFlags.has(flag)) {
+      throw new Error(`Unsupported regular expression flag: ${flag}`);
+    }
+  }
+  normalizedFlags = distinctFlags.join('');
   if (normalizedFlags.includes('x')) {
     normalizedPattern = removeRegexWhiteSpace(normalizedPattern);
     normalizedFlags = normalizedFlags.replace(/x/g, '');
@@ -189,6 +197,11 @@ const isRegexCharacterEscaped = (pattern: string, index: number): boolean => {
   return backslashCount % 2 === 1;
 };
 
+const hasRegexLineSensitiveEndAnchor = (pattern: string): boolean =>
+  pattern.length > 0 &&
+  pattern[pattern.length - 1] === '$' &&
+  !isRegexCharacterEscaped(pattern, pattern.length - 1);
+
 const getSimpleNormalizedRegexInfo = (
   pattern: string,
   flags?: string
@@ -197,6 +210,7 @@ const getSimpleNormalizedRegexInfo = (
       literal: string,
       mode: 'exact' | 'startsWith' | 'endsWith' | 'contains',
       caseInsensitive: boolean,
+      requiresResidual: boolean,
     }
   | null => {
   const distinctFlags = getDistinctRegexFlags(flags);
@@ -213,7 +227,7 @@ const getSimpleNormalizedRegexInfo = (
     anchoredStart = true;
     startIndex = 1;
   }
-  if (endIndex > startIndex && pattern[endIndex - 1] === '$' && !isRegexCharacterEscaped(pattern, endIndex - 1)) {
+  if (endIndex > startIndex && hasRegexLineSensitiveEndAnchor(pattern)) {
     anchoredEnd = true;
     endIndex -= 1;
   }
@@ -255,6 +269,7 @@ const getSimpleNormalizedRegexInfo = (
     literal,
     mode,
     caseInsensitive: distinctFlags.includes('i'),
+    requiresResidual: anchoredEnd,
   };
 };
 
@@ -820,7 +835,45 @@ const parseRegexFiniteGroup = (
 };
 
 const isRegexPurePrefixTail = (pattern: string, index: number): boolean =>
-  index >= pattern.length || pattern.slice(index) === '.*' || pattern.slice(index) === '.*$';
+  index >= pattern.length || pattern.slice(index) === '.*';
+
+const hasTopLevelRegexAlternation = (pattern: string, startIndex: number): boolean => {
+  let groupDepth = 0;
+  let inCharClass = false;
+
+  for (let index = startIndex; index < pattern.length; index += 1) {
+    const char = pattern[index];
+    if (char === '\\') {
+      index += 1;
+      continue;
+    }
+    if (inCharClass) {
+      if (char === ']') {
+        inCharClass = false;
+      }
+      continue;
+    }
+    if (char === '[') {
+      inCharClass = true;
+      continue;
+    }
+    if (char === '(') {
+      groupDepth += 1;
+      continue;
+    }
+    if (char === ')') {
+      if (groupDepth > 0) {
+        groupDepth -= 1;
+      }
+      continue;
+    }
+    if (char === '|' && groupDepth === 0) {
+      return true;
+    }
+  }
+
+  return false;
+};
 
 const parseRegexFiniteSegment = (
   pattern: string,
@@ -928,6 +981,7 @@ const getRegexLeadingLiteralSetInfo = (
   let cursor = 1;
   let literals = [''];
   let parsedAny = false;
+  let stoppedOnOpenEndedSegment = false;
 
   while (cursor < pattern.length) {
     const segment = parseRegexFiniteSegment(pattern, cursor);
@@ -949,6 +1003,7 @@ const getRegexLeadingLiteralSetInfo = (
     parsedAny = true;
 
     if (segment.stopAfter) {
+      stoppedOnOpenEndedSegment = true;
       break;
     }
   }
@@ -962,13 +1017,17 @@ const getRegexLeadingLiteralSetInfo = (
     return null;
   }
 
-  if (pattern.slice(cursor) === '$') {
+  if (!stoppedOnOpenEndedSegment && pattern.slice(cursor) === '$') {
     return {
       literals: normalizeRegexLiteralSet(literals, caseMode),
       matchMode: 'exact',
       caseMode,
-      requiresResidual: false,
+      requiresResidual: true,
     };
+  }
+
+  if (hasTopLevelRegexAlternation(pattern, cursor)) {
+    return null;
   }
 
   const collapsedPrefixes = collapseRegexPrefixSet(literals, caseMode);
@@ -1024,6 +1083,10 @@ const getRegexPrefixPrefilterInfo = (
   }
 
   if (!literalPrefix) {
+    return null;
+  }
+
+  if (hasTopLevelRegexAlternation(pattern, index)) {
     return null;
   }
 

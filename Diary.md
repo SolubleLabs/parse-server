@@ -1767,3 +1767,19 @@
   - `npm run build`
   - `PARSE_SERVER_TEST_DB=sqlite PARSE_SERVER_TEST_DATABASE_URI=sqlite://:memory: TESTING=1 npx jasmine spec/SQLiteStorageAdapter.spec.js`
   - `npx eslint src/Adapters/Storage/SQLite/SQLiteUtils.js src/Adapters/Storage/SQLite/SQLiteStorageAdapter.js spec/SQLiteStorageAdapter.spec.js --flag unstable_config_lookup_from_file`
+
+## 2026-07-09
+- Verified expert opinion against current code:
+  - fixed real correctness bugs for top-level alternation underfiltering, missing residual regex checks on non-indexed array/dot-array paths, stateful `g`/`y` flags, and end-anchor / `.*$` newline semantics
+  - also fixed an extra planner trap where open-ended exact-looking shapes such as `^an+$` could otherwise collapse into equality
+  - skipped the generic `$all` residual-regex claim as not currently applicable: this adapter branch only accepts the legacy starts-with regex shape there, not arbitrary regex semantics
+- Added regression specs for:
+  - `^ann|bob$`
+  - non-indexed array/dot-array residual regex correctness
+  - rejected `g` / `y` flags
+  - end-anchor JS newline equivalence
+  - open-ended anchored repetitions like `^an+$`
+- Validated with:
+  - `npm run build`
+  - `PARSE_SERVER_TEST_DB=sqlite PARSE_SERVER_TEST_DATABASE_URI=sqlite://:memory: TESTING=1 npx jasmine spec/SQLiteStorageAdapter.spec.js`
+  - `npx eslint src/Adapters/Storage/SQLite/SQLiteUtils.js src/Adapters/Storage/SQLite/SQLiteStorageAdapter.js spec/SQLiteStorageAdapter.spec.js --flag unstable_config_lookup_from_file`

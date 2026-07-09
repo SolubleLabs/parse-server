@@ -1781,7 +1781,7 @@ const getSimpleRegexMatchExpression = (
   options?: {
     useRawTextTarget?: boolean,
   }
-): { sql: string, params: Array<any> } | null => {
+): { sql: string, params: Array<any>, requiresResidual: boolean } | null => {
   const regexInfo = getSimpleNormalizedRegexInfo(normalizedRegex.pattern, normalizedRegex.flags);
   if (!regexInfo) {
     return null;
@@ -1804,6 +1804,7 @@ const getSimpleRegexMatchExpression = (
     return {
       sql: `${textTargetSql} LIKE ? ESCAPE '\\'`,
       params: [likePattern],
+      requiresResidual: regexInfo.requiresResidual,
     };
   }
 
@@ -1811,6 +1812,7 @@ const getSimpleRegexMatchExpression = (
     return {
       sql: `${textTargetSql} = ?`,
       params: [regexInfo.literal],
+      requiresResidual: regexInfo.requiresResidual,
     };
   }
 
@@ -1826,6 +1828,7 @@ const getSimpleRegexMatchExpression = (
   return {
     sql: `${textTargetSql} GLOB ?`,
     params: [globPattern],
+    requiresResidual: regexInfo.requiresResidual,
   };
 };
 
@@ -1946,10 +1949,7 @@ const getRegexMatchPlan = (
 
   const simpleRegexMatch = getSimpleRegexMatchExpression(targetSql, normalizedRegex, options);
   if (simpleRegexMatch) {
-    return {
-      ...simpleRegexMatch,
-      requiresResidual: false,
-    };
+    return simpleRegexMatch;
   }
 
   if (!(options && options.allowPrefixPrefilter)) {
@@ -1977,6 +1977,50 @@ const getRegexMatchPlan = (
   };
 };
 
+const getSQLiteRegexResidualExpression = (
+  targetSql: string,
+  normalizedRegex: { pattern: string, flags: string }
+): { sql: string, params: Array<any> } => {
+  if (normalizedRegex.flags) {
+    return {
+      sql: `regexp_flags(?, ?, ${targetSql}) = 1`,
+      params: [normalizedRegex.pattern, normalizedRegex.flags],
+    };
+  }
+
+  return {
+    sql: `${targetSql} REGEXP ?`,
+    params: [normalizedRegex.pattern],
+  };
+};
+
+const getSQLiteRegexValueMatchExpression = (
+  targetSql: string,
+  normalizedRegex: { pattern: string, flags: string },
+  regexMatchPlan?: {
+    sql: string,
+    params: Array<any>,
+    requiresResidual: boolean,
+  } | null
+): { sql: string, params: Array<any> } => {
+  if (!regexMatchPlan) {
+    return getSQLiteRegexResidualExpression(targetSql, normalizedRegex);
+  }
+
+  if (!regexMatchPlan.requiresResidual) {
+    return {
+      sql: regexMatchPlan.sql,
+      params: regexMatchPlan.params,
+    };
+  }
+
+  const residualExpression = getSQLiteRegexResidualExpression(targetSql, normalizedRegex);
+  return {
+    sql: `(${regexMatchPlan.sql}) AND ${residualExpression.sql}`,
+    params: [...regexMatchPlan.params, ...residualExpression.params],
+  };
+};
+
 const getSQLiteArrayIndexRegexMatchExpression = (
   arrayIndexTableName: string,
   normalizedRegex: { pattern: string, flags: string }
@@ -1986,66 +2030,21 @@ const getSQLiteArrayIndexRegexMatchExpression = (
     useRawTextTarget: true,
     allowPrefixPrefilter: true,
   });
+  const regexValueMatch = getSQLiteRegexValueMatchExpression(
+    valueColumnSql,
+    normalizedRegex,
+    regexMatchPlan
+  );
 
-  if (regexMatchPlan) {
-    if (regexMatchPlan.requiresResidual) {
-      if (normalizedRegex.flags) {
-        return {
-          sql:
-            `${quoteColumnName('objectId')} IN (` +
-            `SELECT ${quoteColumnName('objectId')} FROM ${arrayIndexTableName} ` +
-            `WHERE ${quoteColumnName(arrayIndexValueTypeColumn)} = 'text' ` +
-            `AND (${regexMatchPlan.sql}) ` +
-            `AND regexp_flags(?, ?, ${valueColumnSql}) = 1` +
-            `)`,
-          params: [...regexMatchPlan.params, normalizedRegex.pattern, normalizedRegex.flags],
-        };
-      } else {
-        return {
-          sql:
-            `${quoteColumnName('objectId')} IN (` +
-            `SELECT ${quoteColumnName('objectId')} FROM ${arrayIndexTableName} ` +
-            `WHERE ${quoteColumnName(arrayIndexValueTypeColumn)} = 'text' ` +
-            `AND (${regexMatchPlan.sql}) ` +
-            `AND ${valueColumnSql} REGEXP ?` +
-            `)`,
-          params: [...regexMatchPlan.params, normalizedRegex.pattern],
-        };
-      }
-    }
-
-    return {
-      sql:
-        `${quoteColumnName('objectId')} IN (` +
-        `SELECT ${quoteColumnName('objectId')} FROM ${arrayIndexTableName} ` +
-        `WHERE ${quoteColumnName(arrayIndexValueTypeColumn)} = 'text' ` +
-        `AND ${regexMatchPlan.sql}` +
-        `)`,
-      params: regexMatchPlan.params,
-    };
-  }
-
-  if (normalizedRegex.flags) {
-    return {
-      sql:
-        `${quoteColumnName('objectId')} IN (` +
-        `SELECT ${quoteColumnName('objectId')} FROM ${arrayIndexTableName} ` +
-        `WHERE ${quoteColumnName(arrayIndexValueTypeColumn)} = 'text' ` +
-        `AND regexp_flags(?, ?, ${valueColumnSql}) = 1` +
-        `)`,
-      params: [normalizedRegex.pattern, normalizedRegex.flags],
-    };
-  } else {
-    return {
-      sql:
-        `${quoteColumnName('objectId')} IN (` +
-        `SELECT ${quoteColumnName('objectId')} FROM ${arrayIndexTableName} ` +
-        `WHERE ${quoteColumnName(arrayIndexValueTypeColumn)} = 'text' ` +
-        `AND ${valueColumnSql} REGEXP ?` +
-        `)`,
-      params: [normalizedRegex.pattern],
-    };
-  }
+  return {
+    sql:
+      `${quoteColumnName('objectId')} IN (` +
+      `SELECT ${quoteColumnName('objectId')} FROM ${arrayIndexTableName} ` +
+      `WHERE ${quoteColumnName(arrayIndexValueTypeColumn)} = 'text' ` +
+      `AND ${regexValueMatch.sql}` +
+      `)`,
+    params: regexValueMatch.params,
+  };
 };
 
 const transformDotField = (fieldName: string) => {
@@ -4229,17 +4228,16 @@ export class SQLiteStorageAdapter implements StorageAdapter {
                 );
                 conditions.push(indexedRegexMatch.sql);
                 params.push(...indexedRegexMatch.params);
-              } else if (regexMatchPlan) {
-                conditions.push(
-                  `EXISTS (SELECT 1 FROM json_each(${targetSql}) WHERE ${regexMatchPlan.sql})`
-                );
-                params.push(...regexMatchPlan.params);
-              } else if (normalizedRegex.flags) {
-                conditions.push(`EXISTS (SELECT 1 FROM json_each(${targetSql}) WHERE regexp_flags(?, ?, value) = 1)`);
-                params.push(normalizedRegex.pattern, normalizedRegex.flags);
               } else {
-                conditions.push(`EXISTS (SELECT 1 FROM json_each(${targetSql}) WHERE value REGEXP ?)`);
-                params.push(normalizedRegex.pattern);
+                const valueRegexMatch = getSQLiteRegexValueMatchExpression(
+                  'value',
+                  normalizedRegex,
+                  regexMatchPlan
+                );
+                conditions.push(
+                  `EXISTS (SELECT 1 FROM json_each(${targetSql}) WHERE ${valueRegexMatch.sql})`
+                );
+                params.push(...valueRegexMatch.params);
               }
             } else if (dotFieldArraySourceSql) {
               if (indexedArrayElementTableName) {
@@ -4249,49 +4247,25 @@ export class SQLiteStorageAdapter implements StorageAdapter {
                 );
                 conditions.push(indexedRegexMatch.sql);
                 params.push(...indexedRegexMatch.params);
-              } else if (regexMatchPlan) {
-                conditions.push(
-                  `EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${regexMatchPlan.sql})`
-                );
-                params.push(...regexMatchPlan.params);
-              } else if (normalizedRegex.flags) {
-                conditions.push(
-                  `EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE regexp_flags(?, ?, ${targetSql}) = 1)`
-                );
-                params.push(normalizedRegex.pattern, normalizedRegex.flags);
               } else {
-                conditions.push(
-                  `EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${targetSql} REGEXP ?)`
+                const valueRegexMatch = getSQLiteRegexValueMatchExpression(
+                  targetSql,
+                  normalizedRegex,
+                  regexMatchPlan
                 );
-                params.push(normalizedRegex.pattern);
+                conditions.push(
+                  `EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${valueRegexMatch.sql})`
+                );
+                params.push(...valueRegexMatch.params);
               }
             } else {
-              if (regexMatchPlan) {
-                if (regexMatchPlan.requiresResidual) {
-                  if (normalizedRegex.flags) {
-                    conditions.push(
-                      `(${regexMatchPlan.sql}) AND regexp_flags(?, ?, ${targetSql}) = 1`
-                    );
-                    params.push(
-                      ...regexMatchPlan.params,
-                      normalizedRegex.pattern,
-                      normalizedRegex.flags
-                    );
-                  } else {
-                    conditions.push(`(${regexMatchPlan.sql}) AND ${targetSql} REGEXP ?`);
-                    params.push(...regexMatchPlan.params, normalizedRegex.pattern);
-                  }
-                } else {
-                  conditions.push(regexMatchPlan.sql);
-                  params.push(...regexMatchPlan.params);
-                }
-              } else if (normalizedRegex.flags) {
-                conditions.push(`regexp_flags(?, ?, ${targetSql}) = 1`);
-                params.push(normalizedRegex.pattern, normalizedRegex.flags);
-              } else {
-                conditions.push(`${targetSql} REGEXP ?`);
-                params.push(normalizedRegex.pattern);
-              }
+              const scalarRegexMatch = getSQLiteRegexValueMatchExpression(
+                targetSql,
+                normalizedRegex,
+                regexMatchPlan
+              );
+              conditions.push(scalarRegexMatch.sql);
+              params.push(...scalarRegexMatch.params);
             }
           } else if (op === '$nearSphere') {
             const point = opVal;
@@ -4411,22 +4385,15 @@ export class SQLiteStorageAdapter implements StorageAdapter {
                     params.push(...indexedRegexMatch.params);
                   } else {
                     const regexMatchPlan = getRegexMatchPlan('value', normalizedRegex);
-                    if (regexMatchPlan) {
-                      conditions.push(
-                        `EXISTS (SELECT 1 FROM json_each(${targetSql}) WHERE ${regexMatchPlan.sql})`
-                      );
-                      params.push(...regexMatchPlan.params);
-                    } else if (normalizedRegex.flags) {
-                      conditions.push(
-                        `EXISTS (SELECT 1 FROM json_each(${targetSql}) WHERE regexp_flags(?, ?, value) = 1)`
-                      );
-                      params.push(normalizedRegex.pattern, normalizedRegex.flags);
-                    } else {
-                      conditions.push(
-                        `EXISTS (SELECT 1 FROM json_each(${targetSql}) WHERE value REGEXP ?)`
-                      );
-                      params.push(normalizedRegex.pattern);
-                    }
+                    const valueRegexMatch = getSQLiteRegexValueMatchExpression(
+                      'value',
+                      normalizedRegex,
+                      regexMatchPlan
+                    );
+                    conditions.push(
+                      `EXISTS (SELECT 1 FROM json_each(${targetSql}) WHERE ${valueRegexMatch.sql})`
+                    );
+                    params.push(...valueRegexMatch.params);
                   }
                 }
               } else {
