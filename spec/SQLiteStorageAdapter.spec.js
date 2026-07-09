@@ -28,6 +28,22 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
         triggerNames.includes(row.name)
     );
   };
+  const getArrayIndexArtifactsForField = (currentAdapter, className, fieldName) => {
+    const rawTableName = currentAdapter._rawArrayElementIndexTableName(className, fieldName);
+    const triggerNames = Object.values(currentAdapter._getArrayElementIndexArtifactNames(rawTableName)).map(
+      triggerName => triggerName.slice(1, -1)
+    );
+    const allRows = currentAdapter._db
+      .prepare("SELECT type, name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'")
+      .all();
+
+    return allRows.filter(
+      row =>
+        row.name === rawTableName ||
+        row.name.startsWith(`${rawTableName}_`) ||
+        triggerNames.includes(row.name)
+    );
+  };
 
   beforeEach(async () => {
     adapter = new SQLiteStorageAdapter({
@@ -1900,6 +1916,24 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
     await adapter.deleteFields('FTSFieldClass', schema, ['subject']);
 
     expect(getFTSArtifactsForField(adapter, 'FTSFieldClass', 'subject')).toEqual([]);
+  });
+
+  it('cleans up array index artifacts when deleting array fields', async () => {
+    const schema = {
+      className: 'ArrayIndexFieldDeleteClass',
+      fields: {
+        objectId: { type: 'String' },
+        tags: { type: 'Array', contents: { type: 'String' } },
+      },
+    };
+    await adapter.createClass('ArrayIndexFieldDeleteClass', schema);
+    await adapter._ensureArrayElementIndex('ArrayIndexFieldDeleteClass', schema.fields, 'tags');
+
+    expect(getArrayIndexArtifactsForField(adapter, 'ArrayIndexFieldDeleteClass', 'tags').length).toBeGreaterThan(0);
+
+    await adapter.deleteFields('ArrayIndexFieldDeleteClass', schema, ['tags']);
+
+    expect(getArrayIndexArtifactsForField(adapter, 'ArrayIndexFieldDeleteClass', 'tags')).toEqual([]);
   });
 
   it('cleans up FTS artifacts when deleting classes', async () => {

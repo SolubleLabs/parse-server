@@ -2459,6 +2459,11 @@ class SQLiteStorageAdapter {
       return;
     }
     const schemaObj = JSON.parse(row.schema);
+    // Array-index cleanup still needs the original field types after the schema
+    // object has been pruned below.
+    const originalFields = schemaObj.fields ? {
+      ...schemaObj.fields
+    } : {};
     const deletedFieldNames = new Set(fieldNames);
     const relationalFieldNames = new Set();
     for (const fieldName of fieldNames) {
@@ -2495,7 +2500,7 @@ class SQLiteStorageAdapter {
     }
     const deletedColumnNames = fieldNames.filter(fieldName => !relationalFieldNames.has(fieldName));
     for (const fieldName of deletedColumnNames) {
-      this._dropArrayElementIndexArtifactsForField(className, fieldName, schemaObj.fields || {});
+      this._dropArrayElementIndexArtifactsForField(className, fieldName, originalFields);
       this._dropFTS5ArtifactsForField(className, fieldName);
     }
     if (deletedColumnNames.length > 0) {
