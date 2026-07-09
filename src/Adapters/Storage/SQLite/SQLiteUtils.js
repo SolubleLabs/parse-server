@@ -1181,10 +1181,14 @@ const computeRegexPrefixPrefilterInfo = (
     return null;
   }
 
+  // Truncating an `/i` prefix to its uncased Unicode-safe run is only a prefilter.
+  // A later cased literal still needs the residual regex to preserve correctness.
+  const uncasedPrefixWasTruncated = uncasedPrefix.length !== literalPrefix.length;
+
   return {
     literalPrefix: uncasedPrefix,
     mode: 'caseInsensitiveUncased',
-    requiresResidual,
+    requiresResidual: requiresResidual || uncasedPrefixWasTruncated,
   };
 };
 

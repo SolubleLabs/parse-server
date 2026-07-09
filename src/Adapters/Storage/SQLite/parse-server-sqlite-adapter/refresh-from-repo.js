@@ -52,6 +52,7 @@ const importRewrite = {
 
 const utilsCompatSearch = [
   "const {\n",
+  "  getRegexLeadingLiteralSetInfo,\n",
   "  getSimpleNormalizedRegexInfo,\n",
   "  getRegexPrefixPrefilterInfo,\n",
   "  isNumericArrayIndexComponent,\n",

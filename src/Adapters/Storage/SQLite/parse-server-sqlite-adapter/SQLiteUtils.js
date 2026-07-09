@@ -5,7 +5,13 @@
 const stableStringify = require('safe-stable-stringify');
 const numericArrayIndexPattern = /^(0|[1-9]\d*)$/;
 const regexLiteralCharacterPattern = /[0-9 ]|\p{L}/u;
-const asciiOnlyStringPattern = /^[\x00-\x7F]*$/;
+const allowedSQLiteRegexFlags = new Set(['i', 'm', 's', 'u', 'x']);
+// eslint-disable-next-line no-control-regex
+const asciiOnlyStringPattern = /^[\u0000-\u007F]*$/;
+const maxRegexPlannerCacheSize = 512;
+const missingRegexPlannerInfo = Symbol('missingRegexPlannerInfo');
+const regexLeadingLiteralSetInfoCache = new Map();
+const regexPrefixPrefilterInfoCache = new Map();
 
 // Keep object-key order deterministic so equality-sensitive array operations
 // behave consistently across logically equivalent payloads.
@@ -23,6 +29,41 @@ const parseJSONArray = value => {
 // Values like "01" stay object keys because Parse field paths can target both.
 const isNumericArrayIndexComponent = value => typeof value === 'string' && numericArrayIndexPattern.test(value);
 const isASCIIOnlyString = value => asciiOnlyStringPattern.test(value);
+const getRegexPlannerCacheKey = (pattern, flags) => `${flags || ''}\u0000${pattern}`;
+const getCachedRegexPlannerInfo = (cache, key) => {
+  if (!cache.has(key)) {
+    return undefined;
+  }
+  const cachedInfo = cache.get(key);
+  cache.delete(key);
+  cache.set(key, cachedInfo);
+  return cachedInfo === missingRegexPlannerInfo ? null : cachedInfo;
+};
+const setCachedRegexPlannerInfo = (cache, key, info) => {
+  if (cache.size >= maxRegexPlannerCacheSize) {
+    const oldestKey = cache.keys().next().value;
+    if (oldestKey !== undefined) {
+      cache.delete(oldestKey);
+    }
+  }
+  cache.set(key, info == null ? missingRegexPlannerInfo : info);
+  return info;
+};
+const cloneRegexPlannerInfo = info => {
+  if (info == null) {
+    return info;
+  }
+  if (Array.isArray(info.literals)) {
+    return {
+      ...info,
+      literals: info.literals.slice()
+    };
+  }
+  return {
+    ...info
+  };
+};
+const getDistinctRegexFlags = flags => Array.from(new Set((flags || '').split('').filter(Boolean)));
 const removeRegexWhiteSpace = regex => {
   let normalizedRegex = regex;
   if (!normalizedRegex.endsWith('\n')) {
@@ -126,6 +167,13 @@ const hasPotentiallyUnsafeRegexBacktracking = pattern => {
 const normalizeRegexPattern = (pattern, flags) => {
   let normalizedPattern = pattern;
   let normalizedFlags = flags || '';
+  const distinctFlags = getDistinctRegexFlags(normalizedFlags);
+  for (const flag of distinctFlags) {
+    if (!allowedSQLiteRegexFlags.has(flag)) {
+      throw new Error(`Unsupported regular expression flag: ${flag}`);
+    }
+  }
+  normalizedFlags = distinctFlags.join('');
   if (normalizedFlags.includes('x')) {
     normalizedPattern = removeRegexWhiteSpace(normalizedPattern);
     normalizedFlags = normalizedFlags.replace(/x/g, '');
@@ -146,8 +194,9 @@ const isRegexCharacterEscaped = (pattern, index) => {
   }
   return backslashCount % 2 === 1;
 };
+const hasRegexLineSensitiveEndAnchor = pattern => pattern.length > 0 && pattern[pattern.length - 1] === '$' && !isRegexCharacterEscaped(pattern, pattern.length - 1);
 const getSimpleNormalizedRegexInfo = (pattern, flags) => {
-  const distinctFlags = Array.from(new Set((flags || '').split('').filter(Boolean)));
+  const distinctFlags = getDistinctRegexFlags(flags);
   if (distinctFlags.some(flag => flag !== 'i')) {
     return null;
   }
@@ -159,7 +208,7 @@ const getSimpleNormalizedRegexInfo = (pattern, flags) => {
     anchoredStart = true;
     startIndex = 1;
   }
-  if (endIndex > startIndex && pattern[endIndex - 1] === '$' && !isRegexCharacterEscaped(pattern, endIndex - 1)) {
+  if (endIndex > startIndex && hasRegexLineSensitiveEndAnchor(pattern)) {
     anchoredEnd = true;
     endIndex -= 1;
   }
@@ -197,26 +246,38 @@ const getSimpleNormalizedRegexInfo = (pattern, flags) => {
   return {
     literal,
     mode,
-    caseInsensitive: distinctFlags.includes('i')
+    caseInsensitive: distinctFlags.includes('i'),
+    requiresResidual: anchoredEnd
   };
+};
+const isUncasedString = value => {
+  for (const char of value) {
+    if (char.toLocaleLowerCase('und') !== char.toLocaleUpperCase('und')) {
+      return false;
+    }
+  }
+  return true;
 };
 const readRegexQuantifier = (pattern, index) => {
   const char = pattern[index];
   if (char === '*') {
     return {
       min: 0,
+      max: null,
       endIndex: index + 1
     };
   }
   if (char === '+') {
     return {
       min: 1,
+      max: null,
       endIndex: index + 1
     };
   }
   if (char === '?') {
     return {
       min: 0,
+      max: 1,
       endIndex: index + 1
     };
   }
@@ -235,6 +296,7 @@ const readRegexQuantifier = (pattern, index) => {
   if (pattern[cursor] === '}') {
     return {
       min: Number(minimumText),
+      max: Number(minimumText),
       endIndex: cursor + 1
     };
   }
@@ -242,14 +304,24 @@ const readRegexQuantifier = (pattern, index) => {
     return null;
   }
   cursor += 1;
+  if (pattern[cursor] === '}') {
+    return {
+      min: Number(minimumText),
+      max: null,
+      endIndex: cursor + 1
+    };
+  }
+  let maximumText = '';
   while (cursor < pattern.length && /\d/.test(pattern[cursor])) {
+    maximumText += pattern[cursor];
     cursor += 1;
   }
-  if (pattern[cursor] !== '}') {
+  if (pattern[cursor] !== '}' || !maximumText) {
     return null;
   }
   return {
     min: Number(minimumText),
+    max: Number(maximumText),
     endIndex: cursor + 1
   };
 };
@@ -319,8 +391,445 @@ const getUncasedRegexPrefix = prefix => {
   }
   return uncasedPrefix;
 };
-const getRegexPrefixPrefilterInfo = (pattern, flags) => {
-  const distinctFlags = Array.from(new Set((flags || '').split('').filter(Boolean)));
+const getRegexLiteralSetCaseMode = (literals, caseInsensitive) => {
+  if (!caseInsensitive) {
+    return 'caseSensitive';
+  }
+  let allASCII = true;
+  let allUncased = true;
+  for (const literal of literals) {
+    if (allASCII && !isASCIIOnlyString(literal)) {
+      allASCII = false;
+    }
+    if (allUncased && !isUncasedString(literal)) {
+      allUncased = false;
+    }
+    if (!allASCII && !allUncased) {
+      return null;
+    }
+  }
+  if (allASCII) {
+    return 'caseInsensitiveASCII';
+  }
+  if (allUncased) {
+    return 'caseInsensitiveUncased';
+  }
+  return null;
+};
+const normalizeRegexLiteralSet = (literals, caseMode) => {
+  const normalizedLiterals = [];
+  const seen = new Set();
+  for (const literal of literals) {
+    const dedupeKey = caseMode === 'caseInsensitiveASCII' ? literal.toLocaleLowerCase('en-US') : literal;
+    if (seen.has(dedupeKey)) {
+      continue;
+    }
+    seen.add(dedupeKey);
+    normalizedLiterals.push(literal);
+  }
+  return normalizedLiterals;
+};
+const collapseRegexPrefixSet = (prefixes, caseMode) => {
+  const normalizedPrefixes = normalizeRegexLiteralSet(prefixes, caseMode).slice();
+  normalizedPrefixes.sort((left, right) => left.localeCompare(right, 'und'));
+  const collapsedPrefixes = [];
+  let previousPrefix = null;
+  for (const prefix of normalizedPrefixes) {
+    const comparePrefix = caseMode === 'caseInsensitiveASCII' ? prefix.toLocaleLowerCase('en-US') : prefix;
+    if (previousPrefix !== null && comparePrefix.startsWith(previousPrefix.comparePrefix)) {
+      continue;
+    }
+    collapsedPrefixes.push(prefix);
+    previousPrefix = {
+      comparePrefix
+    };
+  }
+  return collapsedPrefixes;
+};
+const maxRegexLeadingFiniteValues = 128;
+const mergeFiniteRegexValues = (currentValues, additionalValues, maxValues) => {
+  const mergedValues = currentValues.slice();
+  const seenValues = new Set(currentValues);
+  for (const value of additionalValues) {
+    if (seenValues.has(value)) {
+      continue;
+    }
+    seenValues.add(value);
+    mergedValues.push(value);
+    if (mergedValues.length > maxValues) {
+      return null;
+    }
+  }
+  return mergedValues;
+};
+const combineFiniteRegexValues = (leftValues, rightValues, maxValues) => {
+  const combinedValues = [];
+  const seenValues = new Set();
+  for (const leftValue of leftValues) {
+    for (const rightValue of rightValues) {
+      const combinedValue = leftValue + rightValue;
+      if (seenValues.has(combinedValue)) {
+        continue;
+      }
+      seenValues.add(combinedValue);
+      combinedValues.push(combinedValue);
+      if (combinedValues.length > maxValues) {
+        return null;
+      }
+    }
+  }
+  return combinedValues;
+};
+const expandFiniteRegexValues = (baseValues, minCount, maxCount, maxValues) => {
+  let repeatedValues = [''];
+  let expandedValues = minCount === 0 ? [''] : [];
+  for (let count = 1; count <= maxCount; count += 1) {
+    repeatedValues = combineFiniteRegexValues(repeatedValues, baseValues, maxValues);
+    if (!repeatedValues) {
+      return null;
+    }
+    if (count >= minCount) {
+      expandedValues = mergeFiniteRegexValues(expandedValues, repeatedValues, maxValues);
+      if (!expandedValues) {
+        return null;
+      }
+    }
+  }
+  return expandedValues;
+};
+const getRegexCharClassAtom = (pattern, index) => {
+  const char = pattern[index];
+  if (char === '\\') {
+    const escapedChar = pattern[index + 1];
+    if (!escapedChar) {
+      return null;
+    }
+    if ('\\.^$|?*+()[]{}-'.includes(escapedChar)) {
+      return {
+        literal: escapedChar,
+        nextIndex: index + 2
+      };
+    }
+    if (escapedChar === 'f') {
+      return {
+        literal: '\f',
+        nextIndex: index + 2
+      };
+    }
+    if (escapedChar === 'n') {
+      return {
+        literal: '\n',
+        nextIndex: index + 2
+      };
+    }
+    if (escapedChar === 'r') {
+      return {
+        literal: '\r',
+        nextIndex: index + 2
+      };
+    }
+    if (escapedChar === 't') {
+      return {
+        literal: '\t',
+        nextIndex: index + 2
+      };
+    }
+    if (escapedChar === 'v') {
+      return {
+        literal: '\v',
+        nextIndex: index + 2
+      };
+    }
+    return null;
+  }
+  if (char === ']' || char === '-') {
+    return null;
+  }
+  return {
+    literal: char,
+    nextIndex: index + 1
+  };
+};
+const parseRegexFiniteCharClass = (pattern, index) => {
+  if (pattern[index] !== '[' || pattern[index + 1] === '^') {
+    return null;
+  }
+  let cursor = index + 1;
+  let values = [];
+  while (cursor < pattern.length) {
+    if (pattern[cursor] === ']') {
+      if (values.length === 0) {
+        return null;
+      }
+      return {
+        values,
+        nextIndex: cursor + 1
+      };
+    }
+    const classAtom = getRegexCharClassAtom(pattern, cursor);
+    if (!classAtom) {
+      return null;
+    }
+    cursor = classAtom.nextIndex;
+    if (pattern[cursor] === '-' && pattern[cursor + 1] !== ']') {
+      const rangeEndAtom = getRegexCharClassAtom(pattern, cursor + 1);
+      if (!rangeEndAtom || !isASCIIOnlyString(classAtom.literal) || !isASCIIOnlyString(rangeEndAtom.literal)) {
+        return null;
+      }
+      const rangeStartCode = classAtom.literal.charCodeAt(0);
+      const rangeEndCode = rangeEndAtom.literal.charCodeAt(0);
+      if (rangeStartCode > rangeEndCode) {
+        return null;
+      }
+      const rangeValues = [];
+      for (let code = rangeStartCode; code <= rangeEndCode; code += 1) {
+        rangeValues.push(String.fromCharCode(code));
+      }
+      values = mergeFiniteRegexValues(values, rangeValues, maxRegexLeadingFiniteValues);
+      if (!values) {
+        return null;
+      }
+      cursor = rangeEndAtom.nextIndex;
+      continue;
+    }
+    values = mergeFiniteRegexValues(values, [classAtom.literal], maxRegexLeadingFiniteValues);
+    if (!values) {
+      return null;
+    }
+  }
+  return null;
+};
+const parseRegexFiniteSequence = (pattern, index, stopCharacters) => {
+  let cursor = index;
+  let values = [''];
+  let parsedAny = false;
+  while (cursor < pattern.length) {
+    if (stopCharacters.includes(pattern[cursor])) {
+      if (parsedAny) {
+        return {
+          values,
+          nextIndex: cursor
+        };
+      } else {
+        return null;
+      }
+    }
+    const segment = parseRegexFiniteSegment(pattern, cursor);
+    if (!segment || segment.stopAfter) {
+      return null;
+    }
+    values = combineFiniteRegexValues(values, segment.values, maxRegexLeadingFiniteValues);
+    if (!values) {
+      return null;
+    }
+    cursor = segment.nextIndex;
+    parsedAny = true;
+  }
+  if (parsedAny) {
+    return {
+      values,
+      nextIndex: cursor
+    };
+  } else {
+    return null;
+  }
+};
+const parseRegexFiniteGroup = (pattern, index) => {
+  if (pattern[index] !== '(') {
+    return null;
+  }
+  let cursor = index + 1;
+  if (pattern[cursor] === '?') {
+    if (pattern[cursor + 1] !== ':') {
+      return null;
+    }
+    cursor += 2;
+  }
+  let groupValues = [];
+  while (cursor < pattern.length) {
+    const branch = parseRegexFiniteSequence(pattern, cursor, '|)');
+    if (!branch) {
+      return null;
+    }
+    groupValues = mergeFiniteRegexValues(groupValues, branch.values, maxRegexLeadingFiniteValues);
+    if (!groupValues) {
+      return null;
+    }
+    cursor = branch.nextIndex;
+    if (pattern[cursor] === '|') {
+      cursor += 1;
+      continue;
+    }
+    if (pattern[cursor] === ')') {
+      return {
+        values: groupValues,
+        nextIndex: cursor + 1
+      };
+    }
+    return null;
+  }
+  return null;
+};
+const isRegexPurePrefixTail = (pattern, index) => index >= pattern.length || pattern.slice(index) === '.*';
+const hasTopLevelRegexAlternation = (pattern, startIndex) => {
+  let groupDepth = 0;
+  let inCharClass = false;
+  for (let index = startIndex; index < pattern.length; index += 1) {
+    const char = pattern[index];
+    if (char === '\\') {
+      index += 1;
+      continue;
+    }
+    if (inCharClass) {
+      if (char === ']') {
+        inCharClass = false;
+      }
+      continue;
+    }
+    if (char === '[') {
+      inCharClass = true;
+      continue;
+    }
+    if (char === '(') {
+      groupDepth += 1;
+      continue;
+    }
+    if (char === ')') {
+      if (groupDepth > 0) {
+        groupDepth -= 1;
+      }
+      continue;
+    }
+    if (char === '|' && groupDepth === 0) {
+      return true;
+    }
+  }
+  return false;
+};
+const parseRegexFiniteSegment = (pattern, index) => {
+  let segmentValues = null;
+  let nextIndex = index;
+  const literalAtom = getRegexLiteralAtom(pattern, index);
+  if (literalAtom) {
+    segmentValues = [literalAtom.literal];
+    nextIndex = literalAtom.nextIndex;
+  } else if (pattern[index] === '[') {
+    const charClass = parseRegexFiniteCharClass(pattern, index);
+    if (!charClass) {
+      return null;
+    }
+    segmentValues = charClass.values;
+    nextIndex = charClass.nextIndex;
+  } else if (pattern[index] === '(') {
+    const finiteGroup = parseRegexFiniteGroup(pattern, index);
+    if (!finiteGroup) {
+      return null;
+    }
+    segmentValues = finiteGroup.values;
+    nextIndex = finiteGroup.nextIndex;
+  } else {
+    return null;
+  }
+  const quantifier = readRegexQuantifier(pattern, nextIndex);
+  if (!quantifier) {
+    return {
+      values: segmentValues,
+      nextIndex,
+      stopAfter: false
+    };
+  }
+  if (quantifier.max === null) {
+    if (quantifier.min === 0) {
+      return null;
+    }
+    const minimumValues = expandFiniteRegexValues(segmentValues, quantifier.min, quantifier.min, maxRegexLeadingFiniteValues);
+    if (!minimumValues) {
+      return null;
+    }
+    return {
+      values: minimumValues,
+      nextIndex: quantifier.endIndex,
+      stopAfter: true
+    };
+  }
+  const quantifiedValues = expandFiniteRegexValues(segmentValues, quantifier.min, quantifier.max, maxRegexLeadingFiniteValues);
+  if (!quantifiedValues) {
+    return null;
+  }
+  return {
+    values: quantifiedValues,
+    nextIndex: quantifier.endIndex,
+    stopAfter: false
+  };
+};
+const computeRegexLeadingLiteralSetInfo = (pattern, flags) => {
+  const distinctFlags = getDistinctRegexFlags(flags);
+  if (distinctFlags.some(flag => flag !== 'i')) {
+    return null;
+  }
+  if (!pattern.startsWith('^')) {
+    return null;
+  }
+  let cursor = 1;
+  let literals = [''];
+  let parsedAny = false;
+  let stoppedOnOpenEndedSegment = false;
+  while (cursor < pattern.length) {
+    const segment = parseRegexFiniteSegment(pattern, cursor);
+    if (!segment) {
+      break;
+    }
+    const nextLiterals = combineFiniteRegexValues(literals, segment.values, maxRegexLeadingFiniteValues);
+    if (!nextLiterals) {
+      break;
+    }
+    literals = nextLiterals;
+    cursor = segment.nextIndex;
+    parsedAny = true;
+    if (segment.stopAfter) {
+      stoppedOnOpenEndedSegment = true;
+      break;
+    }
+  }
+  if (!parsedAny) {
+    return null;
+  }
+  const caseMode = getRegexLiteralSetCaseMode(literals, distinctFlags.includes('i'));
+  if (!caseMode) {
+    return null;
+  }
+  if (!stoppedOnOpenEndedSegment && pattern.slice(cursor) === '$') {
+    return {
+      literals: normalizeRegexLiteralSet(literals, caseMode),
+      matchMode: 'exact',
+      caseMode,
+      requiresResidual: true
+    };
+  }
+  if (hasTopLevelRegexAlternation(pattern, cursor)) {
+    return null;
+  }
+  const collapsedPrefixes = collapseRegexPrefixSet(literals, caseMode);
+  if (collapsedPrefixes.length === 0 || collapsedPrefixes[0] === '') {
+    return null;
+  }
+  return {
+    literals: collapsedPrefixes,
+    matchMode: 'prefix',
+    caseMode,
+    requiresResidual: !isRegexPurePrefixTail(pattern, cursor)
+  };
+};
+const getRegexLeadingLiteralSetInfo = (pattern, flags) => {
+  const cacheKey = getRegexPlannerCacheKey(pattern, flags);
+  const cachedInfo = getCachedRegexPlannerInfo(regexLeadingLiteralSetInfoCache, cacheKey);
+  if (cachedInfo !== undefined) {
+    return cloneRegexPlannerInfo(cachedInfo);
+  }
+  return setCachedRegexPlannerInfo(regexLeadingLiteralSetInfoCache, cacheKey, cloneRegexPlannerInfo(computeRegexLeadingLiteralSetInfo(pattern, flags)));
+};
+const computeRegexPrefixPrefilterInfo = (pattern, flags) => {
+  const distinctFlags = getDistinctRegexFlags(flags);
   const caseInsensitive = distinctFlags.includes('i');
 
   // `m` changes `^` into line-start semantics, so a plain string-prefix filter is no longer safe.
@@ -345,29 +854,49 @@ const getRegexPrefixPrefilterInfo = (pattern, flags) => {
   if (!literalPrefix) {
     return null;
   }
+  if (hasTopLevelRegexAlternation(pattern, index)) {
+    return null;
+  }
+  const requiresResidual = !isRegexPurePrefixTail(pattern, index);
   if (!caseInsensitive) {
     return {
       literalPrefix,
-      mode: 'caseSensitive'
+      mode: 'caseSensitive',
+      requiresResidual
     };
   }
   if (isASCIIOnlyString(literalPrefix)) {
     return {
       literalPrefix,
-      mode: 'caseInsensitiveASCII'
+      mode: 'caseInsensitiveASCII',
+      requiresResidual
     };
   }
   const uncasedPrefix = getUncasedRegexPrefix(literalPrefix);
   if (!uncasedPrefix) {
     return null;
   }
+
+  // Truncating an `/i` prefix to its uncased Unicode-safe run is only a prefilter.
+  // A later cased literal still needs the residual regex to preserve correctness.
+  const uncasedPrefixWasTruncated = uncasedPrefix.length !== literalPrefix.length;
   return {
     literalPrefix: uncasedPrefix,
-    mode: 'caseInsensitiveUncased'
+    mode: 'caseInsensitiveUncased',
+    requiresResidual: requiresResidual || uncasedPrefixWasTruncated
   };
+};
+const getRegexPrefixPrefilterInfo = (pattern, flags) => {
+  const cacheKey = getRegexPlannerCacheKey(pattern, flags);
+  const cachedInfo = getCachedRegexPlannerInfo(regexPrefixPrefilterInfoCache, cacheKey);
+  if (cachedInfo !== undefined) {
+    return cloneRegexPlannerInfo(cachedInfo);
+  }
+  return setCachedRegexPlannerInfo(regexPrefixPrefilterInfoCache, cacheKey, cloneRegexPlannerInfo(computeRegexPrefixPrefilterInfo(pattern, flags)));
 };
 module.exports = {
   canonicalJSONStringify,
+  getRegexLeadingLiteralSetInfo,
   getRegexPrefixPrefilterInfo,
   getSimpleNormalizedRegexInfo,
   isNumericArrayIndexComponent,

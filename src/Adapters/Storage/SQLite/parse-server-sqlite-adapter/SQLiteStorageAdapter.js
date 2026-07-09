@@ -22,6 +22,7 @@ var _Error = (0, _loadParseServerInternal.loadParseServerInternal)("lib/Error");
 var _logger = _interopRequireDefault((0, _loadParseServerInternal.loadParseServerInternal)("lib/logger"));
 function _interopRequireDefault(e) { return e && e.__esModule ? e : { default: e }; }
 const {
+  getRegexLeadingLiteralSetInfo,
   getSimpleNormalizedRegexInfo,
   getRegexPrefixPrefilterInfo,
   isNumericArrayIndexComponent,
@@ -87,6 +88,9 @@ const sqliteArrayIndexTableNamePrefix = '__arridx__';
 const authDataFieldPrefix = '_auth_data_';
 const arrayIndexValueTypeColumn = 'valueType';
 const arrayIndexValueColumn = 'value';
+const sqliteArrayIndexPointerSeparator = '\u001F';
+// The shadow array-member table stores SQLite scalars directly, then derives a
+// couple of object-shaped Parse primitives into lookupable text keys too.
 const sqliteIndexedArrayScalarTypeNames = Object.freeze(['text', 'integer', 'real', 'true', 'false', 'null']);
 const sqliteIndexedArrayScalarTypeNameSQL = sqliteIndexedArrayScalarTypeNames.map(typeName => `'${typeName}'`).join(', ');
 const implicitSQLiteUserColumnFields = Object.freeze({
@@ -1310,7 +1314,10 @@ const getArrayAnyMatchExpression = (targetSql, comparisonValues) => {
     params: valueMatch.params
   };
 };
-const getSQLiteArrayIndexScalarLookup = comparisonValue => {
+const getSQLiteArrayIndexPointerLookupValue = (className, objectId) => `${className}${sqliteArrayIndexPointerSeparator}${objectId}`;
+const getSQLiteArrayIndexStoredValueTypeExpression = (typeExpression, valueExpression) => `CASE ` + `WHEN ${typeExpression} IN (${sqliteIndexedArrayScalarTypeNameSQL}) THEN ${typeExpression} ` + `WHEN json_valid(${valueExpression}) AND json_type(${valueExpression}) = 'object' ` + `AND json_extract(${valueExpression}, '$.__type') = 'Date' ` + `AND json_extract(${valueExpression}, '$.iso') IS NOT NULL THEN 'date' ` + `WHEN json_valid(${valueExpression}) AND json_type(${valueExpression}) = 'object' ` + `AND json_extract(${valueExpression}, '$.__type') = 'Pointer' ` + `AND json_extract(${valueExpression}, '$.className') IS NOT NULL ` + `AND json_extract(${valueExpression}, '$.objectId') IS NOT NULL THEN 'pointer' ` + `ELSE NULL END`;
+const getSQLiteArrayIndexStoredValueExpression = (typeExpression, valueExpression) => `CASE ` + `WHEN ${typeExpression} IN (${sqliteIndexedArrayScalarTypeNameSQL}) THEN ${valueExpression} ` + `WHEN json_valid(${valueExpression}) AND json_type(${valueExpression}) = 'object' ` + `AND json_extract(${valueExpression}, '$.__type') = 'Date' ` + `AND json_extract(${valueExpression}, '$.iso') IS NOT NULL THEN json_extract(${valueExpression}, '$.iso') ` + `WHEN json_valid(${valueExpression}) AND json_type(${valueExpression}) = 'object' ` + `AND json_extract(${valueExpression}, '$.__type') = 'Pointer' ` + `AND json_extract(${valueExpression}, '$.className') IS NOT NULL ` + `AND json_extract(${valueExpression}, '$.objectId') IS NOT NULL THEN ` + `json_extract(${valueExpression}, '$.className') || '${sqliteArrayIndexPointerSeparator}' || ` + `json_extract(${valueExpression}, '$.objectId') ` + `ELSE NULL END`;
+const getSQLiteArrayIndexLookup = comparisonValue => {
   if (comparisonValue === null) {
     return {
       valueType: 'null',
@@ -1335,16 +1342,101 @@ const getSQLiteArrayIndexScalarLookup = comparisonValue => {
       value: comparisonValue
     };
   }
+  if (comparisonValue && typeof comparisonValue === 'object' && comparisonValue.__type === 'Date') {
+    const sqliteDateValue = toSQLiteValue(comparisonValue);
+    if (sqliteDateValue != null) {
+      return {
+        valueType: 'date',
+        value: sqliteDateValue
+      };
+    }
+  }
+  if (isPointerValue(comparisonValue)) {
+    return {
+      valueType: 'pointer',
+      value: getSQLiteArrayIndexPointerLookupValue(comparisonValue.className, comparisonValue.objectId)
+    };
+  }
   return null;
 };
 const getSQLiteArrayIndexValueMatchExpression = (arrayIndexTableName, comparisonValue) => {
-  const lookup = getSQLiteArrayIndexScalarLookup(comparisonValue);
+  const lookup = getSQLiteArrayIndexLookup(comparisonValue);
   if (!lookup) {
     return null;
   }
   return {
     sql: `${quoteColumnName('objectId')} IN (` + `SELECT ${quoteColumnName('objectId')} FROM ${arrayIndexTableName} ` + `WHERE ${quoteColumnName(arrayIndexValueTypeColumn)} = ? ` + `AND ${quoteColumnName(arrayIndexValueColumn)} = ?` + `)`,
     params: [lookup.valueType, lookup.value]
+  };
+};
+const getSQLiteArrayIndexAnyMatchExpression = (arrayIndexTableName, comparisonValues, getFallbackAnyMatchExpression) => {
+  const sqlParts = [];
+  const params = [];
+  const fallbackValues = [];
+  const indexedValuesByType = new Map();
+  for (const comparisonValue of comparisonValues) {
+    const lookup = arrayIndexTableName ? getSQLiteArrayIndexLookup(comparisonValue) : null;
+    if (lookup && lookup.valueType !== 'null') {
+      const existingValues = indexedValuesByType.get(lookup.valueType);
+      if (existingValues) {
+        existingValues.push(lookup.value);
+      } else {
+        indexedValuesByType.set(lookup.valueType, [lookup.value]);
+      }
+    } else {
+      // Non-scalar JSON values still need the slower JSON walk because the
+      // shadow table only stores scalar array members.
+      fallbackValues.push(comparisonValue);
+    }
+  }
+  if (arrayIndexTableName && indexedValuesByType.size > 0) {
+    const indexedValueClauses = [];
+    for (const [valueType, valueGroup] of indexedValuesByType) {
+      indexedValueClauses.push(`(${quoteColumnName(arrayIndexValueTypeColumn)} = ? AND ` + `${quoteColumnName(arrayIndexValueColumn)} IN (SELECT value FROM json_each(?)))`);
+      params.push(valueType, JSON.stringify(valueGroup));
+    }
+    sqlParts.push(`${quoteColumnName('objectId')} IN (` + `SELECT ${quoteColumnName('objectId')} FROM ${arrayIndexTableName} ` + `WHERE ${indexedValueClauses.join(' OR ')}` + `)`);
+  }
+  if (fallbackValues.length > 0) {
+    const fallbackMatch = getFallbackAnyMatchExpression(fallbackValues);
+    sqlParts.push(`(${fallbackMatch.sql})`);
+    params.push(...fallbackMatch.params);
+  }
+  return {
+    sql: sqlParts.join(' OR '),
+    params
+  };
+};
+const getSQLiteArrayIndexNullMatchExpression = arrayIndexTableName => ({
+  sql: `${quoteColumnName('objectId')} IN (` + `SELECT ${quoteColumnName('objectId')} FROM ${arrayIndexTableName} ` + `WHERE ${quoteColumnName(arrayIndexValueTypeColumn)} = 'null'` + `)`,
+  params: []
+});
+const getSQLiteArrayIndexRangeMatchExpression = (arrayIndexTableName, comparisonValue, operator) => {
+  const rangeClauses = [];
+  const params = [];
+  if (typeof comparisonValue === 'string') {
+    rangeClauses.push(`(${quoteColumnName(arrayIndexValueTypeColumn)} = 'text' AND ` + `${quoteColumnName(arrayIndexValueColumn)} ${operator} ?)`);
+    params.push(comparisonValue);
+  } else if (comparisonValue && typeof comparisonValue === 'object' && comparisonValue.__type === 'Date') {
+    const sqliteDateValue = toSQLiteValue(comparisonValue);
+    if (sqliteDateValue == null) {
+      return null;
+    }
+    rangeClauses.push(`(${quoteColumnName(arrayIndexValueTypeColumn)} = 'date' AND ` + `${quoteColumnName(arrayIndexValueColumn)} ${operator} ?)`);
+    params.push(sqliteDateValue);
+  } else if (typeof comparisonValue === 'number' && Number.isFinite(comparisonValue)) {
+    // Integer and real array members share Parse's numeric ordering semantics, so
+    // the shadow lookup has to probe both numeric buckets.
+    rangeClauses.push(`(${quoteColumnName(arrayIndexValueTypeColumn)} = 'integer' AND ` + `${quoteColumnName(arrayIndexValueColumn)} ${operator} ?)`);
+    params.push(comparisonValue);
+    rangeClauses.push(`(${quoteColumnName(arrayIndexValueTypeColumn)} = 'real' AND ` + `${quoteColumnName(arrayIndexValueColumn)} ${operator} ?)`);
+    params.push(comparisonValue);
+  } else {
+    return null;
+  }
+  return {
+    sql: `${quoteColumnName('objectId')} IN (` + `SELECT ${quoteColumnName('objectId')} FROM ${arrayIndexTableName} ` + `WHERE ${rangeClauses.join(' OR ')}` + `)`,
+    params
   };
 };
 const getScalarValueMatchExpression = (targetSql, comparisonValue) => getJsonValueMatchExpression(targetSql, comparisonValue);
@@ -1360,7 +1452,10 @@ const validateRegexPattern = (pattern, flags) => {
 };
 const escapeSQLiteLikePattern = literal => literal.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
 const escapeSQLiteGlobPattern = literal => literal.replace(/\[/g, '[[]').replace(/\*/g, '[*]').replace(/\?/g, '[?]');
-const isASCIIOnlyString = value => /^[\x00-\x7F]*$/.test(value);
+
+// eslint-disable-next-line no-control-regex
+const asciiOnlyStringPattern = /^[\u0000-\u007F]*$/;
+const isASCIIOnlyString = value => asciiOnlyStringPattern.test(value);
 
 /** Only bare text-ish columns can drop CAST() and still keep regex lowering semantics sane. */
 const isLowerableRegexTextColumn = (schemaFields, fieldName) => {
@@ -1395,13 +1490,15 @@ const getSimpleRegexMatchExpression = (targetSql, normalizedRegex, options) => {
     }
     return {
       sql: `${textTargetSql} LIKE ? ESCAPE '\\'`,
-      params: [likePattern]
+      params: [likePattern],
+      requiresResidual: regexInfo.requiresResidual
     };
   }
   if (regexInfo.mode === 'exact') {
     return {
       sql: `${textTargetSql} = ?`,
-      params: [regexInfo.literal]
+      params: [regexInfo.literal],
+      requiresResidual: regexInfo.requiresResidual
     };
   }
   const globLiteral = escapeSQLiteGlobPattern(regexInfo.literal);
@@ -1415,16 +1512,72 @@ const getSimpleRegexMatchExpression = (targetSql, normalizedRegex, options) => {
   }
   return {
     sql: `${textTargetSql} GLOB ?`,
-    params: [globPattern]
+    params: [globPattern],
+    requiresResidual: regexInfo.requiresResidual
+  };
+};
+const getRegexTextTargetSQL = (targetSql, options) => options && options.useRawTextTarget ? targetSql : `CAST(${targetSql} AS TEXT)`;
+const getSQLiteExactSetRegexExpression = (targetSql, literals, caseMode, options) => {
+  const textTargetSql = getRegexTextTargetSQL(targetSql, options);
+  const placeholders = literals.map(() => '?').join(', ');
+  if (caseMode === 'caseInsensitiveASCII') {
+    return {
+      sql: `(${textTargetSql} COLLATE NOCASE) IN (${placeholders})`,
+      params: literals
+    };
+  }
+  if (literals.length === 1) {
+    return {
+      sql: `${textTargetSql} = ?`,
+      params: literals
+    };
+  }
+  return {
+    sql: `${textTargetSql} IN (${placeholders})`,
+    params: literals
+  };
+};
+const getSQLitePrefixSetRegexExpression = (targetSql, prefixes, caseMode, options) => {
+  const textTargetSql = getRegexTextTargetSQL(targetSql, options);
+  const prefixClauses = [];
+  const params = [];
+  for (const prefix of prefixes) {
+    if (caseMode === 'caseInsensitiveASCII') {
+      prefixClauses.push(`${textTargetSql} LIKE ? ESCAPE '\\'`);
+      params.push(`${escapeSQLiteLikePattern(prefix)}%`);
+    } else {
+      prefixClauses.push(`${textTargetSql} GLOB ?`);
+      params.push(`${escapeSQLiteGlobPattern(prefix)}*`);
+    }
+  }
+  if (prefixClauses.length === 1) {
+    return {
+      sql: prefixClauses[0],
+      params
+    };
+  }
+  return {
+    sql: `(${prefixClauses.join(' OR ')})`,
+    params
   };
 };
 const getRegexMatchPlan = (targetSql, normalizedRegex, options) => {
+  const leadingLiteralSetInfo = getRegexLeadingLiteralSetInfo(normalizedRegex.pattern, normalizedRegex.flags);
+  if (leadingLiteralSetInfo) {
+    let expression;
+    if (leadingLiteralSetInfo.matchMode === 'exact') {
+      expression = getSQLiteExactSetRegexExpression(targetSql, leadingLiteralSetInfo.literals, leadingLiteralSetInfo.caseMode, options);
+    } else {
+      expression = getSQLitePrefixSetRegexExpression(targetSql, leadingLiteralSetInfo.literals, leadingLiteralSetInfo.caseMode, options);
+    }
+    return {
+      ...expression,
+      requiresResidual: leadingLiteralSetInfo.requiresResidual
+    };
+  }
   const simpleRegexMatch = getSimpleRegexMatchExpression(targetSql, normalizedRegex, options);
   if (simpleRegexMatch) {
-    return {
-      ...simpleRegexMatch,
-      requiresResidual: false
-    };
+    return simpleRegexMatch;
   }
   if (!(options && options.allowPrefixPrefilter)) {
     return null;
@@ -1433,18 +1586,38 @@ const getRegexMatchPlan = (targetSql, normalizedRegex, options) => {
   if (!prefixInfo) {
     return null;
   }
-  const textTargetSql = options && options.useRawTextTarget ? targetSql : `CAST(${targetSql} AS TEXT)`;
-  if (prefixInfo.mode === 'caseInsensitiveASCII') {
+  const prefixExpression = getSQLitePrefixSetRegexExpression(targetSql, [prefixInfo.literalPrefix], prefixInfo.mode, options);
+  return {
+    ...prefixExpression,
+    requiresResidual: prefixInfo.requiresResidual
+  };
+};
+const getSQLiteRegexResidualExpression = (targetSql, normalizedRegex) => {
+  if (normalizedRegex.flags) {
     return {
-      sql: `${textTargetSql} LIKE ? ESCAPE '\\'`,
-      params: [`${escapeSQLiteLikePattern(prefixInfo.literalPrefix)}%`],
-      requiresResidual: true
+      sql: `regexp_flags(?, ?, ${targetSql}) = 1`,
+      params: [normalizedRegex.pattern, normalizedRegex.flags]
     };
   }
   return {
-    sql: `${textTargetSql} GLOB ?`,
-    params: [`${escapeSQLiteGlobPattern(prefixInfo.literalPrefix)}*`],
-    requiresResidual: true
+    sql: `${targetSql} REGEXP ?`,
+    params: [normalizedRegex.pattern]
+  };
+};
+const getSQLiteRegexValueMatchExpression = (targetSql, normalizedRegex, regexMatchPlan) => {
+  if (!regexMatchPlan) {
+    return getSQLiteRegexResidualExpression(targetSql, normalizedRegex);
+  }
+  if (!regexMatchPlan.requiresResidual) {
+    return {
+      sql: regexMatchPlan.sql,
+      params: regexMatchPlan.params
+    };
+  }
+  const residualExpression = getSQLiteRegexResidualExpression(targetSql, normalizedRegex);
+  return {
+    sql: `(${regexMatchPlan.sql}) AND ${residualExpression.sql}`,
+    params: [...regexMatchPlan.params, ...residualExpression.params]
   };
 };
 const getSQLiteArrayIndexRegexMatchExpression = (arrayIndexTableName, normalizedRegex) => {
@@ -1453,36 +1626,11 @@ const getSQLiteArrayIndexRegexMatchExpression = (arrayIndexTableName, normalized
     useRawTextTarget: true,
     allowPrefixPrefilter: true
   });
-  if (regexMatchPlan) {
-    if (regexMatchPlan.requiresResidual) {
-      if (normalizedRegex.flags) {
-        return {
-          sql: `${quoteColumnName('objectId')} IN (` + `SELECT ${quoteColumnName('objectId')} FROM ${arrayIndexTableName} ` + `WHERE ${quoteColumnName(arrayIndexValueTypeColumn)} = 'text' ` + `AND (${regexMatchPlan.sql}) ` + `AND regexp_flags(?, ?, ${valueColumnSql}) = 1` + `)`,
-          params: [...regexMatchPlan.params, normalizedRegex.pattern, normalizedRegex.flags]
-        };
-      } else {
-        return {
-          sql: `${quoteColumnName('objectId')} IN (` + `SELECT ${quoteColumnName('objectId')} FROM ${arrayIndexTableName} ` + `WHERE ${quoteColumnName(arrayIndexValueTypeColumn)} = 'text' ` + `AND (${regexMatchPlan.sql}) ` + `AND ${valueColumnSql} REGEXP ?` + `)`,
-          params: [...regexMatchPlan.params, normalizedRegex.pattern]
-        };
-      }
-    }
-    return {
-      sql: `${quoteColumnName('objectId')} IN (` + `SELECT ${quoteColumnName('objectId')} FROM ${arrayIndexTableName} ` + `WHERE ${quoteColumnName(arrayIndexValueTypeColumn)} = 'text' ` + `AND ${regexMatchPlan.sql}` + `)`,
-      params: regexMatchPlan.params
-    };
-  }
-  if (normalizedRegex.flags) {
-    return {
-      sql: `${quoteColumnName('objectId')} IN (` + `SELECT ${quoteColumnName('objectId')} FROM ${arrayIndexTableName} ` + `WHERE ${quoteColumnName(arrayIndexValueTypeColumn)} = 'text' ` + `AND regexp_flags(?, ?, ${valueColumnSql}) = 1` + `)`,
-      params: [normalizedRegex.pattern, normalizedRegex.flags]
-    };
-  } else {
-    return {
-      sql: `${quoteColumnName('objectId')} IN (` + `SELECT ${quoteColumnName('objectId')} FROM ${arrayIndexTableName} ` + `WHERE ${quoteColumnName(arrayIndexValueTypeColumn)} = 'text' ` + `AND ${valueColumnSql} REGEXP ?` + `)`,
-      params: [normalizedRegex.pattern]
-    };
-  }
+  const regexValueMatch = getSQLiteRegexValueMatchExpression(valueColumnSql, normalizedRegex, regexMatchPlan);
+  return {
+    sql: `${quoteColumnName('objectId')} IN (` + `SELECT ${quoteColumnName('objectId')} FROM ${arrayIndexTableName} ` + `WHERE ${quoteColumnName(arrayIndexValueTypeColumn)} = 'text' ` + `AND ${regexValueMatch.sql}` + `)`,
+    params: regexValueMatch.params
+  };
 };
 const transformDotField = fieldName => {
   if (fieldName.indexOf('.') === -1) {
@@ -1737,6 +1885,7 @@ class SQLiteStorageAdapter {
     return !!this._prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = ?", db).get(rawTableName);
   }
   _rawTableName(className, dbOverride) {
+    void dbOverride;
     if (className === '_SCHEMA') {
       return '_SCHEMA';
     }
@@ -1947,21 +2096,27 @@ class SQLiteStorageAdapter {
     const quotedObjectId = quoteColumnName('objectId');
     const quotedValueType = quoteColumnName(arrayIndexValueTypeColumn);
     const quotedValue = quoteColumnName(arrayIndexValueColumn);
+    const storedValueTypeExpression = getSQLiteArrayIndexStoredValueTypeExpression(arrayIndexField.typeExpression, arrayIndexField.valueExpression);
+    const storedValueExpression = getSQLiteArrayIndexStoredValueExpression(arrayIndexField.typeExpression, arrayIndexField.valueExpression);
+    const derivedInsertRowsSql = `SELECT ` + `${storedValueTypeExpression} AS __arridx_value_type, ` + `${storedValueExpression} AS __arridx_value ` + `FROM json_each(COALESCE(${rootColumnSql}, '[]')) AS array_index_item`;
 
     // Array membership semantics only care whether one element matches, so the
     // shadow table can tolerate duplicate rows from duplicate array elements.
     db.exec(`CREATE TABLE IF NOT EXISTS ${arrayIndexTableName} (` + `${quotedObjectId} TEXT NOT NULL, ` + `${quotedValueType} TEXT NOT NULL, ` + `${quotedValue}` + `)`);
     db.exec(`CREATE INDEX IF NOT EXISTS ${lookupIndex} ON ${arrayIndexTableName} (` + `${quotedValueType}, ${quotedValue}, ${quotedObjectId}` + `)`);
     db.exec(`CREATE INDEX IF NOT EXISTS ${objectIdIndex} ON ${arrayIndexTableName} (` + `${quotedObjectId}` + `)`);
-    db.exec(`CREATE TRIGGER IF NOT EXISTS ${insertTrigger} AFTER INSERT ON ${tableName} BEGIN ` + `DELETE FROM ${arrayIndexTableName} WHERE ${quotedObjectId} = new.${quotedObjectId}; ` + `INSERT INTO ${arrayIndexTableName}(${quotedObjectId}, ${quotedValueType}, ${quotedValue}) ` + `SELECT new.${quotedObjectId}, ${arrayIndexField.typeExpression}, ${arrayIndexField.valueExpression} ` + `FROM json_each(COALESCE(${rootColumnSql}, '[]')) AS array_index_item ` + `WHERE ${arrayIndexField.typeExpression} IN (${sqliteIndexedArrayScalarTypeNameSQL}); ` + `END`);
+    db.exec(`CREATE TRIGGER IF NOT EXISTS ${insertTrigger} AFTER INSERT ON ${tableName} BEGIN ` + `DELETE FROM ${arrayIndexTableName} WHERE ${quotedObjectId} = new.${quotedObjectId}; ` + `INSERT INTO ${arrayIndexTableName}(${quotedObjectId}, ${quotedValueType}, ${quotedValue}) ` + `SELECT new.${quotedObjectId}, derived.__arridx_value_type, derived.__arridx_value ` + `FROM (${derivedInsertRowsSql}) AS derived ` + `WHERE derived.__arridx_value_type IS NOT NULL; ` + `END`);
     db.exec(`CREATE TRIGGER IF NOT EXISTS ${deleteTrigger} AFTER DELETE ON ${tableName} BEGIN ` + `DELETE FROM ${arrayIndexTableName} WHERE ${quotedObjectId} = old.${quotedObjectId}; ` + `END`);
-    db.exec(`CREATE TRIGGER IF NOT EXISTS ${updateTrigger} AFTER UPDATE OF ${quoteColumnName(arrayIndexField.rootFieldName)} ON ${tableName} BEGIN ` + `DELETE FROM ${arrayIndexTableName} WHERE ${quotedObjectId} = old.${quotedObjectId}; ` + `INSERT INTO ${arrayIndexTableName}(${quotedObjectId}, ${quotedValueType}, ${quotedValue}) ` + `SELECT new.${quotedObjectId}, ${arrayIndexField.typeExpression}, ${arrayIndexField.valueExpression} ` + `FROM json_each(COALESCE(${rootColumnSql}, '[]')) AS array_index_item ` + `WHERE ${arrayIndexField.typeExpression} IN (${sqliteIndexedArrayScalarTypeNameSQL}); ` + `END`);
+    db.exec(`CREATE TRIGGER IF NOT EXISTS ${updateTrigger} AFTER UPDATE OF ${quoteColumnName(arrayIndexField.rootFieldName)} ON ${tableName} BEGIN ` + `DELETE FROM ${arrayIndexTableName} WHERE ${quotedObjectId} = old.${quotedObjectId}; ` + `INSERT INTO ${arrayIndexTableName}(${quotedObjectId}, ${quotedValueType}, ${quotedValue}) ` + `SELECT new.${quotedObjectId}, derived.__arridx_value_type, derived.__arridx_value ` + `FROM (${derivedInsertRowsSql}) AS derived ` + `WHERE derived.__arridx_value_type IS NOT NULL; ` + `END`);
     const backfillField = this._getArrayElementIndexFieldInfo(schemaFields, arrayIndexField.normalizedFieldName);
     if (!backfillField) {
       return;
     }
     db.exec(`DELETE FROM ${arrayIndexTableName}`);
-    db.exec(`INSERT INTO ${arrayIndexTableName}(${quotedObjectId}, ${quotedValueType}, ${quotedValue}) ` + `SELECT base.${quotedObjectId}, ${backfillField.typeExpression}, ${backfillField.valueExpression} ` + `FROM ${tableName} AS base, ` + `json_each(COALESCE(base.${quoteColumnName(backfillField.rootFieldName)}, '[]')) AS array_index_item ` + `WHERE ${backfillField.typeExpression} IN (${sqliteIndexedArrayScalarTypeNameSQL})`);
+    const backfillStoredValueTypeExpression = getSQLiteArrayIndexStoredValueTypeExpression(backfillField.typeExpression, backfillField.valueExpression);
+    const backfillStoredValueExpression = getSQLiteArrayIndexStoredValueExpression(backfillField.typeExpression, backfillField.valueExpression);
+    const derivedBackfillRowsSql = `SELECT ` + `base.${quotedObjectId} AS __arridx_object_id, ` + `${backfillStoredValueTypeExpression} AS __arridx_value_type, ` + `${backfillStoredValueExpression} AS __arridx_value ` + `FROM ${tableName} AS base, ` + `json_each(COALESCE(base.${quoteColumnName(backfillField.rootFieldName)}, '[]')) AS array_index_item`;
+    db.exec(`INSERT INTO ${arrayIndexTableName}(${quotedObjectId}, ${quotedValueType}, ${quotedValue}) ` + `SELECT derived.__arridx_object_id, derived.__arridx_value_type, derived.__arridx_value ` + `FROM (${derivedBackfillRowsSql}) AS derived ` + `WHERE derived.__arridx_value_type IS NOT NULL`);
   }
   _rawFTSTableName(className, fieldName, diacriticSensitive) {
     const suffix = diacriticSensitive ? 'accent' : 'folded';
@@ -2842,22 +2997,42 @@ class SQLiteStorageAdapter {
       if (authDataProvider) {
         targetSql = `json_extract("authData", '$.${authDataProvider}')`;
       } else if (isDotNotation) {
-        targetSql = dotFieldArrayPath ? dotFieldArrayPath.valueExpression : dotFieldRootExists ? dotFieldPath.valueExpression : 'NULL';
+        if (dotFieldArrayPath) {
+          targetSql = dotFieldArrayPath.valueExpression;
+        } else if (dotFieldRootExists) {
+          targetSql = dotFieldPath.valueExpression;
+        } else {
+          targetSql = 'NULL';
+        }
       } else {
         validateFieldName(normalizedKey);
         const fieldExistsInSchema = doesSQLiteFieldExistInSchema(schemaFields, normalizedKey);
         targetSql = fieldExistsInSchema ? quoteColumnName(normalizedKey) : 'NULL';
       }
-      const dotFieldTypeSql = dotFieldArrayPath ? dotFieldArrayPath.typeExpression : dotFieldPath && dotFieldRootExists ? dotFieldPath.typeExpression : null;
+      let dotFieldTypeSql = null;
+      if (dotFieldArrayPath) {
+        dotFieldTypeSql = dotFieldArrayPath.typeExpression;
+      } else if (dotFieldPath && dotFieldRootExists) {
+        dotFieldTypeSql = dotFieldPath.typeExpression;
+      }
       const usesCaseInsensitiveComparison = caseInsensitive && !authDataProvider && !isDotNotation && (normalizedKey === 'username' || normalizedKey === 'email');
       const isArrayField = normalizedKey === '_rperm' || normalizedKey === '_wperm' || schemaFields[normalizedKey] && schemaFields[normalizedKey].type === 'Array';
       const explicitNullFieldMatch = shouldTrackExplicitNullFields(className) && !authDataProvider && !isDotNotation ? getExplicitNullFieldMatchExpression(normalizedKey) : null;
       /** Bare text columns can keep index-friendly LIKE/GLOB/=`...` lowering without CAST(... AS TEXT). */
       const canUseLoweredRegexRawTextTarget = !authDataProvider && !isDotNotation && !isArrayField && targetSql !== 'NULL' && isLowerableRegexTextColumn(schemaFields, normalizedKey);
-      const indexedArrayElementTableName = isArrayField || dotFieldArraySourceSql ? this._getQuotedIndexedArrayElementTableName(className, schemaFields, isArrayField ? normalizedKey : key) : null;
+      let indexedArrayElementTableName = null;
+      if (isArrayField || dotFieldArraySourceSql) {
+        indexedArrayElementTableName = this._getQuotedIndexedArrayElementTableName(className, schemaFields, isArrayField ? normalizedKey : key);
+      }
       if (val === null || val === undefined) {
         if (dotFieldArraySourceSql) {
-          conditions.push(`EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${targetSql} IS NULL)`);
+          const indexedArrayNullMatch = indexedArrayElementTableName ? getSQLiteArrayIndexNullMatchExpression(indexedArrayElementTableName) : null;
+          if (indexedArrayNullMatch) {
+            conditions.push(indexedArrayNullMatch.sql);
+            params.push(...indexedArrayNullMatch.params);
+          } else {
+            conditions.push(`EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${targetSql} IS NULL)`);
+          }
         } else {
           conditions.push(`${targetSql} IS NULL`);
         }
@@ -2872,7 +3047,13 @@ class SQLiteStorageAdapter {
           if (op === '$eq') {
             if (opVal === null) {
               if (dotFieldArraySourceSql) {
-                conditions.push(`EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${targetSql} IS NULL)`);
+                const indexedArrayNullMatch = indexedArrayElementTableName ? getSQLiteArrayIndexNullMatchExpression(indexedArrayElementTableName) : null;
+                if (indexedArrayNullMatch) {
+                  conditions.push(indexedArrayNullMatch.sql);
+                  params.push(...indexedArrayNullMatch.params);
+                } else {
+                  conditions.push(`EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${targetSql} IS NULL)`);
+                }
               } else {
                 conditions.push(`${targetSql} IS NULL`);
               }
@@ -2914,13 +3095,25 @@ class SQLiteStorageAdapter {
                 conditions.push(`${targetSql} IS NOT NULL`);
               }
             } else if (isArrayField) {
-              const elementMatch = getArrayElementMatchExpression(targetSql, opVal);
-              conditions.push(`(${targetSql} IS NULL OR NOT (${elementMatch.sql}))`);
-              params.push(...elementMatch.params);
+              const indexedArrayValueMatch = indexedArrayElementTableName ? getSQLiteArrayIndexValueMatchExpression(indexedArrayElementTableName, opVal) : null;
+              if (indexedArrayValueMatch) {
+                conditions.push(`(${targetSql} IS NULL OR NOT (${indexedArrayValueMatch.sql}))`);
+                params.push(...indexedArrayValueMatch.params);
+              } else {
+                const elementMatch = getArrayElementMatchExpression(targetSql, opVal);
+                conditions.push(`(${targetSql} IS NULL OR NOT (${elementMatch.sql}))`);
+                params.push(...elementMatch.params);
+              }
             } else if (dotFieldArraySourceSql) {
-              const valueMatch = getArrayRootDotValueMatchExpression(dotFieldArraySourceSql, targetSql, opVal);
-              conditions.push(`NOT (${valueMatch.sql})`);
-              params.push(...valueMatch.params);
+              const indexedArrayValueMatch = indexedArrayElementTableName ? getSQLiteArrayIndexValueMatchExpression(indexedArrayElementTableName, opVal) : null;
+              if (indexedArrayValueMatch) {
+                conditions.push(`NOT (${indexedArrayValueMatch.sql})`);
+                params.push(...indexedArrayValueMatch.params);
+              } else {
+                const valueMatch = getArrayRootDotValueMatchExpression(dotFieldArraySourceSql, targetSql, opVal);
+                conditions.push(`NOT (${valueMatch.sql})`);
+                params.push(...valueMatch.params);
+              }
             } else if (usesCaseInsensitiveComparison && typeof opVal === 'string') {
               conditions.push(`(${targetSql} IS NULL OR LOWER(${targetSql}) != LOWER(?))`);
               params.push(opVal);
@@ -2931,32 +3124,60 @@ class SQLiteStorageAdapter {
             }
           } else if (op === '$lt') {
             if (dotFieldArraySourceSql) {
-              conditions.push(`EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${targetSql} < ?)`);
+              const indexedArrayRangeMatch = indexedArrayElementTableName ? getSQLiteArrayIndexRangeMatchExpression(indexedArrayElementTableName, opVal, '<') : null;
+              if (indexedArrayRangeMatch) {
+                conditions.push(indexedArrayRangeMatch.sql);
+                params.push(...indexedArrayRangeMatch.params);
+              } else {
+                conditions.push(`EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${targetSql} < ?)`);
+                params.push(toSQLiteValue(opVal));
+              }
             } else {
               conditions.push(`${targetSql} < ?`);
+              params.push(toSQLiteValue(opVal));
             }
-            params.push(toSQLiteValue(opVal));
           } else if (op === '$lte') {
             if (dotFieldArraySourceSql) {
-              conditions.push(`EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${targetSql} <= ?)`);
+              const indexedArrayRangeMatch = indexedArrayElementTableName ? getSQLiteArrayIndexRangeMatchExpression(indexedArrayElementTableName, opVal, '<=') : null;
+              if (indexedArrayRangeMatch) {
+                conditions.push(indexedArrayRangeMatch.sql);
+                params.push(...indexedArrayRangeMatch.params);
+              } else {
+                conditions.push(`EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${targetSql} <= ?)`);
+                params.push(toSQLiteValue(opVal));
+              }
             } else {
               conditions.push(`${targetSql} <= ?`);
+              params.push(toSQLiteValue(opVal));
             }
-            params.push(toSQLiteValue(opVal));
           } else if (op === '$gt') {
             if (dotFieldArraySourceSql) {
-              conditions.push(`EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${targetSql} > ?)`);
+              const indexedArrayRangeMatch = indexedArrayElementTableName ? getSQLiteArrayIndexRangeMatchExpression(indexedArrayElementTableName, opVal, '>') : null;
+              if (indexedArrayRangeMatch) {
+                conditions.push(indexedArrayRangeMatch.sql);
+                params.push(...indexedArrayRangeMatch.params);
+              } else {
+                conditions.push(`EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${targetSql} > ?)`);
+                params.push(toSQLiteValue(opVal));
+              }
             } else {
               conditions.push(`${targetSql} > ?`);
+              params.push(toSQLiteValue(opVal));
             }
-            params.push(toSQLiteValue(opVal));
           } else if (op === '$gte') {
             if (dotFieldArraySourceSql) {
-              conditions.push(`EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${targetSql} >= ?)`);
+              const indexedArrayRangeMatch = indexedArrayElementTableName ? getSQLiteArrayIndexRangeMatchExpression(indexedArrayElementTableName, opVal, '>=') : null;
+              if (indexedArrayRangeMatch) {
+                conditions.push(indexedArrayRangeMatch.sql);
+                params.push(...indexedArrayRangeMatch.params);
+              } else {
+                conditions.push(`EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${targetSql} >= ?)`);
+                params.push(toSQLiteValue(opVal));
+              }
             } else {
               conditions.push(`${targetSql} >= ?`);
+              params.push(toSQLiteValue(opVal));
             }
-            params.push(toSQLiteValue(opVal));
           } else if (op === '$in') {
             if (!Array.isArray(opVal)) {
               throw new _node.default.Error(_node.default.Error.INVALID_JSON, 'bad $in value');
@@ -2969,7 +3190,7 @@ class SQLiteStorageAdapter {
             if (hasInValues) {
               if (isArrayField) {
                 if (nonNulls.length > 0) {
-                  const anyMatch = getArrayAnyMatchExpression(targetSql, nonNulls);
+                  const anyMatch = getSQLiteArrayIndexAnyMatchExpression(indexedArrayElementTableName, nonNulls, comparisonValues => getArrayAnyMatchExpression(targetSql, comparisonValues));
                   if (hasNull) {
                     conditions.push(`(${targetSql} IS NULL OR (${anyMatch.sql}))`);
                   } else {
@@ -2983,15 +3204,27 @@ class SQLiteStorageAdapter {
                 }
               } else if (dotFieldArraySourceSql) {
                 if (nonNulls.length > 0) {
-                  const anyMatch = getArrayRootDotAnyMatchExpression(dotFieldArraySourceSql, targetSql, nonNulls);
+                  const anyMatch = getSQLiteArrayIndexAnyMatchExpression(indexedArrayElementTableName, nonNulls, comparisonValues => getArrayRootDotAnyMatchExpression(dotFieldArraySourceSql, targetSql, comparisonValues));
                   if (hasNull) {
-                    conditions.push(`(${anyMatch.sql} OR EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${targetSql} IS NULL))`);
+                    const indexedArrayNullMatch = indexedArrayElementTableName ? getSQLiteArrayIndexNullMatchExpression(indexedArrayElementTableName) : null;
+                    conditions.push(indexedArrayNullMatch ? `(${anyMatch.sql} OR ${indexedArrayNullMatch.sql})` : `(${anyMatch.sql} OR EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${targetSql} IS NULL))`);
+                    if (indexedArrayNullMatch) {
+                      params.push(...anyMatch.params, ...indexedArrayNullMatch.params);
+                    } else {
+                      params.push(...anyMatch.params);
+                    }
                   } else {
                     conditions.push(`(${anyMatch.sql})`);
+                    params.push(...anyMatch.params);
                   }
-                  params.push(...anyMatch.params);
                 } else if (hasNull) {
-                  conditions.push(`EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${targetSql} IS NULL)`);
+                  const indexedArrayNullMatch = indexedArrayElementTableName ? getSQLiteArrayIndexNullMatchExpression(indexedArrayElementTableName) : null;
+                  if (indexedArrayNullMatch) {
+                    conditions.push(indexedArrayNullMatch.sql);
+                    params.push(...indexedArrayNullMatch.params);
+                  } else {
+                    conditions.push(`EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${targetSql} IS NULL)`);
+                  }
                 } else {
                   conditions.push('1 = 0');
                 }
@@ -3042,7 +3275,7 @@ class SQLiteStorageAdapter {
             if (hasNinValues) {
               if (isArrayField) {
                 if (nonNulls.length > 0) {
-                  const anyMatch = getArrayAnyMatchExpression(targetSql, nonNulls);
+                  const anyMatch = getSQLiteArrayIndexAnyMatchExpression(indexedArrayElementTableName, nonNulls, comparisonValues => getArrayAnyMatchExpression(targetSql, comparisonValues));
                   if (hasNull) {
                     conditions.push(`(${targetSql} IS NOT NULL AND NOT (${anyMatch.sql}))`);
                   } else {
@@ -3054,7 +3287,7 @@ class SQLiteStorageAdapter {
                 }
               } else if (dotFieldArraySourceSql) {
                 if (nonNulls.length > 0) {
-                  const anyMatch = getArrayRootDotAnyMatchExpression(dotFieldArraySourceSql, targetSql, nonNulls);
+                  const anyMatch = getSQLiteArrayIndexAnyMatchExpression(indexedArrayElementTableName, nonNulls, comparisonValues => getArrayRootDotAnyMatchExpression(dotFieldArraySourceSql, targetSql, comparisonValues));
                   if (hasNull) {
                     const existsMatch = getArrayRootDotExistsExpression(dotFieldArraySourceSql, dotFieldTypeSql, true);
                     conditions.push(`(${existsMatch.sql} AND NOT (${anyMatch.sql}))`);
@@ -3132,52 +3365,25 @@ class SQLiteStorageAdapter {
                 const indexedRegexMatch = getSQLiteArrayIndexRegexMatchExpression(indexedArrayElementTableName, normalizedRegex);
                 conditions.push(indexedRegexMatch.sql);
                 params.push(...indexedRegexMatch.params);
-              } else if (regexMatchPlan) {
-                conditions.push(`EXISTS (SELECT 1 FROM json_each(${targetSql}) WHERE ${regexMatchPlan.sql})`);
-                params.push(...regexMatchPlan.params);
-              } else if (normalizedRegex.flags) {
-                conditions.push(`EXISTS (SELECT 1 FROM json_each(${targetSql}) WHERE regexp_flags(?, ?, value) = 1)`);
-                params.push(normalizedRegex.pattern, normalizedRegex.flags);
               } else {
-                conditions.push(`EXISTS (SELECT 1 FROM json_each(${targetSql}) WHERE value REGEXP ?)`);
-                params.push(normalizedRegex.pattern);
+                const valueRegexMatch = getSQLiteRegexValueMatchExpression('value', normalizedRegex, regexMatchPlan);
+                conditions.push(`EXISTS (SELECT 1 FROM json_each(${targetSql}) WHERE ${valueRegexMatch.sql})`);
+                params.push(...valueRegexMatch.params);
               }
             } else if (dotFieldArraySourceSql) {
               if (indexedArrayElementTableName) {
                 const indexedRegexMatch = getSQLiteArrayIndexRegexMatchExpression(indexedArrayElementTableName, normalizedRegex);
                 conditions.push(indexedRegexMatch.sql);
                 params.push(...indexedRegexMatch.params);
-              } else if (regexMatchPlan) {
-                conditions.push(`EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${regexMatchPlan.sql})`);
-                params.push(...regexMatchPlan.params);
-              } else if (normalizedRegex.flags) {
-                conditions.push(`EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE regexp_flags(?, ?, ${targetSql}) = 1)`);
-                params.push(normalizedRegex.pattern, normalizedRegex.flags);
               } else {
-                conditions.push(`EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${targetSql} REGEXP ?)`);
-                params.push(normalizedRegex.pattern);
+                const valueRegexMatch = getSQLiteRegexValueMatchExpression(targetSql, normalizedRegex, regexMatchPlan);
+                conditions.push(`EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${valueRegexMatch.sql})`);
+                params.push(...valueRegexMatch.params);
               }
             } else {
-              if (regexMatchPlan) {
-                if (regexMatchPlan.requiresResidual) {
-                  if (normalizedRegex.flags) {
-                    conditions.push(`(${regexMatchPlan.sql}) AND regexp_flags(?, ?, ${targetSql}) = 1`);
-                    params.push(...regexMatchPlan.params, normalizedRegex.pattern, normalizedRegex.flags);
-                  } else {
-                    conditions.push(`(${regexMatchPlan.sql}) AND ${targetSql} REGEXP ?`);
-                    params.push(...regexMatchPlan.params, normalizedRegex.pattern);
-                  }
-                } else {
-                  conditions.push(regexMatchPlan.sql);
-                  params.push(...regexMatchPlan.params);
-                }
-              } else if (normalizedRegex.flags) {
-                conditions.push(`regexp_flags(?, ?, ${targetSql}) = 1`);
-                params.push(normalizedRegex.pattern, normalizedRegex.flags);
-              } else {
-                conditions.push(`${targetSql} REGEXP ?`);
-                params.push(normalizedRegex.pattern);
-              }
+              const scalarRegexMatch = getSQLiteRegexValueMatchExpression(targetSql, normalizedRegex, regexMatchPlan);
+              conditions.push(scalarRegexMatch.sql);
+              params.push(...scalarRegexMatch.params);
             }
           } else if (op === '$nearSphere') {
             const point = opVal;
@@ -3276,16 +3482,9 @@ class SQLiteStorageAdapter {
                     params.push(...indexedRegexMatch.params);
                   } else {
                     const regexMatchPlan = getRegexMatchPlan('value', normalizedRegex);
-                    if (regexMatchPlan) {
-                      conditions.push(`EXISTS (SELECT 1 FROM json_each(${targetSql}) WHERE ${regexMatchPlan.sql})`);
-                      params.push(...regexMatchPlan.params);
-                    } else if (normalizedRegex.flags) {
-                      conditions.push(`EXISTS (SELECT 1 FROM json_each(${targetSql}) WHERE regexp_flags(?, ?, value) = 1)`);
-                      params.push(normalizedRegex.pattern, normalizedRegex.flags);
-                    } else {
-                      conditions.push(`EXISTS (SELECT 1 FROM json_each(${targetSql}) WHERE value REGEXP ?)`);
-                      params.push(normalizedRegex.pattern);
-                    }
+                    const valueRegexMatch = getSQLiteRegexValueMatchExpression('value', normalizedRegex, regexMatchPlan);
+                    conditions.push(`EXISTS (SELECT 1 FROM json_each(${targetSql}) WHERE ${valueRegexMatch.sql})`);
+                    params.push(...valueRegexMatch.params);
                   }
                 }
               } else {
@@ -4212,10 +4411,13 @@ class SQLiteStorageAdapter {
       };
     }
     const compiled = this._compileAggregateExpression(context, expression);
-    const fieldType = compiled.fieldType && compiled.fieldType.nativePointer ? {
-      ...compiled.fieldType,
-      aggregateGroupPointer: true
-    } : compiled.fieldType;
+    let fieldType = compiled.fieldType;
+    if (fieldType && fieldType.nativePointer) {
+      fieldType = {
+        ...fieldType,
+        aggregateGroupPointer: true
+      };
+    }
     return {
       sql: compiled.sql,
       params: compiled.params,
@@ -4427,18 +4629,22 @@ class SQLiteStorageAdapter {
     }
     selectParts.push(`json_each.value AS ${quoteColumnName(fieldName)}`);
     const currentField = context.schema.fields[fieldName];
+    let nextFieldDefinition = {
+      type: 'Object'
+    };
+    if (currentField && currentField.aggregateLookup) {
+      nextFieldDefinition = {
+        type: 'Object',
+        aggregateLookup: true,
+        lookupSchema: currentField.lookupSchema,
+        targetClass: currentField.targetClass
+      };
+    }
     const nextSchema = {
       className: context.className,
       fields: {
         ...context.schema.fields,
-        [fieldName]: currentField && currentField.aggregateLookup ? {
-          type: 'Object',
-          aggregateLookup: true,
-          lookupSchema: currentField.lookupSchema,
-          targetClass: currentField.targetClass
-        } : {
-          type: 'Object'
-        }
+        [fieldName]: nextFieldDefinition
       }
     };
     return {
@@ -5137,19 +5343,24 @@ class SQLiteStorageAdapter {
       }
     };
     const schemaFields = storedSchema.schema && storedSchema.schema.fields || {};
-    const normalizedIndexes = Array.isArray(indexes) ? indexes.map(index => ({
-      name: index.name,
-      key: index.key,
-      unique: Boolean(index.unique),
-      sparse: Boolean(index.sparse),
-      skipDatabaseCreation: Boolean(index.skipDatabaseCreation)
-    })) : Object.keys(indexes).map(name => ({
-      name,
-      key: indexes[name],
-      unique: false,
-      sparse: false,
-      skipDatabaseCreation: false
-    }));
+    let normalizedIndexes;
+    if (Array.isArray(indexes)) {
+      normalizedIndexes = indexes.map(index => ({
+        name: index.name,
+        key: index.key,
+        unique: Boolean(index.unique),
+        sparse: Boolean(index.sparse),
+        skipDatabaseCreation: Boolean(index.skipDatabaseCreation)
+      }));
+    } else {
+      normalizedIndexes = Object.keys(indexes).map(name => ({
+        name,
+        key: indexes[name],
+        unique: false,
+        sparse: false,
+        skipDatabaseCreation: false
+      }));
+    }
     const tableName = this._tableName(className);
     const columns = new Set(this._getTableColumns(className, conn));
     for (const index of normalizedIndexes) {

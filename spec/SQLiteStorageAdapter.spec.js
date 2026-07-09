@@ -1159,6 +1159,53 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
     ]);
   });
 
+  it('keeps residual regex checks when an uncased Unicode /i prefix is truncated before cased text', async () => {
+    const schema = {
+      className: 'RegexMixedThaiAsciiPrefixClass',
+      fields: {
+        objectId: { type: 'String' },
+        name: { type: 'String' },
+      },
+    };
+    await adapter.createClass('RegexMixedThaiAsciiPrefixClass', schema);
+    await adapter.createIndex(
+      'RegexMixedThaiAsciiPrefixClass',
+      { name: 1 },
+      { name: 'indexed_regex_mixed_thai_ascii_name' }
+    );
+    await adapter.createObject('RegexMixedThaiAsciiPrefixClass', schema, {
+      objectId: 'match',
+      name: 'สมAfoo',
+    });
+    await adapter.createObject('RegexMixedThaiAsciiPrefixClass', schema, {
+      objectId: 'noMatch',
+      name: 'สมBfoo',
+    });
+
+    const where = adapter._buildWhereClause('RegexMixedThaiAsciiPrefixClass', schema, {
+      name: { $regex: '^สมA.*', $options: 'i' },
+    });
+    const queryPlan = adapter
+      ._prepare(
+        `EXPLAIN QUERY PLAN SELECT "objectId" FROM ${adapter._tableName('RegexMixedThaiAsciiPrefixClass')} WHERE ${where.sql}`
+      )
+      .all(...where.params);
+    const results = await adapter.find('RegexMixedThaiAsciiPrefixClass', schema, {
+      name: { $regex: '^สมA.*', $options: 'i' },
+    });
+
+    expect(where.sql.includes('"name" GLOB ?')).toBeTrue();
+    expect(where.sql.includes('regexp_flags')).toBeTrue();
+    expect(
+      queryPlan.some(
+        row =>
+          typeof row.detail === 'string' &&
+          row.detail.includes('indexed_regex_mixed_thai_ascii_name')
+      )
+    ).toBeTrue();
+    expect(results.map(result => result.objectId)).toEqual(['match']);
+  });
+
   it('lowers anchored exact regex alternations to IN while keeping end-anchor semantics correct', async () => {
     const schema = {
       className: 'IndexedRegexExactAlternationClass',
