@@ -2861,6 +2861,11 @@ export class SQLiteStorageAdapter implements StorageAdapter {
       arrayIndexField.typeExpression,
       arrayIndexField.valueExpression
     );
+    const derivedInsertRowsSql =
+      `SELECT ` +
+      `${storedValueTypeExpression} AS __arridx_value_type, ` +
+      `${storedValueExpression} AS __arridx_value ` +
+      `FROM json_each(COALESCE(${rootColumnSql}, '[]')) AS array_index_item`;
 
     // Array membership semantics only care whether one element matches, so the
     // shadow table can tolerate duplicate rows from duplicate array elements.
@@ -2886,9 +2891,9 @@ export class SQLiteStorageAdapter implements StorageAdapter {
       `CREATE TRIGGER IF NOT EXISTS ${insertTrigger} AFTER INSERT ON ${tableName} BEGIN ` +
         `DELETE FROM ${arrayIndexTableName} WHERE ${quotedObjectId} = new.${quotedObjectId}; ` +
         `INSERT INTO ${arrayIndexTableName}(${quotedObjectId}, ${quotedValueType}, ${quotedValue}) ` +
-        `SELECT new.${quotedObjectId}, ${storedValueTypeExpression}, ${storedValueExpression} ` +
-        `FROM json_each(COALESCE(${rootColumnSql}, '[]')) AS array_index_item ` +
-        `WHERE ${storedValueTypeExpression} IS NOT NULL; ` +
+        `SELECT new.${quotedObjectId}, derived.__arridx_value_type, derived.__arridx_value ` +
+        `FROM (${derivedInsertRowsSql}) AS derived ` +
+        `WHERE derived.__arridx_value_type IS NOT NULL; ` +
         `END`
     );
     db.exec(
@@ -2902,9 +2907,9 @@ export class SQLiteStorageAdapter implements StorageAdapter {
       )} ON ${tableName} BEGIN ` +
         `DELETE FROM ${arrayIndexTableName} WHERE ${quotedObjectId} = old.${quotedObjectId}; ` +
         `INSERT INTO ${arrayIndexTableName}(${quotedObjectId}, ${quotedValueType}, ${quotedValue}) ` +
-        `SELECT new.${quotedObjectId}, ${storedValueTypeExpression}, ${storedValueExpression} ` +
-        `FROM json_each(COALESCE(${rootColumnSql}, '[]')) AS array_index_item ` +
-        `WHERE ${storedValueTypeExpression} IS NOT NULL; ` +
+        `SELECT new.${quotedObjectId}, derived.__arridx_value_type, derived.__arridx_value ` +
+        `FROM (${derivedInsertRowsSql}) AS derived ` +
+        `WHERE derived.__arridx_value_type IS NOT NULL; ` +
         `END`
     );
 
@@ -2925,12 +2930,18 @@ export class SQLiteStorageAdapter implements StorageAdapter {
       backfillField.typeExpression,
       backfillField.valueExpression
     );
+    const derivedBackfillRowsSql =
+      `SELECT ` +
+      `base.${quotedObjectId} AS __arridx_object_id, ` +
+      `${backfillStoredValueTypeExpression} AS __arridx_value_type, ` +
+      `${backfillStoredValueExpression} AS __arridx_value ` +
+      `FROM ${tableName} AS base, ` +
+      `json_each(COALESCE(base.${quoteColumnName(backfillField.rootFieldName)}, '[]')) AS array_index_item`;
     db.exec(
       `INSERT INTO ${arrayIndexTableName}(${quotedObjectId}, ${quotedValueType}, ${quotedValue}) ` +
-        `SELECT base.${quotedObjectId}, ${backfillStoredValueTypeExpression}, ${backfillStoredValueExpression} ` +
-        `FROM ${tableName} AS base, ` +
-        `json_each(COALESCE(base.${quoteColumnName(backfillField.rootFieldName)}, '[]')) AS array_index_item ` +
-        `WHERE ${backfillStoredValueTypeExpression} IS NOT NULL`
+        `SELECT derived.__arridx_object_id, derived.__arridx_value_type, derived.__arridx_value ` +
+        `FROM (${derivedBackfillRowsSql}) AS derived ` +
+        `WHERE derived.__arridx_value_type IS NOT NULL`
     );
   }
 

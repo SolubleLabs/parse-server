@@ -1814,3 +1814,14 @@
   - `npm run build`
   - `PARSE_SERVER_TEST_DB=sqlite PARSE_SERVER_TEST_DATABASE_URI=sqlite://:memory: TESTING=1 npx jasmine spec/SQLiteStorageAdapter.spec.js`
   - result: `68 specs, 0 failures`
+
+- Perf audit follow-up on the recent SQLite work:
+  - query-side deep-array lookup path looked acceptable: no obvious new chained `map/filter/sort/includes` hot-path issue was found in the recently touched regex / hidden-array-index query builders
+  - fixed one real write-path footgun in the hidden array-element shadow index maintenance SQL:
+    - trigger/backfill queries were evaluating the derived `valueType` CASE expression twice per array element
+    - insert/update/backfill SQL now computes derived array-index rows once in a subquery, then filters on the derived alias
+  - smaller repeated-walk style nits that remain are in cold-path planner/cache setup or test code, not the main SQLite query path
+- Full SQLite suite re-run:
+  - `npm run test:sqlite:testonly`
+  - result: `Executed 4175 of 4474 specs INCOMPLETE (299 PENDING) in 4 mins 38 secs`
+  - no failures; the incomplete count is the repo’s normal pending / `xit` / db-specific skipped coverage, not a SQLite regression
