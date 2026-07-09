@@ -1749,3 +1749,21 @@
   - conclusion: the earlier `secondMasterKey` failure is not a currently reproducible standalone adapter bug
   - raw `spec/index.spec.js` runs in isolation are misleading for this path and should not be used as the deciding signal
   - separate issue remains: full-suite serial run can still hit a late `ParseLiveQuery` timeout cascade, but `spec/ParseLiveQuery.spec.js` also passes cleanly in isolation with the same seed (`99115`), so that hang is cross-suite contamination rather than an intrinsic failure inside the LiveQuery spec file
+
+## 2026-07-09
+
+- Expanded SQLite regex lowering in `SQLiteUtils` / `SQLiteStorageAdapter` so anchored literal alternations like `^(ann|bob|cat)$` lower to native exact-set matching and grouped anchored prefixes like `^(ann|bob).*son` lower to native OR prefilters plus residual regex only when still required.
+- Removed the redundant residual regex path for pure anchored prefix shapes like `^ann.*`; these now stay fully native.
+- Kept the unicode-safe behavior for uncased scripts such as Thai while still refusing unsafe `/i` lowering for cased non-ASCII text.
+- Cleaned touched-file eslint errors in the adapter/spec files after the planner change.
+- Kept `asciiOnlyStringPattern` in regex form and suppressed `no-control-regex` only on those exact lines, per preference, instead of keeping the temporary byte-length / loop fallback.
+- Added a capped finite leading-language expander for regex lowering. It now handles small exact / prefix products built from literals, grouped alternations, positive char classes, optional pieces, bounded repetitions, and min-only open-ended repetitions when a safe prefix can still be proven.
+- Added targeted SQLite specs covering:
+  - finite char-class exact lowering like `^ann[ae]$`
+  - finite grouped products like `^(Dr|Mr)\. (Ann|Bob)$`
+  - more selective residual-prefilter lowering like `^ann[ae].*son`
+  - pure-prefix optional lowering like `^colou?r`
+- Validated with:
+  - `npm run build`
+  - `PARSE_SERVER_TEST_DB=sqlite PARSE_SERVER_TEST_DATABASE_URI=sqlite://:memory: TESTING=1 npx jasmine spec/SQLiteStorageAdapter.spec.js`
+  - `npx eslint src/Adapters/Storage/SQLite/SQLiteUtils.js src/Adapters/Storage/SQLite/SQLiteStorageAdapter.js spec/SQLiteStorageAdapter.spec.js --flag unstable_config_lookup_from_file`

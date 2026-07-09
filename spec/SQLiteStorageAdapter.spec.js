@@ -858,6 +858,426 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
     ]);
   });
 
+  it('lowers anchored exact regex alternations to IN without paying the REGEXP path', async () => {
+    const schema = {
+      className: 'IndexedRegexExactAlternationClass',
+      fields: {
+        objectId: { type: 'String' },
+        name: { type: 'String' },
+      },
+    };
+    await adapter.createClass('IndexedRegexExactAlternationClass', schema);
+    await adapter.createObject('IndexedRegexExactAlternationClass', schema, {
+      objectId: 'regexExactAlt1',
+      name: 'ann',
+    });
+    await adapter.createObject('IndexedRegexExactAlternationClass', schema, {
+      objectId: 'regexExactAlt2',
+      name: 'bob',
+    });
+    await adapter.createObject('IndexedRegexExactAlternationClass', schema, {
+      objectId: 'regexExactAlt3',
+      name: 'cat',
+    });
+    await adapter.createObject('IndexedRegexExactAlternationClass', schema, {
+      objectId: 'regexExactAlt4',
+      name: 'anna',
+    });
+    await adapter.createIndex(
+      'IndexedRegexExactAlternationClass',
+      { name: 1 },
+      { name: 'indexed_regex_exact_alt_name' }
+    );
+
+    const where = adapter._buildWhereClause('IndexedRegexExactAlternationClass', schema, {
+      name: { $regex: '^(ann|bob|cat)$' },
+    });
+    const queryPlan = adapter
+      ._prepare(
+        `EXPLAIN QUERY PLAN SELECT "objectId" FROM ${adapter._tableName('IndexedRegexExactAlternationClass')} WHERE ${where.sql}`
+      )
+      .all(...where.params);
+    const results = await adapter.find('IndexedRegexExactAlternationClass', schema, {
+      name: { $regex: '^(ann|bob|cat)$' },
+    });
+
+    expect(where.sql.includes(' IN (')).toBeTrue();
+    expect(where.sql.includes('REGEXP')).toBeFalse();
+    expect(
+      queryPlan.some(
+        row =>
+          typeof row.detail === 'string' &&
+          row.detail.includes('indexed_regex_exact_alt_name')
+      )
+    ).toBeTrue();
+    expect(results.map(result => result.objectId).sort()).toEqual([
+      'regexExactAlt1',
+      'regexExactAlt2',
+      'regexExactAlt3',
+    ]);
+  });
+
+  it('uses the Parse case-insensitive helper index for exact regex alternations too', async () => {
+    const schema = {
+      className: 'IndexedRegexExactInsensitiveAlternationClass',
+      fields: {
+        objectId: { type: 'String' },
+        username: { type: 'String' },
+      },
+    };
+    await adapter.createClass('IndexedRegexExactInsensitiveAlternationClass', schema);
+    await adapter.createObject('IndexedRegexExactInsensitiveAlternationClass', schema, {
+      objectId: 'regexExactInsensitive1',
+      username: 'Ann',
+    });
+    await adapter.createObject('IndexedRegexExactInsensitiveAlternationClass', schema, {
+      objectId: 'regexExactInsensitive2',
+      username: 'BOB',
+    });
+    await adapter.createObject('IndexedRegexExactInsensitiveAlternationClass', schema, {
+      objectId: 'regexExactInsensitive3',
+      username: 'cat',
+    });
+    await adapter.ensureIndex(
+      'IndexedRegexExactInsensitiveAlternationClass',
+      schema,
+      ['username'],
+      'case_insensitive_username',
+      true
+    );
+
+    const where = adapter._buildWhereClause(
+      'IndexedRegexExactInsensitiveAlternationClass',
+      schema,
+      {
+        username: { $regex: '^(ann|bob)$', $options: 'i' },
+      }
+    );
+    const queryPlan = adapter
+      ._prepare(
+        `EXPLAIN QUERY PLAN SELECT "objectId" FROM ${adapter._tableName('IndexedRegexExactInsensitiveAlternationClass')} WHERE ${where.sql}`
+      )
+      .all(...where.params);
+    const results = await adapter.find(
+      'IndexedRegexExactInsensitiveAlternationClass',
+      schema,
+      {
+        username: { $regex: '^(ann|bob)$', $options: 'i' },
+      }
+    );
+
+    expect(where.sql.includes('COLLATE NOCASE')).toBeTrue();
+    expect(where.sql.includes(' IN (')).toBeTrue();
+    expect(where.sql.includes('regexp_flags')).toBeFalse();
+    expect(
+      queryPlan.some(
+        row => typeof row.detail === 'string' && row.detail.includes('case_insensitive_username')
+      )
+    ).toBeTrue();
+    expect(results.map(result => result.objectId).sort()).toEqual([
+      'regexExactInsensitive1',
+      'regexExactInsensitive2',
+    ]);
+  });
+
+  it('lowers finite char-class exact regex to IN without falling back to REGEXP', async () => {
+    const schema = {
+      className: 'IndexedRegexFiniteCharClassClass',
+      fields: {
+        objectId: { type: 'String' },
+        name: { type: 'String' },
+      },
+    };
+    await adapter.createClass('IndexedRegexFiniteCharClassClass', schema);
+    await adapter.createObject('IndexedRegexFiniteCharClassClass', schema, {
+      objectId: 'regexFiniteCharClass1',
+      name: 'anna',
+    });
+    await adapter.createObject('IndexedRegexFiniteCharClassClass', schema, {
+      objectId: 'regexFiniteCharClass2',
+      name: 'anne',
+    });
+    await adapter.createObject('IndexedRegexFiniteCharClassClass', schema, {
+      objectId: 'regexFiniteCharClass3',
+      name: 'annb',
+    });
+    await adapter.createIndex(
+      'IndexedRegexFiniteCharClassClass',
+      { name: 1 },
+      { name: 'indexed_regex_finite_char_class_name' }
+    );
+
+    const where = adapter._buildWhereClause('IndexedRegexFiniteCharClassClass', schema, {
+      name: { $regex: '^ann[ae]$' },
+    });
+    const queryPlan = adapter
+      ._prepare(
+        `EXPLAIN QUERY PLAN SELECT "objectId" FROM ${adapter._tableName('IndexedRegexFiniteCharClassClass')} WHERE ${where.sql}`
+      )
+      .all(...where.params);
+    const results = await adapter.find('IndexedRegexFiniteCharClassClass', schema, {
+      name: { $regex: '^ann[ae]$' },
+    });
+
+    expect(where.sql.includes(' IN (')).toBeTrue();
+    expect(where.sql.includes('REGEXP')).toBeFalse();
+    expect(where.params.sort()).toEqual(['anna', 'anne']);
+    expect(
+      queryPlan.some(
+        row =>
+          typeof row.detail === 'string' &&
+          row.detail.includes('indexed_regex_finite_char_class_name')
+      )
+    ).toBeTrue();
+    expect(results.map(result => result.objectId).sort()).toEqual([
+      'regexFiniteCharClass1',
+      'regexFiniteCharClass2',
+    ]);
+  });
+
+  it('lowers finite grouped regex products to IN when the full language stays small', async () => {
+    const schema = {
+      className: 'IndexedRegexFiniteGroupProductClass',
+      fields: {
+        objectId: { type: 'String' },
+        title: { type: 'String' },
+      },
+    };
+    await adapter.createClass('IndexedRegexFiniteGroupProductClass', schema);
+    await adapter.createObject('IndexedRegexFiniteGroupProductClass', schema, {
+      objectId: 'regexFiniteGroup1',
+      title: 'Dr. Ann',
+    });
+    await adapter.createObject('IndexedRegexFiniteGroupProductClass', schema, {
+      objectId: 'regexFiniteGroup2',
+      title: 'Dr. Bob',
+    });
+    await adapter.createObject('IndexedRegexFiniteGroupProductClass', schema, {
+      objectId: 'regexFiniteGroup3',
+      title: 'Mr. Ann',
+    });
+    await adapter.createObject('IndexedRegexFiniteGroupProductClass', schema, {
+      objectId: 'regexFiniteGroup4',
+      title: 'Ms. Ann',
+    });
+    await adapter.createIndex(
+      'IndexedRegexFiniteGroupProductClass',
+      { title: 1 },
+      { name: 'indexed_regex_finite_group_product_title' }
+    );
+
+    const where = adapter._buildWhereClause('IndexedRegexFiniteGroupProductClass', schema, {
+      title: { $regex: '^(Dr|Mr)\\. (Ann|Bob)$' },
+    });
+    const queryPlan = adapter
+      ._prepare(
+        `EXPLAIN QUERY PLAN SELECT "objectId" FROM ${adapter._tableName('IndexedRegexFiniteGroupProductClass')} WHERE ${where.sql}`
+      )
+      .all(...where.params);
+    const results = await adapter.find('IndexedRegexFiniteGroupProductClass', schema, {
+      title: { $regex: '^(Dr|Mr)\\. (Ann|Bob)$' },
+    });
+
+    expect(where.sql.includes(' IN (')).toBeTrue();
+    expect(where.sql.includes('REGEXP')).toBeFalse();
+    expect(where.params.sort()).toEqual(['Dr. Ann', 'Dr. Bob', 'Mr. Ann', 'Mr. Bob']);
+    expect(
+      queryPlan.some(
+        row =>
+          typeof row.detail === 'string' &&
+          row.detail.includes('indexed_regex_finite_group_product_title')
+      )
+    ).toBeTrue();
+    expect(results.map(result => result.objectId).sort()).toEqual([
+      'regexFiniteGroup1',
+      'regexFiniteGroup2',
+      'regexFiniteGroup3',
+    ]);
+  });
+
+  it('uses finite leading expansions as more selective regex prefilters before residual matching', async () => {
+    const schema = {
+      className: 'IndexedRegexFiniteResidualClass',
+      fields: {
+        objectId: { type: 'String' },
+        name: { type: 'String' },
+      },
+    };
+    await adapter.createClass('IndexedRegexFiniteResidualClass', schema);
+    await adapter.createObject('IndexedRegexFiniteResidualClass', schema, {
+      objectId: 'regexFiniteResidual1',
+      name: 'annason',
+    });
+    await adapter.createObject('IndexedRegexFiniteResidualClass', schema, {
+      objectId: 'regexFiniteResidual2',
+      name: 'anneson',
+    });
+    await adapter.createObject('IndexedRegexFiniteResidualClass', schema, {
+      objectId: 'regexFiniteResidual3',
+      name: 'annxson',
+    });
+    await adapter.createIndex(
+      'IndexedRegexFiniteResidualClass',
+      { name: 1 },
+      { name: 'indexed_regex_finite_residual_name' }
+    );
+
+    const where = adapter._buildWhereClause('IndexedRegexFiniteResidualClass', schema, {
+      name: { $regex: '^ann[ae].*son' },
+    });
+    const queryPlan = adapter
+      ._prepare(
+        `EXPLAIN QUERY PLAN SELECT "objectId" FROM ${adapter._tableName('IndexedRegexFiniteResidualClass')} WHERE ${where.sql}`
+      )
+      .all(...where.params);
+    const results = await adapter.find('IndexedRegexFiniteResidualClass', schema, {
+      name: { $regex: '^ann[ae].*son' },
+    });
+
+    expect(where.sql.includes(' OR ')).toBeTrue();
+    expect(where.sql.includes('"name" GLOB ?')).toBeTrue();
+    expect(where.sql.includes('REGEXP')).toBeTrue();
+    expect(where.params.slice(0, 2).sort()).toEqual(['anna*', 'anne*']);
+    expect(
+      queryPlan.some(
+        row =>
+          typeof row.detail === 'string' &&
+          row.detail.includes('indexed_regex_finite_residual_name')
+      )
+    ).toBeTrue();
+    expect(results.map(result => result.objectId).sort()).toEqual([
+      'regexFiniteResidual1',
+      'regexFiniteResidual2',
+    ]);
+  });
+
+  it('keeps finite optional regex prefixes fully native when the remaining language is still pure prefix', async () => {
+    const schema = {
+      className: 'IndexedRegexFiniteOptionalPrefixClass',
+      fields: {
+        objectId: { type: 'String' },
+        word: { type: 'String' },
+      },
+    };
+    await adapter.createClass('IndexedRegexFiniteOptionalPrefixClass', schema);
+    await adapter.createIndex(
+      'IndexedRegexFiniteOptionalPrefixClass',
+      { word: 1 },
+      { name: 'indexed_regex_finite_optional_prefix_word' }
+    );
+
+    const where = adapter._buildWhereClause('IndexedRegexFiniteOptionalPrefixClass', schema, {
+      word: { $regex: '^colou?r' },
+    });
+    const queryPlan = adapter
+      ._prepare(
+        `EXPLAIN QUERY PLAN SELECT "objectId" FROM ${adapter._tableName('IndexedRegexFiniteOptionalPrefixClass')} WHERE ${where.sql}`
+      )
+      .all(...where.params);
+
+    expect(where.sql.includes(' OR ')).toBeTrue();
+    expect(where.sql.includes('"word" GLOB ?')).toBeTrue();
+    expect(where.sql.includes('REGEXP')).toBeFalse();
+    expect(where.params.slice().sort()).toEqual(['color*', 'colour*']);
+    expect(
+      queryPlan.some(
+        row =>
+          typeof row.detail === 'string' &&
+          row.detail.includes('indexed_regex_finite_optional_prefix_word')
+      )
+    ).toBeTrue();
+  });
+
+  it('keeps pure ^prefix.* regex fully native instead of adding a redundant residual regex', async () => {
+    const schema = {
+      className: 'IndexedRegexPurePrefixClass',
+      fields: {
+        objectId: { type: 'String' },
+        name: { type: 'String' },
+      },
+    };
+    await adapter.createClass('IndexedRegexPurePrefixClass', schema);
+    await adapter.createIndex(
+      'IndexedRegexPurePrefixClass',
+      { name: 1 },
+      { name: 'indexed_regex_pure_prefix_name' }
+    );
+
+    const where = adapter._buildWhereClause('IndexedRegexPurePrefixClass', schema, {
+      name: { $regex: '^ann.*' },
+    });
+    const queryPlan = adapter
+      ._prepare(
+        `EXPLAIN QUERY PLAN SELECT "objectId" FROM ${adapter._tableName('IndexedRegexPurePrefixClass')} WHERE ${where.sql}`
+      )
+      .all(...where.params);
+
+    expect(where.sql.includes('"name" GLOB ?')).toBeTrue();
+    expect(where.sql.includes('REGEXP')).toBeFalse();
+    expect(
+      queryPlan.some(
+        row =>
+          typeof row.detail === 'string' &&
+          row.detail.includes('indexed_regex_pure_prefix_name')
+      )
+    ).toBeTrue();
+  });
+
+  it('uses native OR prefix prefilters for grouped anchored regex before falling back to residual matching', async () => {
+    const schema = {
+      className: 'IndexedRegexAlternationResidualClass',
+      fields: {
+        objectId: { type: 'String' },
+        username: { type: 'String' },
+      },
+    };
+    await adapter.createClass('IndexedRegexAlternationResidualClass', schema);
+    await adapter.createObject('IndexedRegexAlternationResidualClass', schema, {
+      objectId: 'regexAlternationResidual1',
+      username: 'annason',
+    });
+    await adapter.createObject('IndexedRegexAlternationResidualClass', schema, {
+      objectId: 'regexAlternationResidual2',
+      username: 'bob___son',
+    });
+    await adapter.createObject('IndexedRegexAlternationResidualClass', schema, {
+      objectId: 'regexAlternationResidual3',
+      username: 'catson',
+    });
+    await adapter.ensureIndex(
+      'IndexedRegexAlternationResidualClass',
+      schema,
+      ['username'],
+      'case_insensitive_username',
+      true
+    );
+
+    const where = adapter._buildWhereClause('IndexedRegexAlternationResidualClass', schema, {
+      username: { $regex: '^(ann|bob).*son', $options: 'i' },
+    });
+    const queryPlan = adapter
+      ._prepare(
+        `EXPLAIN QUERY PLAN SELECT "objectId" FROM ${adapter._tableName('IndexedRegexAlternationResidualClass')} WHERE ${where.sql}`
+      )
+      .all(...where.params);
+    const results = await adapter.find('IndexedRegexAlternationResidualClass', schema, {
+      username: { $regex: '^(ann|bob).*son', $options: 'i' },
+    });
+
+    expect(where.sql.includes(' OR ')).toBeTrue();
+    expect(where.sql.includes('"username" LIKE ?')).toBeTrue();
+    expect(where.sql.includes('regexp_flags')).toBeTrue();
+    expect(
+      queryPlan.some(
+        row => typeof row.detail === 'string' && row.detail.includes('case_insensitive_username')
+      )
+    ).toBeTrue();
+    expect(results.map(result => result.objectId).sort()).toEqual([
+      'regexAlternationResidual1',
+      'regexAlternationResidual2',
+    ]);
+  });
+
   it('cleans up FTS artifacts when deleting text indexes', async () => {
     const schema = {
       className: 'FTSIndexClass',
@@ -1029,7 +1449,7 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
       }
     );
 
-    let storedSchema = await adapter.getClass('RootUpdateOpInferenceClass');
+    const storedSchema = await adapter.getClass('RootUpdateOpInferenceClass');
     expect(storedSchema.fields.lastRefundAt).toBeUndefined();
     expect(storedSchema.fields.refundCount.type).toBe('Number');
     expect(storedSchema.fields.tags.type).toBe('Array');

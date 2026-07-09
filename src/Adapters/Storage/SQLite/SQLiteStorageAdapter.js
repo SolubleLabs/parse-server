@@ -14,6 +14,7 @@ import Utils from '../../../Utils';
 import { createSanitizedError } from '../../../Error';
 import logger from '../../../logger';
 const {
+  getRegexLeadingLiteralSetInfo,
   getSimpleNormalizedRegexInfo,
   getRegexPrefixPrefilterInfo,
   isNumericArrayIndexComponent,
@@ -1753,7 +1754,9 @@ const escapeSQLiteLikePattern = (literal: string): string =>
 const escapeSQLiteGlobPattern = (literal: string): string =>
   literal.replace(/\[/g, '[[]').replace(/\*/g, '[*]').replace(/\?/g, '[?]');
 
-const isASCIIOnlyString = (value: string): boolean => /^[\x00-\x7F]*$/.test(value);
+// eslint-disable-next-line no-control-regex
+const asciiOnlyStringPattern = /^[\u0000-\u007F]*$/;
+const isASCIIOnlyString = (value: string): boolean => asciiOnlyStringPattern.test(value);
 
 /** Only bare text-ish columns can drop CAST() and still keep regex lowering semantics sane. */
 const isLowerableRegexTextColumn = (
@@ -1826,6 +1829,79 @@ const getSimpleRegexMatchExpression = (
   };
 };
 
+const getRegexTextTargetSQL = (
+  targetSql: string,
+  options?: {
+    useRawTextTarget?: boolean,
+  }
+): string => ((options && options.useRawTextTarget) ? targetSql : `CAST(${targetSql} AS TEXT)`);
+
+const getSQLiteExactSetRegexExpression = (
+  targetSql: string,
+  literals: Array<string>,
+  caseMode: 'caseSensitive' | 'caseInsensitiveASCII' | 'caseInsensitiveUncased',
+  options?: {
+    useRawTextTarget?: boolean,
+  }
+): { sql: string, params: Array<any> } => {
+  const textTargetSql = getRegexTextTargetSQL(targetSql, options);
+  const placeholders = literals.map(() => '?').join(', ');
+
+  if (caseMode === 'caseInsensitiveASCII') {
+    return {
+      sql: `(${textTargetSql} COLLATE NOCASE) IN (${placeholders})`,
+      params: literals,
+    };
+  }
+
+  if (literals.length === 1) {
+    return {
+      sql: `${textTargetSql} = ?`,
+      params: literals,
+    };
+  }
+
+  return {
+    sql: `${textTargetSql} IN (${placeholders})`,
+    params: literals,
+  };
+};
+
+const getSQLitePrefixSetRegexExpression = (
+  targetSql: string,
+  prefixes: Array<string>,
+  caseMode: 'caseSensitive' | 'caseInsensitiveASCII' | 'caseInsensitiveUncased',
+  options?: {
+    useRawTextTarget?: boolean,
+  }
+): { sql: string, params: Array<any> } => {
+  const textTargetSql = getRegexTextTargetSQL(targetSql, options);
+  const prefixClauses = [];
+  const params = [];
+
+  for (const prefix of prefixes) {
+    if (caseMode === 'caseInsensitiveASCII') {
+      prefixClauses.push(`${textTargetSql} LIKE ? ESCAPE '\\'`);
+      params.push(`${escapeSQLiteLikePattern(prefix)}%`);
+    } else {
+      prefixClauses.push(`${textTargetSql} GLOB ?`);
+      params.push(`${escapeSQLiteGlobPattern(prefix)}*`);
+    }
+  }
+
+  if (prefixClauses.length === 1) {
+    return {
+      sql: prefixClauses[0],
+      params,
+    };
+  }
+
+  return {
+    sql: `(${prefixClauses.join(' OR ')})`,
+    params,
+  };
+};
+
 const getRegexMatchPlan = (
   targetSql: string,
   normalizedRegex: { pattern: string, flags: string },
@@ -1840,6 +1916,34 @@ const getRegexMatchPlan = (
       requiresResidual: boolean,
     }
   | null => {
+  const leadingLiteralSetInfo = getRegexLeadingLiteralSetInfo(
+    normalizedRegex.pattern,
+    normalizedRegex.flags
+  );
+  if (leadingLiteralSetInfo) {
+    let expression;
+    if (leadingLiteralSetInfo.matchMode === 'exact') {
+      expression = getSQLiteExactSetRegexExpression(
+        targetSql,
+        leadingLiteralSetInfo.literals,
+        leadingLiteralSetInfo.caseMode,
+        options
+      );
+    } else {
+      expression = getSQLitePrefixSetRegexExpression(
+        targetSql,
+        leadingLiteralSetInfo.literals,
+        leadingLiteralSetInfo.caseMode,
+        options
+      );
+    }
+
+    return {
+      ...expression,
+      requiresResidual: leadingLiteralSetInfo.requiresResidual,
+    };
+  }
+
   const simpleRegexMatch = getSimpleRegexMatchExpression(targetSql, normalizedRegex, options);
   if (simpleRegexMatch) {
     return {
@@ -1860,21 +1964,16 @@ const getRegexMatchPlan = (
     return null;
   }
 
-  const textTargetSql =
-    options && options.useRawTextTarget ? targetSql : `CAST(${targetSql} AS TEXT)`;
-
-  if (prefixInfo.mode === 'caseInsensitiveASCII') {
-    return {
-      sql: `${textTargetSql} LIKE ? ESCAPE '\\'`,
-      params: [`${escapeSQLiteLikePattern(prefixInfo.literalPrefix)}%`],
-      requiresResidual: true,
-    };
-  }
+  const prefixExpression = getSQLitePrefixSetRegexExpression(
+    targetSql,
+    [prefixInfo.literalPrefix],
+    prefixInfo.mode,
+    options
+  );
 
   return {
-    sql: `${textTargetSql} GLOB ?`,
-    params: [`${escapeSQLiteGlobPattern(prefixInfo.literalPrefix)}*`],
-    requiresResidual: true,
+    ...prefixExpression,
+    requiresResidual: prefixInfo.requiresResidual,
   };
 };
 
@@ -2287,6 +2386,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
   }
 
   _rawTableName(className: string, dbOverride?: any): string {
+    void dbOverride;
     if (className === '_SCHEMA') {
       return '_SCHEMA';
     }
@@ -3724,23 +3824,25 @@ export class SQLiteStorageAdapter implements StorageAdapter {
       if (authDataProvider) {
         targetSql = `json_extract("authData", '$.${authDataProvider}')`;
       } else if (isDotNotation) {
-        targetSql = dotFieldArrayPath
-          ? dotFieldArrayPath.valueExpression
-          : dotFieldRootExists
-          ? dotFieldPath.valueExpression
-          : 'NULL';
+        if (dotFieldArrayPath) {
+          targetSql = dotFieldArrayPath.valueExpression;
+        } else if (dotFieldRootExists) {
+          targetSql = dotFieldPath.valueExpression;
+        } else {
+          targetSql = 'NULL';
+        }
       } else {
         validateFieldName(normalizedKey);
         const fieldExistsInSchema = doesSQLiteFieldExistInSchema(schemaFields, normalizedKey);
         targetSql = fieldExistsInSchema ? quoteColumnName(normalizedKey) : 'NULL';
       }
 
-      const dotFieldTypeSql =
-        dotFieldArrayPath
-          ? dotFieldArrayPath.typeExpression
-          : dotFieldPath && dotFieldRootExists
-          ? dotFieldPath.typeExpression
-          : null;
+      let dotFieldTypeSql = null;
+      if (dotFieldArrayPath) {
+        dotFieldTypeSql = dotFieldArrayPath.typeExpression;
+      } else if (dotFieldPath && dotFieldRootExists) {
+        dotFieldTypeSql = dotFieldPath.typeExpression;
+      }
       const usesCaseInsensitiveComparison =
         caseInsensitive &&
         !authDataProvider &&
@@ -3761,14 +3863,14 @@ export class SQLiteStorageAdapter implements StorageAdapter {
         !isArrayField &&
         targetSql !== 'NULL' &&
         isLowerableRegexTextColumn(schemaFields, normalizedKey);
-      const indexedArrayElementTableName =
-        isArrayField || dotFieldArraySourceSql
-          ? this._getQuotedIndexedArrayElementTableName(
-              className,
-              schemaFields,
-              isArrayField ? normalizedKey : key
-            )
-          : null;
+      let indexedArrayElementTableName = null;
+      if (isArrayField || dotFieldArraySourceSql) {
+        indexedArrayElementTableName = this._getQuotedIndexedArrayElementTableName(
+          className,
+          schemaFields,
+          isArrayField ? normalizedKey : key
+        );
+      }
 
       if (val === null || val === undefined) {
         if (dotFieldArraySourceSql) {
@@ -5368,13 +5470,13 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     }
 
     const compiled = this._compileAggregateExpression(context, expression);
-    const fieldType =
-      compiled.fieldType && compiled.fieldType.nativePointer
-        ? {
-            ...compiled.fieldType,
-            aggregateGroupPointer: true,
-          }
-        : compiled.fieldType;
+    let fieldType = compiled.fieldType;
+    if (fieldType && fieldType.nativePointer) {
+      fieldType = {
+        ...fieldType,
+        aggregateGroupPointer: true,
+      };
+    }
     return {
       sql: compiled.sql,
       params: compiled.params,
@@ -5622,19 +5724,21 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     selectParts.push(`json_each.value AS ${quoteColumnName(fieldName)}`);
 
     const currentField = context.schema.fields[fieldName];
+    let nextFieldDefinition = { type: 'Object' };
+    if (currentField && currentField.aggregateLookup) {
+      nextFieldDefinition = {
+        type: 'Object',
+        aggregateLookup: true,
+        lookupSchema: currentField.lookupSchema,
+        targetClass: currentField.targetClass,
+      };
+    }
+
     const nextSchema = {
       className: context.className,
       fields: {
         ...context.schema.fields,
-        [fieldName]:
-          currentField && currentField.aggregateLookup
-            ? {
-                type: 'Object',
-                aggregateLookup: true,
-                lookupSchema: currentField.lookupSchema,
-                targetClass: currentField.targetClass,
-              }
-            : { type: 'Object' },
+        [fieldName]: nextFieldDefinition,
       },
     };
 
@@ -6446,21 +6550,24 @@ export class SQLiteStorageAdapter implements StorageAdapter {
       schema: { fields: {} },
     };
     const schemaFields = (storedSchema.schema && storedSchema.schema.fields) || {};
-    const normalizedIndexes = Array.isArray(indexes)
-      ? indexes.map(index => ({
-          name: index.name,
-          key: index.key,
-          unique: Boolean(index.unique),
-          sparse: Boolean(index.sparse),
-          skipDatabaseCreation: Boolean(index.skipDatabaseCreation),
-        }))
-      : Object.keys(indexes).map(name => ({
-          name,
-          key: indexes[name],
-          unique: false,
-          sparse: false,
-          skipDatabaseCreation: false,
-        }));
+    let normalizedIndexes;
+    if (Array.isArray(indexes)) {
+      normalizedIndexes = indexes.map(index => ({
+        name: index.name,
+        key: index.key,
+        unique: Boolean(index.unique),
+        sparse: Boolean(index.sparse),
+        skipDatabaseCreation: Boolean(index.skipDatabaseCreation),
+      }));
+    } else {
+      normalizedIndexes = Object.keys(indexes).map(name => ({
+        name,
+        key: indexes[name],
+        unique: false,
+        sparse: false,
+        skipDatabaseCreation: false,
+      }));
+    }
 
     const tableName = this._tableName(className);
     const columns = new Set(this._getTableColumns(className, conn));
