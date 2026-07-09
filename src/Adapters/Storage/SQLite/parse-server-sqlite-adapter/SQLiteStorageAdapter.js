@@ -2495,7 +2495,7 @@ class SQLiteStorageAdapter {
     }
     const deletedColumnNames = fieldNames.filter(fieldName => !relationalFieldNames.has(fieldName));
     for (const fieldName of deletedColumnNames) {
-      this._dropArrayElementIndexArtifactsForField(className, fieldName, schema.fields || {});
+      this._dropArrayElementIndexArtifactsForField(className, fieldName, schemaObj.fields || {});
       this._dropFTS5ArtifactsForField(className, fieldName);
     }
     if (deletedColumnNames.length > 0) {
