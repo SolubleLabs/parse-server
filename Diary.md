@@ -1801,3 +1801,16 @@
   - `PARSE_SERVER_TEST_DB=sqlite PARSE_SERVER_TEST_DATABASE_URI=sqlite://:memory: TESTING=1 npx jasmine spec/SQLiteStorageAdapter.spec.js`
   - `npx eslint src/Adapters/Storage/SQLite/SQLiteStorageAdapter.js spec/SQLiteStorageAdapter.spec.js --flag unstable_config_lookup_from_file`
   - result: `68 specs, 0 failures`
+
+- the latest four cited regex-correctness concerns were already fixed and covered by specs:
+    - ungrouped top-level alternation underfiltering
+    - missing residual regex on non-indexed arrays / dotted array paths
+    - JavaScript `$` newline semantics
+    - rejection of stateful `g` / `y` flags
+  - implemented the remaining worthwhile suggestion only: a small LRU cache for pure regex planner facts in `src/Adapters/Storage/SQLite/SQLiteUtils.js`
+  - cache scope intentionally stays at pattern-analysis facts (`getRegexLeadingLiteralSetInfo`, `getRegexPrefixPrefilterInfo`), not SQL fragments, so it remains target-agnostic and low-risk
+- Revalidated with:
+  - `npx eslint src/Adapters/Storage/SQLite/SQLiteUtils.js src/Adapters/Storage/SQLite/SQLiteStorageAdapter.js spec/SQLiteStorageAdapter.spec.js --flag unstable_config_lookup_from_file`
+  - `npm run build`
+  - `PARSE_SERVER_TEST_DB=sqlite PARSE_SERVER_TEST_DATABASE_URI=sqlite://:memory: TESTING=1 npx jasmine spec/SQLiteStorageAdapter.spec.js`
+  - result: `68 specs, 0 failures`

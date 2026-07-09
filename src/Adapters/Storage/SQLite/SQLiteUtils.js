@@ -6,6 +6,10 @@ const regexLiteralCharacterPattern = /[0-9 ]|\p{L}/u;
 const allowedSQLiteRegexFlags = new Set(['i', 'm', 's', 'u', 'x']);
 // eslint-disable-next-line no-control-regex
 const asciiOnlyStringPattern = /^[\u0000-\u007F]*$/;
+const maxRegexPlannerCacheSize = 512;
+const missingRegexPlannerInfo = Symbol('missingRegexPlannerInfo');
+const regexLeadingLiteralSetInfoCache = new Map();
+const regexPrefixPrefilterInfoCache = new Map();
 
 // Keep object-key order deterministic so equality-sensitive array operations
 // behave consistently across logically equivalent payloads.
@@ -26,6 +30,46 @@ const isNumericArrayIndexComponent = (value: any): boolean =>
   typeof value === 'string' && numericArrayIndexPattern.test(value);
 
 const isASCIIOnlyString = (value: string): boolean => asciiOnlyStringPattern.test(value);
+
+const getRegexPlannerCacheKey = (pattern: string, flags?: string): string =>
+  `${flags || ''}\u0000${pattern}`;
+
+const getCachedRegexPlannerInfo = (cache: Map<string, any>, key: string): any => {
+  if (!cache.has(key)) {
+    return undefined;
+  }
+
+  const cachedInfo = cache.get(key);
+  cache.delete(key);
+  cache.set(key, cachedInfo);
+  return cachedInfo === missingRegexPlannerInfo ? null : cachedInfo;
+};
+
+const setCachedRegexPlannerInfo = (cache: Map<string, any>, key: string, info: any): any => {
+  if (cache.size >= maxRegexPlannerCacheSize) {
+    const oldestKey = cache.keys().next().value;
+    if (oldestKey !== undefined) {
+      cache.delete(oldestKey);
+    }
+  }
+  cache.set(key, info == null ? missingRegexPlannerInfo : info);
+  return info;
+};
+
+const cloneRegexPlannerInfo = (info: any): any => {
+  if (info == null) {
+    return info;
+  }
+
+  if (Array.isArray(info.literals)) {
+    return {
+      ...info,
+      literals: info.literals.slice(),
+    };
+  }
+
+  return { ...info };
+};
 
 const getDistinctRegexFlags = (flags?: string): Array<string> =>
   Array.from(new Set((flags || '').split('').filter(Boolean)));
@@ -958,7 +1002,7 @@ const parseRegexFiniteSegment = (
   };
 };
 
-const getRegexLeadingLiteralSetInfo = (
+const computeRegexLeadingLiteralSetInfo = (
   pattern: string,
   flags?: string
 ):
@@ -1043,7 +1087,31 @@ const getRegexLeadingLiteralSetInfo = (
   };
 };
 
-const getRegexPrefixPrefilterInfo = (
+const getRegexLeadingLiteralSetInfo = (
+  pattern: string,
+  flags?: string
+):
+  | {
+      literals: Array<string>,
+      matchMode: 'exact' | 'prefix',
+      caseMode: 'caseSensitive' | 'caseInsensitiveASCII' | 'caseInsensitiveUncased',
+      requiresResidual: boolean,
+    }
+  | null => {
+  const cacheKey = getRegexPlannerCacheKey(pattern, flags);
+  const cachedInfo = getCachedRegexPlannerInfo(regexLeadingLiteralSetInfoCache, cacheKey);
+  if (cachedInfo !== undefined) {
+    return cloneRegexPlannerInfo(cachedInfo);
+  }
+
+  return setCachedRegexPlannerInfo(
+    regexLeadingLiteralSetInfoCache,
+    cacheKey,
+    cloneRegexPlannerInfo(computeRegexLeadingLiteralSetInfo(pattern, flags))
+  );
+};
+
+const computeRegexPrefixPrefilterInfo = (
   pattern: string,
   flags?: string
 ):
@@ -1118,6 +1186,29 @@ const getRegexPrefixPrefilterInfo = (
     mode: 'caseInsensitiveUncased',
     requiresResidual,
   };
+};
+
+const getRegexPrefixPrefilterInfo = (
+  pattern: string,
+  flags?: string
+):
+  | {
+      literalPrefix: string,
+      mode: 'caseSensitive' | 'caseInsensitiveASCII' | 'caseInsensitiveUncased',
+      requiresResidual: boolean,
+    }
+  | null => {
+  const cacheKey = getRegexPlannerCacheKey(pattern, flags);
+  const cachedInfo = getCachedRegexPlannerInfo(regexPrefixPrefilterInfoCache, cacheKey);
+  if (cachedInfo !== undefined) {
+    return cloneRegexPlannerInfo(cachedInfo);
+  }
+
+  return setCachedRegexPlannerInfo(
+    regexPrefixPrefilterInfoCache,
+    cacheKey,
+    cloneRegexPlannerInfo(computeRegexPrefixPrefilterInfo(pattern, flags))
+  );
 };
 
 module.exports = {
