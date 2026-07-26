@@ -1878,7 +1878,8 @@ const getNestedDotArrayTraversalAnyMatchExpression = (
     rootExpression,
     components,
     fieldName,
-    valueExpression => getJsonValueAnyMatchExpression(valueExpression, comparisonValues)
+    (valueExpression, typeExpression) =>
+      getTypedValueAnyMatchExpression(valueExpression, typeExpression, comparisonValues)
   );
 
 const getNestedDotArrayTraversalRegexMatchExpression = (

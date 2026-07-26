@@ -249,10 +249,37 @@ describe_only_db('sqlite')('SQLiteStorageAdapter live Parse query integration', 
     const containedInResults = await containedInQuery.find({ useMasterKey: true });
     const notContainedInResults = await notContainedInQuery.find({ useMasterKey: true });
 
-    expect(containedInResults.map(result => result.id).sort()).toEqual([
-      first.id,
-      second.id,
-    ]);
+    expect(containedInResults.map(result => result.id).sort()).toEqual(
+      [first.id, second.id].sort()
+    );
+    expect(notContainedInResults.map(result => result.id)).toEqual([second.id]);
+  });
+
+  it('supports Parse.Query set operators through arrays nested below object roots with array-valued terminals', async () => {
+    const first = new Parse.Object('Observation');
+    first.set('code', {
+      coding: [{ aliases: ['weight', 'wt'] }],
+    });
+    await first.save(null, { useMasterKey: true });
+
+    const second = new Parse.Object('Observation');
+    second.set('code', {
+      coding: [{ aliases: ['height', 'ht'] }],
+    });
+    await second.save(null, { useMasterKey: true });
+
+    const containedInQuery = new Parse.Query('Observation');
+    containedInQuery.containedIn('code.coding.aliases', ['wt']);
+    containedInQuery.ascending('objectId');
+
+    const notContainedInQuery = new Parse.Query('Observation');
+    notContainedInQuery.notContainedIn('code.coding.aliases', ['wt']);
+    notContainedInQuery.ascending('objectId');
+
+    const containedInResults = await containedInQuery.find({ useMasterKey: true });
+    const notContainedInResults = await notContainedInQuery.find({ useMasterKey: true });
+
+    expect(containedInResults.map(result => result.id)).toEqual([first.id]);
     expect(notContainedInResults.map(result => result.id)).toEqual([second.id]);
   });
 

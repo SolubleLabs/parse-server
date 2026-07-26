@@ -1386,7 +1386,7 @@ const getTypedValueAnyMatchExpression = (targetSql, typeSql, comparisonValues) =
     params: [...arrayMatch.params, ...scalarMatch.params]
   };
 };
-const getNestedDotArrayTraversalAnyMatchExpression = (rootExpression, components, fieldName, comparisonValues) => getNestedDotArrayTraversalExpression(rootExpression, components, fieldName, valueExpression => getJsonValueAnyMatchExpression(valueExpression, comparisonValues));
+const getNestedDotArrayTraversalAnyMatchExpression = (rootExpression, components, fieldName, comparisonValues) => getNestedDotArrayTraversalExpression(rootExpression, components, fieldName, (valueExpression, typeExpression) => getTypedValueAnyMatchExpression(valueExpression, typeExpression, comparisonValues));
 const getNestedDotArrayTraversalRegexMatchExpression = (rootExpression, components, fieldName, normalizedRegex) => getNestedDotArrayTraversalExpression(rootExpression, components, fieldName, valueExpression => {
   const regexMatchPlan = getRegexMatchPlan(valueExpression, normalizedRegex, {
     allowPrefixPrefilter: true
