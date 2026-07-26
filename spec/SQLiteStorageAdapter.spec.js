@@ -2038,6 +2038,64 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
     expect(results[0].a).toEqual({ foo: ['b', 'c'] });
   });
 
+  it('matches $exists on dotted object subfields', async () => {
+    const schema = {
+      className: 'VitalSignsObservation',
+      fields: {
+        objectId: { type: 'String' },
+        value: { type: 'Object' },
+      },
+    };
+    await adapter.createClass('VitalSignsObservation', schema);
+    await adapter.createObject('VitalSignsObservation', schema, {
+      objectId: 'vital1',
+      value: { weight: 72.5 },
+    });
+    await adapter.createObject('VitalSignsObservation', schema, {
+      objectId: 'vital2',
+      value: { temperature: 37.1 },
+    });
+
+    const results = await adapter.find('VitalSignsObservation', schema, {
+      'value.weight': { $exists: true },
+    });
+
+    expect(results.map(result => result.objectId)).toEqual(['vital1']);
+  });
+
+  it('matches dotted equality through arrays nested below object roots', async () => {
+    const schema = {
+      className: 'NestedObjectArrayDotQueryClass',
+      fields: {
+        objectId: { type: 'String' },
+        code: { type: 'Object' },
+      },
+    };
+    await adapter.createClass('NestedObjectArrayDotQueryClass', schema);
+    await adapter.createObject('NestedObjectArrayDotQueryClass', schema, {
+      objectId: 'nested-array-dot-1',
+      code: {
+        coding: [{ code: '29463-7' }],
+      },
+    });
+    await adapter.createObject('NestedObjectArrayDotQueryClass', schema, {
+      objectId: 'nested-array-dot-2',
+      code: {
+        coding: [{ code: '8302-2' }],
+      },
+    });
+
+    const where = adapter._buildWhereClause('NestedObjectArrayDotQueryClass', schema, {
+      'code.coding.code': '29463-7',
+    });
+    const results = await adapter.find('NestedObjectArrayDotQueryClass', schema, {
+      'code.coding.code': '29463-7',
+    });
+
+    expect(where.sql.includes('json_each')).toBeTrue();
+    expect(results.map(result => result.objectId)).toEqual(['nested-array-dot-1']);
+  });
+
   it('infers semantic field types for root update ops', async () => {
     const schema = {
       className: 'RootUpdateOpInferenceClass',

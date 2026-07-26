@@ -1655,6 +1655,111 @@ const getArrayRootDotExistsExpression = (
   params: [],
 });
 
+/**
+ * Dot notation should keep walking when one intermediate JSON node turns out
+ * to be an array at runtime, e.g. `code.coding.code` over
+ * `{ code: { coding: [{ code: '29463-7' }] } }`.
+ *
+ * The normal `json_extract(..., '$.coding.code')` path misses those rows
+ * because SQLite does not auto-expand arrays inside object traversals. This
+ * recursive CTE keeps the current component index unchanged while flattening
+ * arrays, then resumes normal object/index traversal once it reaches a
+ * non-array value again.
+ */
+const getNestedDotArrayTraversalValueMatchExpression = (
+  rootExpression: string,
+  components: Array<string>,
+  fieldName: string,
+  comparisonValue: any
+): { sql: string, params: Array<any> } => {
+  const cteName = '__dot_walk';
+  const valueColumn = '__dot_value';
+  const typeColumn = '__dot_type';
+  const depthColumn = '__dot_depth';
+  const usedArrayColumn = '__dot_used_array';
+  const recursiveTerms = [];
+  const flattenDepthConditions = [];
+
+  for (let index = 0; index < components.length; index += 1) {
+    if (!isNumericArrayIndexComponent(components[index])) {
+      flattenDepthConditions.push(`${cteName}.${depthColumn} = ${index}`);
+    }
+  }
+
+  if (flattenDepthConditions.length > 0) {
+    recursiveTerms.push(
+      `SELECT ` +
+        `array_item.value AS ${valueColumn}, ` +
+        `array_item.type AS ${typeColumn}, ` +
+        `${cteName}.${depthColumn} AS ${depthColumn}, ` +
+        `1 AS ${usedArrayColumn} ` +
+        `FROM ${cteName}, json_each(${cteName}.${valueColumn}) AS array_item ` +
+        `WHERE ${cteName}.${typeColumn} = 'array' ` +
+        `AND ${cteName}.${depthColumn} < ${components.length} ` +
+        `AND (${flattenDepthConditions.join(' OR ')})`
+    );
+  }
+
+  for (let index = 0; index < components.length; index += 1) {
+    const component = components[index];
+    if (isNumericArrayIndexComponent(component)) {
+      const arrayPath = `$[${component}]`;
+      const objectPath = `$."${component}"`;
+      recursiveTerms.push(
+        `SELECT ` +
+          `(CASE ${cteName}.${typeColumn} ` +
+          `WHEN 'array' THEN json_extract(${cteName}.${valueColumn}, '${arrayPath}') ` +
+          `WHEN 'object' THEN json_extract(${cteName}.${valueColumn}, '${objectPath}') ` +
+          `ELSE NULL END) AS ${valueColumn}, ` +
+          `(CASE ${cteName}.${typeColumn} ` +
+          `WHEN 'array' THEN json_type(${cteName}.${valueColumn}, '${arrayPath}') ` +
+          `WHEN 'object' THEN json_type(${cteName}.${valueColumn}, '${objectPath}') ` +
+          `ELSE NULL END) AS ${typeColumn}, ` +
+          `${index + 1} AS ${depthColumn}, ` +
+          `${cteName}.${usedArrayColumn} AS ${usedArrayColumn} ` +
+          `FROM ${cteName} ` +
+          `WHERE ${cteName}.${depthColumn} = ${index} ` +
+          `AND ${cteName}.${typeColumn} IN ('array', 'object')`
+      );
+      continue;
+    }
+
+    validateObjectPathComponent(component, fieldName);
+    const objectPath = `$."${component}"`;
+    recursiveTerms.push(
+      `SELECT ` +
+        `json_extract(${cteName}.${valueColumn}, '${objectPath}') AS ${valueColumn}, ` +
+        `json_type(${cteName}.${valueColumn}, '${objectPath}') AS ${typeColumn}, ` +
+        `${index + 1} AS ${depthColumn}, ` +
+        `${cteName}.${usedArrayColumn} AS ${usedArrayColumn} ` +
+        `FROM ${cteName} ` +
+        `WHERE ${cteName}.${depthColumn} = ${index} ` +
+        `AND ${cteName}.${typeColumn} = 'object'`
+    );
+  }
+
+  const valueMatch = getJsonValueMatchExpression(`${cteName}.${valueColumn}`, comparisonValue);
+  return {
+    sql:
+      `EXISTS (` +
+      `WITH RECURSIVE ${cteName}(${valueColumn}, ${typeColumn}, ${depthColumn}, ${usedArrayColumn}) AS (` +
+      `SELECT ` +
+      `${rootExpression} AS ${valueColumn}, ` +
+      `${getJsonRootTypeExpression(rootExpression)} AS ${typeColumn}, ` +
+      `0 AS ${depthColumn}, ` +
+      `0 AS ${usedArrayColumn} ` +
+      `UNION ALL ` +
+      recursiveTerms.join(' UNION ALL ') +
+      `) ` +
+      `SELECT 1 FROM ${cteName} ` +
+      `WHERE ${cteName}.${depthColumn} = ${components.length} ` +
+      `AND ${cteName}.${usedArrayColumn} = 1 ` +
+      `AND ${valueMatch.sql}` +
+      `)`,
+    params: valueMatch.params,
+  };
+};
+
 const isGeoPointValue = (value: any) =>
   value &&
   typeof value === 'object' &&
@@ -4033,6 +4138,16 @@ export class SQLiteStorageAdapter implements StorageAdapter {
       const dotFieldArrayPath = dotFieldUsesRootArrayTraversal
         ? buildArrayRootDotFieldPath(key)
         : null;
+      const hasNestedDotPathSegmentsBeyondOneLevel =
+        dotFieldPath && dotFieldPath.components.length > 1;
+      const hasExplicitNumericDotPathSegment =
+        dotFieldPath && dotFieldPath.components.some(isNumericArrayIndexComponent);
+      const shouldUseNestedDotArrayTraversalFallback =
+        dotFieldPath &&
+        dotFieldRootExists &&
+        !dotFieldArrayPath &&
+        hasNestedDotPathSegmentsBeyondOneLevel &&
+        !hasExplicitNumericDotPathSegment;
       const dotFieldArraySourceSql = dotFieldArrayPath
         ? quoteColumnName(dotFieldArrayPath.rootFieldName)
         : null;
@@ -4158,6 +4273,18 @@ export class SQLiteStorageAdapter implements StorageAdapter {
                 conditions.push(`(${valueMatch.sql})`);
                 params.push(...valueMatch.params);
               }
+            } else if (shouldUseNestedDotArrayTraversalFallback) {
+              const directValueMatch = getScalarValueMatchExpression(targetSql, opVal);
+              const nestedArrayValueMatch = getNestedDotArrayTraversalValueMatchExpression(
+                quoteColumnName(dotFieldPath.rootFieldName),
+                dotFieldPath.components,
+                key,
+                opVal
+              );
+              conditions.push(
+                `((${directValueMatch.sql}) OR ${nestedArrayValueMatch.sql})`
+              );
+              params.push(...directValueMatch.params, ...nestedArrayValueMatch.params);
             } else if (usesCaseInsensitiveComparison && typeof opVal === 'string') {
               conditions.push(`(LOWER(${targetSql}) = LOWER(?))`);
               params.push(opVal);
@@ -4795,6 +4922,16 @@ export class SQLiteStorageAdapter implements StorageAdapter {
             conditions.push(valueMatch.sql);
             params.push(...valueMatch.params);
           }
+        } else if (shouldUseNestedDotArrayTraversalFallback) {
+          const directValueMatch = getScalarValueMatchExpression(targetSql, val);
+          const nestedArrayValueMatch = getNestedDotArrayTraversalValueMatchExpression(
+            quoteColumnName(dotFieldPath.rootFieldName),
+            dotFieldPath.components,
+            key,
+            val
+          );
+          conditions.push(`((${directValueMatch.sql}) OR ${nestedArrayValueMatch.sql})`);
+          params.push(...directValueMatch.params, ...nestedArrayValueMatch.params);
         } else if (usesCaseInsensitiveComparison && typeof val === 'string') {
           conditions.push(`(LOWER(${targetSql}) = LOWER(?))`);
           params.push(val);

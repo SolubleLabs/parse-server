@@ -1825,3 +1825,18 @@
   - `npm run test:sqlite:testonly`
   - result: `Executed 4175 of 4474 specs INCOMPLETE (299 PENDING) in 4 mins 38 secs`
   - no failures; the incomplete count is the repo’s normal pending / `xit` / db-specific skipped coverage, not a SQLite regression
+
+## 2026-07-26
+
+### Nested JSON Query Follow-Up
+- Verified the reported `exists("value.weight")` concern against the current adapter with live Parse integration tests, not just adapter-unit coverage.
+- Added exact SQLite live repros for:
+  - `exists("value.weight")`
+  - `exists("subject") + exists("value.weight") + equalTo("subject") + ascending("time") + addAscending("objectId")`
+  - `exists("subject") + matchesQuery("subject", ClientInfo.exists("uid")) + exists("value.weight")`
+- All of those passed on the current adapter, so the old app-side `value.weight` workaround comment is stale relative to this repo state.
+- The real adapter query bug was the nested object-root array traversal case like `code.coding.code == "29463-7"` over `{ code: { coding: [{ code: "29463-7" }] } }`.
+- Fixed that in the adapter with a recursive SQL fallback that only activates for deep dot paths that are not already covered by the root-array fast path or explicit numeric index traversal.
+- Coverage added in:
+  - `spec/SQLiteStorageAdapter.spec.js`
+  - `spec/SQLiteStorageAdapterQueryIntegration.spec.js`
