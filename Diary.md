@@ -1840,3 +1840,25 @@
 - Coverage added in:
   - `spec/SQLiteStorageAdapter.spec.js`
   - `spec/SQLiteStorageAdapterQueryIntegration.spec.js`
+### Nested Object-Root Array Operator Follow-Up
+- Verified the later audit was correct: the recursive nested-array fallback initially only covered equality.
+- Fixed the same object-root nested-array gap for:
+  - implicit `field: null`
+  - `$eq: null`
+  - `$ne`
+  - `$exists`
+- Added red coverage for nested object-root array:
+  - adapter-level `$ne`
+  - adapter-level `$exists`
+  - live Parse `notEqualTo(...)`
+  - live Parse `exists(...)`
+- Extended the same fallback further for:
+  - `$lt`
+  - `$lte`
+  - `$gt`
+  - `$gte`
+  - `$in`
+  - `$nin`
+  - `$regex`
+- Added red coverage for those operators at both adapter level and live Parse integration level.
+- Rebuilt `lib/` and refreshed the standalone adapter package copy after the fix.

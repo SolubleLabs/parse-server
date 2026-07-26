@@ -2096,6 +2096,192 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
     expect(results.map(result => result.objectId)).toEqual(['nested-array-dot-1']);
   });
 
+  it('matches dotted not-equality through arrays nested below object roots', async () => {
+    const schema = {
+      className: 'NestedObjectArrayDotNotEqualClass',
+      fields: {
+        objectId: { type: 'String' },
+        code: { type: 'Object' },
+      },
+    };
+    await adapter.createClass('NestedObjectArrayDotNotEqualClass', schema);
+    await adapter.createObject('NestedObjectArrayDotNotEqualClass', schema, {
+      objectId: 'nested-array-ne-1',
+      code: {
+        coding: [{ code: '29463-7' }],
+      },
+    });
+    await adapter.createObject('NestedObjectArrayDotNotEqualClass', schema, {
+      objectId: 'nested-array-ne-2',
+      code: {
+        coding: [{ code: '8302-2' }],
+      },
+    });
+
+    const results = await adapter.find('NestedObjectArrayDotNotEqualClass', schema, {
+      'code.coding.code': { $ne: '29463-7' },
+    });
+
+    expect(results.map(result => result.objectId)).toEqual(['nested-array-ne-2']);
+  });
+
+  it('matches dotted $exists through arrays nested below object roots', async () => {
+    const schema = {
+      className: 'NestedObjectArrayDotExistsClass',
+      fields: {
+        objectId: { type: 'String' },
+        code: { type: 'Object' },
+      },
+    };
+    await adapter.createClass('NestedObjectArrayDotExistsClass', schema);
+    await adapter.createObject('NestedObjectArrayDotExistsClass', schema, {
+      objectId: 'nested-array-exists-1',
+      code: {
+        coding: [{ code: '29463-7' }],
+      },
+    });
+    await adapter.createObject('NestedObjectArrayDotExistsClass', schema, {
+      objectId: 'nested-array-exists-2',
+      code: {
+        coding: [{ display: 'Weight' }],
+      },
+    });
+
+    const existingResults = await adapter.find('NestedObjectArrayDotExistsClass', schema, {
+      'code.coding.code': { $exists: true },
+    });
+    const missingResults = await adapter.find('NestedObjectArrayDotExistsClass', schema, {
+      'code.coding.code': { $exists: false },
+    });
+
+    expect(existingResults.map(result => result.objectId)).toEqual(['nested-array-exists-1']);
+    expect(missingResults.map(result => result.objectId)).toEqual(['nested-array-exists-2']);
+  });
+
+  it('matches dotted range operators through arrays nested below object roots', async () => {
+    const schema = {
+      className: 'NestedObjectArrayDotRangeClass',
+      fields: {
+        objectId: { type: 'String' },
+        code: { type: 'Object' },
+      },
+    };
+    await adapter.createClass('NestedObjectArrayDotRangeClass', schema);
+    await adapter.createObject('NestedObjectArrayDotRangeClass', schema, {
+      objectId: 'nested-array-range-1',
+      code: {
+        coding: [{ rank: 10 }],
+      },
+    });
+    await adapter.createObject('NestedObjectArrayDotRangeClass', schema, {
+      objectId: 'nested-array-range-2',
+      code: {
+        coding: [{ rank: 20 }],
+      },
+    });
+    await adapter.createObject('NestedObjectArrayDotRangeClass', schema, {
+      objectId: 'nested-array-range-3',
+      code: {
+        coding: [{ rank: 30 }],
+      },
+    });
+
+    const lessThanResults = await adapter.find('NestedObjectArrayDotRangeClass', schema, {
+      'code.coding.rank': { $lt: 15 },
+    });
+    const lessThanOrEqualResults = await adapter.find('NestedObjectArrayDotRangeClass', schema, {
+      'code.coding.rank': { $lte: 20 },
+    });
+    const greaterThanResults = await adapter.find('NestedObjectArrayDotRangeClass', schema, {
+      'code.coding.rank': { $gt: 20 },
+    });
+    const greaterThanOrEqualResults = await adapter.find('NestedObjectArrayDotRangeClass', schema, {
+      'code.coding.rank': { $gte: 20 },
+    });
+
+    expect(lessThanResults.map(result => result.objectId)).toEqual(['nested-array-range-1']);
+    expect(lessThanOrEqualResults.map(result => result.objectId).sort()).toEqual([
+      'nested-array-range-1',
+      'nested-array-range-2',
+    ]);
+    expect(greaterThanResults.map(result => result.objectId)).toEqual(['nested-array-range-3']);
+    expect(greaterThanOrEqualResults.map(result => result.objectId).sort()).toEqual([
+      'nested-array-range-2',
+      'nested-array-range-3',
+    ]);
+  });
+
+  it('matches dotted set operators through arrays nested below object roots', async () => {
+    const schema = {
+      className: 'NestedObjectArrayDotSetClass',
+      fields: {
+        objectId: { type: 'String' },
+        code: { type: 'Object' },
+      },
+    };
+    await adapter.createClass('NestedObjectArrayDotSetClass', schema);
+    await adapter.createObject('NestedObjectArrayDotSetClass', schema, {
+      objectId: 'nested-array-set-1',
+      code: {
+        coding: [{ code: '29463-7' }],
+      },
+    });
+    await adapter.createObject('NestedObjectArrayDotSetClass', schema, {
+      objectId: 'nested-array-set-2',
+      code: {
+        coding: [{ code: '8302-2' }],
+      },
+    });
+    await adapter.createObject('NestedObjectArrayDotSetClass', schema, {
+      objectId: 'nested-array-set-3',
+      code: {
+        coding: [{ code: '8867-4' }],
+      },
+    });
+
+    const inResults = await adapter.find('NestedObjectArrayDotSetClass', schema, {
+      'code.coding.code': { $in: ['29463-7', '8302-2'] },
+    });
+    const ninResults = await adapter.find('NestedObjectArrayDotSetClass', schema, {
+      'code.coding.code': { $nin: ['29463-7', '8867-4'] },
+    });
+
+    expect(inResults.map(result => result.objectId).sort()).toEqual([
+      'nested-array-set-1',
+      'nested-array-set-2',
+    ]);
+    expect(ninResults.map(result => result.objectId)).toEqual(['nested-array-set-2']);
+  });
+
+  it('matches dotted regex through arrays nested below object roots', async () => {
+    const schema = {
+      className: 'NestedObjectArrayDotRegexClass',
+      fields: {
+        objectId: { type: 'String' },
+        code: { type: 'Object' },
+      },
+    };
+    await adapter.createClass('NestedObjectArrayDotRegexClass', schema);
+    await adapter.createObject('NestedObjectArrayDotRegexClass', schema, {
+      objectId: 'nested-array-regex-1',
+      code: {
+        coding: [{ code: '29463-7' }],
+      },
+    });
+    await adapter.createObject('NestedObjectArrayDotRegexClass', schema, {
+      objectId: 'nested-array-regex-2',
+      code: {
+        coding: [{ code: '8302-2' }],
+      },
+    });
+
+    const results = await adapter.find('NestedObjectArrayDotRegexClass', schema, {
+      'code.coding.code': { $regex: '^29463', $options: 'i' },
+    });
+
+    expect(results.map(result => result.objectId)).toEqual(['nested-array-regex-1']);
+  });
+
   it('infers semantic field types for root update ops', async () => {
     const schema = {
       className: 'RootUpdateOpInferenceClass',

@@ -123,6 +123,161 @@ describe_only_db('sqlite')('SQLiteStorageAdapter live Parse query integration', 
     expect(results.map(result => result.id)).toEqual([matching.id]);
   });
 
+  it('supports Parse.Query.notEqualTo through arrays nested below object roots', async () => {
+    const matching = new Parse.Object('Observation');
+    matching.set('code', {
+      coding: [{ code: '8302-2' }],
+    });
+    await matching.save(null, { useMasterKey: true });
+
+    const excluded = new Parse.Object('Observation');
+    excluded.set('code', {
+      coding: [{ code: '29463-7' }],
+    });
+    await excluded.save(null, { useMasterKey: true });
+
+    const query = new Parse.Query('Observation');
+    query.notEqualTo('code.coding.code', '29463-7');
+    query.ascending('objectId');
+
+    const results = await query.find({ useMasterKey: true });
+
+    expect(results.map(result => result.id)).toEqual([matching.id]);
+  });
+
+  it('supports Parse.Query.exists through arrays nested below object roots', async () => {
+    const matching = new Parse.Object('Observation');
+    matching.set('code', {
+      coding: [{ code: '29463-7' }],
+    });
+    await matching.save(null, { useMasterKey: true });
+
+    const excluded = new Parse.Object('Observation');
+    excluded.set('code', {
+      coding: [{ display: 'Weight' }],
+    });
+    await excluded.save(null, { useMasterKey: true });
+
+    const query = new Parse.Query('Observation');
+    query.exists('code.coding.code');
+    query.ascending('objectId');
+
+    const results = await query.find({ useMasterKey: true });
+
+    expect(results.map(result => result.id)).toEqual([matching.id]);
+  });
+
+  it('supports Parse.Query range operators through arrays nested below object roots', async () => {
+    const low = new Parse.Object('Observation');
+    low.set('code', {
+      coding: [{ rank: 10 }],
+    });
+    await low.save(null, { useMasterKey: true });
+
+    const mid = new Parse.Object('Observation');
+    mid.set('code', {
+      coding: [{ rank: 20 }],
+    });
+    await mid.save(null, { useMasterKey: true });
+
+    const high = new Parse.Object('Observation');
+    high.set('code', {
+      coding: [{ rank: 30 }],
+    });
+    await high.save(null, { useMasterKey: true });
+
+    const lessThanQuery = new Parse.Query('Observation');
+    lessThanQuery.lessThan('code.coding.rank', 15);
+    lessThanQuery.ascending('objectId');
+
+    const lessThanOrEqualQuery = new Parse.Query('Observation');
+    lessThanOrEqualQuery.lessThanOrEqualTo('code.coding.rank', 20);
+    lessThanOrEqualQuery.ascending('objectId');
+
+    const greaterThanQuery = new Parse.Query('Observation');
+    greaterThanQuery.greaterThan('code.coding.rank', 20);
+    greaterThanQuery.ascending('objectId');
+
+    const greaterThanOrEqualQuery = new Parse.Query('Observation');
+    greaterThanOrEqualQuery.greaterThanOrEqualTo('code.coding.rank', 20);
+    greaterThanOrEqualQuery.ascending('objectId');
+
+    const lessThanResults = await lessThanQuery.find({ useMasterKey: true });
+    const lessThanOrEqualResults = await lessThanOrEqualQuery.find({ useMasterKey: true });
+    const greaterThanResults = await greaterThanQuery.find({ useMasterKey: true });
+    const greaterThanOrEqualResults = await greaterThanOrEqualQuery.find({
+      useMasterKey: true,
+    });
+
+    expect(lessThanResults.map(result => result.id)).toEqual([low.id]);
+    expect(lessThanOrEqualResults.map(result => result.id).sort()).toEqual(
+      [low.id, mid.id].sort()
+    );
+    expect(greaterThanResults.map(result => result.id)).toEqual([high.id]);
+    expect(greaterThanOrEqualResults.map(result => result.id).sort()).toEqual(
+      [high.id, mid.id].sort()
+    );
+  });
+
+  it('supports Parse.Query set operators through arrays nested below object roots', async () => {
+    const first = new Parse.Object('Observation');
+    first.set('code', {
+      coding: [{ code: '29463-7' }],
+    });
+    await first.save(null, { useMasterKey: true });
+
+    const second = new Parse.Object('Observation');
+    second.set('code', {
+      coding: [{ code: '8302-2' }],
+    });
+    await second.save(null, { useMasterKey: true });
+
+    const third = new Parse.Object('Observation');
+    third.set('code', {
+      coding: [{ code: '8867-4' }],
+    });
+    await third.save(null, { useMasterKey: true });
+
+    const containedInQuery = new Parse.Query('Observation');
+    containedInQuery.containedIn('code.coding.code', ['29463-7', '8302-2']);
+    containedInQuery.ascending('objectId');
+
+    const notContainedInQuery = new Parse.Query('Observation');
+    notContainedInQuery.notContainedIn('code.coding.code', ['29463-7', '8867-4']);
+    notContainedInQuery.ascending('objectId');
+
+    const containedInResults = await containedInQuery.find({ useMasterKey: true });
+    const notContainedInResults = await notContainedInQuery.find({ useMasterKey: true });
+
+    expect(containedInResults.map(result => result.id).sort()).toEqual([
+      first.id,
+      second.id,
+    ]);
+    expect(notContainedInResults.map(result => result.id)).toEqual([second.id]);
+  });
+
+  it('supports Parse.Query.matches through arrays nested below object roots', async () => {
+    const matching = new Parse.Object('Observation');
+    matching.set('code', {
+      coding: [{ code: '29463-7' }],
+    });
+    await matching.save(null, { useMasterKey: true });
+
+    const excluded = new Parse.Object('Observation');
+    excluded.set('code', {
+      coding: [{ code: '8302-2' }],
+    });
+    await excluded.save(null, { useMasterKey: true });
+
+    const query = new Parse.Query('Observation');
+    query.matches('code.coding.code', /^29463/i);
+    query.ascending('objectId');
+
+    const results = await query.find({ useMasterKey: true });
+
+    expect(results.map(result => result.id)).toEqual([matching.id]);
+  });
+
   it('supports VitalSignsObservation-style exists queries with subject matchesQuery scoping', async () => {
     const allowedPatient = new Parse.Object('ClientInfo');
     allowedPatient.set('uid', 'patient-1');

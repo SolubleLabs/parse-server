@@ -1666,11 +1666,14 @@ const getArrayRootDotExistsExpression = (
  * arrays, then resumes normal object/index traversal once it reaches a
  * non-array value again.
  */
-const getNestedDotArrayTraversalValueMatchExpression = (
+const getNestedDotArrayTraversalExpression = (
   rootExpression: string,
   components: Array<string>,
   fieldName: string,
-  comparisonValue: any
+  terminalMatchBuilder: (
+    valueExpression: string,
+    typeExpression: string
+  ) => { sql: string, params: Array<any> }
 ): { sql: string, params: Array<any> } => {
   const cteName = '__dot_walk';
   const valueColumn = '__dot_value';
@@ -1738,7 +1741,10 @@ const getNestedDotArrayTraversalValueMatchExpression = (
     );
   }
 
-  const valueMatch = getJsonValueMatchExpression(`${cteName}.${valueColumn}`, comparisonValue);
+  const terminalMatch = terminalMatchBuilder(
+    `${cteName}.${valueColumn}`,
+    `${cteName}.${typeColumn}`
+  );
   return {
     sql:
       `EXISTS (` +
@@ -1754,11 +1760,71 @@ const getNestedDotArrayTraversalValueMatchExpression = (
       `SELECT 1 FROM ${cteName} ` +
       `WHERE ${cteName}.${depthColumn} = ${components.length} ` +
       `AND ${cteName}.${usedArrayColumn} = 1 ` +
-      `AND ${valueMatch.sql}` +
+      `AND ${terminalMatch.sql}` +
       `)`,
-    params: valueMatch.params,
+    params: terminalMatch.params,
   };
 };
+
+const getNestedDotArrayTraversalValueMatchExpression = (
+  rootExpression: string,
+  components: Array<string>,
+  fieldName: string,
+  comparisonValue: any
+): { sql: string, params: Array<any> } =>
+  getNestedDotArrayTraversalExpression(
+    rootExpression,
+    components,
+    fieldName,
+    valueExpression => getJsonValueMatchExpression(valueExpression, comparisonValue)
+  );
+
+const getNestedDotArrayTraversalExistsExpression = (
+  rootExpression: string,
+  components: Array<string>,
+  fieldName: string
+): { sql: string, params: Array<any> } =>
+  getNestedDotArrayTraversalExpression(
+    rootExpression,
+    components,
+    fieldName,
+    (_valueExpression, typeExpression) => ({
+      sql: `${typeExpression} IS NOT NULL`,
+      params: [],
+    })
+  );
+
+const getNestedDotArrayTraversalNonNullValueExpression = (
+  rootExpression: string,
+  components: Array<string>,
+  fieldName: string
+): { sql: string, params: Array<any> } =>
+  getNestedDotArrayTraversalExpression(
+    rootExpression,
+    components,
+    fieldName,
+    valueExpression => ({
+      sql: `${valueExpression} IS NOT NULL`,
+      params: [],
+    })
+  );
+
+const getNestedDotArrayTraversalRangeMatchExpression = (
+  rootExpression: string,
+  components: Array<string>,
+  fieldName: string,
+  operator: '<' | '<=' | '>' | '>=',
+  comparisonValue: any
+): { sql: string, params: Array<any> } =>
+  getNestedDotArrayTraversalExpression(
+    rootExpression,
+    components,
+    fieldName,
+    valueExpression => ({
+      sql: `${valueExpression} ${operator} ?`,
+      params: [toSQLiteValue(comparisonValue)],
+    })
+  );
 
 const isGeoPointValue = (value: any) =>
   value &&
@@ -1779,6 +1845,63 @@ const getArrayAnyMatchExpression = (
     params: valueMatch.params,
   };
 };
+
+const getTypedValueAnyMatchExpression = (
+  targetSql: string,
+  typeSql: string | null,
+  comparisonValues: Array<any>
+): { sql: string, params: Array<any> } => {
+  const scalarMatch = getScalarAnyMatchExpression(targetSql, comparisonValues);
+  if (!typeSql) {
+    return scalarMatch;
+  }
+
+  const arrayMatch = getArrayAnyMatchExpression(targetSql, comparisonValues);
+  const arrayTypeCondition = `COALESCE(${typeSql}, '') = 'array'`;
+  const scalarTypeCondition = `COALESCE(${typeSql}, '') != 'array'`;
+  return {
+    sql:
+      `((` +
+      `${arrayTypeCondition} AND (${arrayMatch.sql})) OR ` +
+      `(${scalarTypeCondition} AND (${scalarMatch.sql})))`,
+    params: [...arrayMatch.params, ...scalarMatch.params],
+  };
+};
+
+const getNestedDotArrayTraversalAnyMatchExpression = (
+  rootExpression: string,
+  components: Array<string>,
+  fieldName: string,
+  comparisonValues: Array<any>
+): { sql: string, params: Array<any> } =>
+  getNestedDotArrayTraversalExpression(
+    rootExpression,
+    components,
+    fieldName,
+    valueExpression => getJsonValueAnyMatchExpression(valueExpression, comparisonValues)
+  );
+
+const getNestedDotArrayTraversalRegexMatchExpression = (
+  rootExpression: string,
+  components: Array<string>,
+  fieldName: string,
+  normalizedRegex: { pattern: string, flags: string }
+): { sql: string, params: Array<any> } =>
+  getNestedDotArrayTraversalExpression(
+    rootExpression,
+    components,
+    fieldName,
+    valueExpression => {
+      const regexMatchPlan = getRegexMatchPlan(valueExpression, normalizedRegex, {
+        allowPrefixPrefilter: true,
+      });
+      return getSQLiteRegexValueMatchExpression(
+        valueExpression,
+        normalizedRegex,
+        regexMatchPlan
+      );
+    }
+  );
 
 const getSQLiteArrayIndexPointerLookupValue = (className: string, objectId: string): string =>
   `${className}${sqliteArrayIndexPointerSeparator}${objectId}`;
@@ -4148,6 +4271,9 @@ export class SQLiteStorageAdapter implements StorageAdapter {
         !dotFieldArrayPath &&
         hasNestedDotPathSegmentsBeyondOneLevel &&
         !hasExplicitNumericDotPathSegment;
+      const nestedDotArrayRootSql = shouldUseNestedDotArrayTraversalFallback
+        ? quoteColumnName(dotFieldPath.rootFieldName)
+        : null;
       const dotFieldArraySourceSql = dotFieldArrayPath
         ? quoteColumnName(dotFieldArrayPath.rootFieldName)
         : null;
@@ -4216,6 +4342,22 @@ export class SQLiteStorageAdapter implements StorageAdapter {
               `EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${targetSql} IS NULL)`
             );
           }
+        } else if (shouldUseNestedDotArrayTraversalFallback) {
+          const nestedArrayExistsMatch = getNestedDotArrayTraversalExistsExpression(
+            nestedDotArrayRootSql,
+            dotFieldPath.components,
+            key
+          );
+          const nestedArrayNullMatch = getNestedDotArrayTraversalValueMatchExpression(
+            nestedDotArrayRootSql,
+            dotFieldPath.components,
+            key,
+            null
+          );
+          conditions.push(
+            `(((${targetSql} IS NULL) AND NOT (${nestedArrayExistsMatch.sql})) OR ${nestedArrayNullMatch.sql})`
+          );
+          params.push(...nestedArrayExistsMatch.params, ...nestedArrayNullMatch.params);
         } else {
           conditions.push(`${targetSql} IS NULL`);
         }
@@ -4242,6 +4384,22 @@ export class SQLiteStorageAdapter implements StorageAdapter {
                     `EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${targetSql} IS NULL)`
                   );
                 }
+              } else if (shouldUseNestedDotArrayTraversalFallback) {
+                const nestedArrayExistsMatch = getNestedDotArrayTraversalExistsExpression(
+                  nestedDotArrayRootSql,
+                  dotFieldPath.components,
+                  key
+                );
+                const nestedArrayNullMatch = getNestedDotArrayTraversalValueMatchExpression(
+                  nestedDotArrayRootSql,
+                  dotFieldPath.components,
+                  key,
+                  null
+                );
+                conditions.push(
+                  `(((${targetSql} IS NULL) AND NOT (${nestedArrayExistsMatch.sql})) OR ${nestedArrayNullMatch.sql})`
+                );
+                params.push(...nestedArrayExistsMatch.params, ...nestedArrayNullMatch.params);
               } else {
                 conditions.push(`${targetSql} IS NULL`);
               }
@@ -4276,14 +4434,12 @@ export class SQLiteStorageAdapter implements StorageAdapter {
             } else if (shouldUseNestedDotArrayTraversalFallback) {
               const directValueMatch = getScalarValueMatchExpression(targetSql, opVal);
               const nestedArrayValueMatch = getNestedDotArrayTraversalValueMatchExpression(
-                quoteColumnName(dotFieldPath.rootFieldName),
+                nestedDotArrayRootSql,
                 dotFieldPath.components,
                 key,
                 opVal
               );
-              conditions.push(
-                `((${directValueMatch.sql}) OR ${nestedArrayValueMatch.sql})`
-              );
+              conditions.push(`((${directValueMatch.sql}) OR ${nestedArrayValueMatch.sql})`);
               params.push(...directValueMatch.params, ...nestedArrayValueMatch.params);
             } else if (usesCaseInsensitiveComparison && typeof opVal === 'string') {
               conditions.push(`(LOWER(${targetSql}) = LOWER(?))`);
@@ -4303,6 +4459,14 @@ export class SQLiteStorageAdapter implements StorageAdapter {
                 );
                 conditions.push(existsMatch.sql);
                 params.push(...existsMatch.params);
+              } else if (shouldUseNestedDotArrayTraversalFallback) {
+                const nestedArrayNonNullMatch = getNestedDotArrayTraversalNonNullValueExpression(
+                  nestedDotArrayRootSql,
+                  dotFieldPath.components,
+                  key
+                );
+                conditions.push(`(${targetSql} IS NOT NULL OR ${nestedArrayNonNullMatch.sql})`);
+                params.push(...nestedArrayNonNullMatch.params);
               } else {
                 conditions.push(`${targetSql} IS NOT NULL`);
               }
@@ -4334,6 +4498,18 @@ export class SQLiteStorageAdapter implements StorageAdapter {
                 conditions.push(`NOT (${valueMatch.sql})`);
                 params.push(...valueMatch.params);
               }
+            } else if (shouldUseNestedDotArrayTraversalFallback) {
+              const directValueMatch = getScalarValueMatchExpression(targetSql, opVal);
+              const nestedArrayValueMatch = getNestedDotArrayTraversalValueMatchExpression(
+                nestedDotArrayRootSql,
+                dotFieldPath.components,
+                key,
+                opVal
+              );
+              conditions.push(
+                `((${targetSql} IS NULL OR NOT (${directValueMatch.sql})) AND NOT (${nestedArrayValueMatch.sql}))`
+              );
+              params.push(...directValueMatch.params, ...nestedArrayValueMatch.params);
             } else if (usesCaseInsensitiveComparison && typeof opVal === 'string') {
               conditions.push(`(${targetSql} IS NULL OR LOWER(${targetSql}) != LOWER(?))`);
               params.push(opVal);
@@ -4356,6 +4532,16 @@ export class SQLiteStorageAdapter implements StorageAdapter {
                 );
                 params.push(toSQLiteValue(opVal));
               }
+            } else if (shouldUseNestedDotArrayTraversalFallback) {
+              const nestedArrayRangeMatch = getNestedDotArrayTraversalRangeMatchExpression(
+                nestedDotArrayRootSql,
+                dotFieldPath.components,
+                key,
+                '<',
+                opVal
+              );
+              conditions.push(`((${targetSql} < ?) OR ${nestedArrayRangeMatch.sql})`);
+              params.push(toSQLiteValue(opVal), ...nestedArrayRangeMatch.params);
             } else {
               conditions.push(`${targetSql} < ?`);
               params.push(toSQLiteValue(opVal));
@@ -4374,6 +4560,16 @@ export class SQLiteStorageAdapter implements StorageAdapter {
                 );
                 params.push(toSQLiteValue(opVal));
               }
+            } else if (shouldUseNestedDotArrayTraversalFallback) {
+              const nestedArrayRangeMatch = getNestedDotArrayTraversalRangeMatchExpression(
+                nestedDotArrayRootSql,
+                dotFieldPath.components,
+                key,
+                '<=',
+                opVal
+              );
+              conditions.push(`((${targetSql} <= ?) OR ${nestedArrayRangeMatch.sql})`);
+              params.push(toSQLiteValue(opVal), ...nestedArrayRangeMatch.params);
             } else {
               conditions.push(`${targetSql} <= ?`);
               params.push(toSQLiteValue(opVal));
@@ -4392,6 +4588,16 @@ export class SQLiteStorageAdapter implements StorageAdapter {
                 );
                 params.push(toSQLiteValue(opVal));
               }
+            } else if (shouldUseNestedDotArrayTraversalFallback) {
+              const nestedArrayRangeMatch = getNestedDotArrayTraversalRangeMatchExpression(
+                nestedDotArrayRootSql,
+                dotFieldPath.components,
+                key,
+                '>',
+                opVal
+              );
+              conditions.push(`((${targetSql} > ?) OR ${nestedArrayRangeMatch.sql})`);
+              params.push(toSQLiteValue(opVal), ...nestedArrayRangeMatch.params);
             } else {
               conditions.push(`${targetSql} > ?`);
               params.push(toSQLiteValue(opVal));
@@ -4410,6 +4616,16 @@ export class SQLiteStorageAdapter implements StorageAdapter {
                 );
                 params.push(toSQLiteValue(opVal));
               }
+            } else if (shouldUseNestedDotArrayTraversalFallback) {
+              const nestedArrayRangeMatch = getNestedDotArrayTraversalRangeMatchExpression(
+                nestedDotArrayRootSql,
+                dotFieldPath.components,
+                key,
+                '>=',
+                opVal
+              );
+              conditions.push(`((${targetSql} >= ?) OR ${nestedArrayRangeMatch.sql})`);
+              params.push(toSQLiteValue(opVal), ...nestedArrayRangeMatch.params);
             } else {
               conditions.push(`${targetSql} >= ?`);
               params.push(toSQLiteValue(opVal));
@@ -4484,6 +4700,46 @@ export class SQLiteStorageAdapter implements StorageAdapter {
                       `EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${targetSql} IS NULL)`
                     );
                   }
+                } else {
+                  conditions.push('1 = 0');
+                }
+              } else if (shouldUseNestedDotArrayTraversalFallback) {
+                const inClauses = [];
+                if (nonNulls.length > 0) {
+                  const directAnyMatch = getTypedValueAnyMatchExpression(
+                    targetSql,
+                    dotFieldTypeSql,
+                    nonNulls
+                  );
+                  const nestedArrayAnyMatch = getNestedDotArrayTraversalAnyMatchExpression(
+                    nestedDotArrayRootSql,
+                    dotFieldPath.components,
+                    key,
+                    nonNulls
+                  );
+                  inClauses.push(`(${directAnyMatch.sql})`);
+                  inClauses.push(nestedArrayAnyMatch.sql);
+                  params.push(...directAnyMatch.params, ...nestedArrayAnyMatch.params);
+                }
+                if (hasNull) {
+                  const nestedArrayExistsMatch = getNestedDotArrayTraversalExistsExpression(
+                    nestedDotArrayRootSql,
+                    dotFieldPath.components,
+                    key
+                  );
+                  const nestedArrayNullMatch = getNestedDotArrayTraversalValueMatchExpression(
+                    nestedDotArrayRootSql,
+                    dotFieldPath.components,
+                    key,
+                    null
+                  );
+                  inClauses.push(
+                    `(((${targetSql} IS NULL) AND NOT (${nestedArrayExistsMatch.sql})) OR ${nestedArrayNullMatch.sql})`
+                  );
+                  params.push(...nestedArrayExistsMatch.params, ...nestedArrayNullMatch.params);
+                }
+                if (inClauses.length > 0) {
+                  conditions.push(`(${inClauses.join(' OR ')})`);
                 } else {
                   conditions.push('1 = 0');
                 }
@@ -4589,6 +4845,69 @@ export class SQLiteStorageAdapter implements StorageAdapter {
                   conditions.push(existsMatch.sql);
                   params.push(...existsMatch.params);
                 }
+              } else if (shouldUseNestedDotArrayTraversalFallback) {
+                const directAnyMatch =
+                  nonNulls.length > 0
+                    ? getTypedValueAnyMatchExpression(targetSql, dotFieldTypeSql, nonNulls)
+                    : null;
+                const nestedArrayAnyMatch =
+                  nonNulls.length > 0
+                    ? getNestedDotArrayTraversalAnyMatchExpression(
+                        nestedDotArrayRootSql,
+                        dotFieldPath.components,
+                        key,
+                        nonNulls
+                      )
+                    : null;
+                if (hasNull) {
+                  const nestedArrayNonNullMatch = getNestedDotArrayTraversalNonNullValueExpression(
+                    nestedDotArrayRootSql,
+                    dotFieldPath.components,
+                    key
+                  );
+                  const nestedArrayNullMatch = getNestedDotArrayTraversalValueMatchExpression(
+                    nestedDotArrayRootSql,
+                    dotFieldPath.components,
+                    key,
+                    null
+                  );
+                  const noDirectAnyMatchSql = directAnyMatch
+                    ? `(${targetSql} IS NULL OR NOT (${directAnyMatch.sql}))`
+                    : '1 = 1';
+                  const noNestedAnyMatchSql = nestedArrayAnyMatch
+                    ? `NOT (${nestedArrayAnyMatch.sql})`
+                    : '1 = 1';
+                  conditions.push(
+                    `((` +
+                      `(${targetSql} IS NOT NULL OR ${nestedArrayNonNullMatch.sql}) AND ` +
+                      `${noDirectAnyMatchSql} AND ` +
+                      `${noNestedAnyMatchSql} AND ` +
+                      `NOT (${nestedArrayNullMatch.sql})` +
+                      `))`
+                  );
+                  params.push(...nestedArrayNonNullMatch.params);
+                  if (directAnyMatch) {
+                    params.push(...directAnyMatch.params);
+                  }
+                  if (nestedArrayAnyMatch) {
+                    params.push(...nestedArrayAnyMatch.params);
+                  }
+                  params.push(...nestedArrayNullMatch.params);
+                } else {
+                  const noDirectAnyMatchSql = directAnyMatch
+                    ? `(${targetSql} IS NULL OR NOT (${directAnyMatch.sql}))`
+                    : '1 = 1';
+                  const noNestedAnyMatchSql = nestedArrayAnyMatch
+                    ? `NOT (${nestedArrayAnyMatch.sql})`
+                    : '1 = 1';
+                  conditions.push(`(${noDirectAnyMatchSql} AND ${noNestedAnyMatchSql})`);
+                  if (directAnyMatch) {
+                    params.push(...directAnyMatch.params);
+                  }
+                  if (nestedArrayAnyMatch) {
+                    params.push(...nestedArrayAnyMatch.params);
+                  }
+                }
               } else if (dotFieldTypeSql) {
                 if (nonNulls.length > 0) {
                   const scalarMatch = getScalarAnyMatchExpression(targetSql, nonNulls);
@@ -4636,6 +4955,14 @@ export class SQLiteStorageAdapter implements StorageAdapter {
                 );
                 conditions.push(existsMatch.sql);
                 params.push(...existsMatch.params);
+              } else if (shouldUseNestedDotArrayTraversalFallback) {
+                const nestedArrayExistsMatch = getNestedDotArrayTraversalExistsExpression(
+                  nestedDotArrayRootSql,
+                  dotFieldPath.components,
+                  key
+                );
+                conditions.push(`(${targetSql} IS NOT NULL OR ${nestedArrayExistsMatch.sql})`);
+                params.push(...nestedArrayExistsMatch.params);
               } else if (explicitNullFieldMatch) {
                 conditions.push(`(${targetSql} IS NOT NULL OR ${explicitNullFieldMatch.sql})`);
                 params.push(...explicitNullFieldMatch.params);
@@ -4651,6 +4978,14 @@ export class SQLiteStorageAdapter implements StorageAdapter {
                 );
                 conditions.push(existsMatch.sql);
                 params.push(...existsMatch.params);
+              } else if (shouldUseNestedDotArrayTraversalFallback) {
+                const nestedArrayExistsMatch = getNestedDotArrayTraversalExistsExpression(
+                  nestedDotArrayRootSql,
+                  dotFieldPath.components,
+                  key
+                );
+                conditions.push(`(${targetSql} IS NULL AND NOT (${nestedArrayExistsMatch.sql}))`);
+                params.push(...nestedArrayExistsMatch.params);
               } else if (explicitNullFieldMatch) {
                 conditions.push(`(${targetSql} IS NULL AND NOT ${explicitNullFieldMatch.sql})`);
                 params.push(...explicitNullFieldMatch.params);
@@ -4706,6 +5041,20 @@ export class SQLiteStorageAdapter implements StorageAdapter {
                 );
                 params.push(...valueRegexMatch.params);
               }
+            } else if (shouldUseNestedDotArrayTraversalFallback) {
+              const directRegexMatch = getSQLiteRegexValueMatchExpression(
+                targetSql,
+                normalizedRegex,
+                regexMatchPlan
+              );
+              const nestedArrayRegexMatch = getNestedDotArrayTraversalRegexMatchExpression(
+                nestedDotArrayRootSql,
+                dotFieldPath.components,
+                key,
+                normalizedRegex
+              );
+              conditions.push(`((${directRegexMatch.sql}) OR ${nestedArrayRegexMatch.sql})`);
+              params.push(...directRegexMatch.params, ...nestedArrayRegexMatch.params);
             } else {
               const scalarRegexMatch = getSQLiteRegexValueMatchExpression(
                 targetSql,
