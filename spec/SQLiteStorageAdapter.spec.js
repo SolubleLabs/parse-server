@@ -713,6 +713,164 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
     ).toEqual(['patientRequest']);
   });
 
+  it('merges ordered scalar-set scans with indexed array membership', async () => {
+    const schema = {
+      className: 'IndexedArrayOrderClass',
+      fields: {
+        objectId: { type: 'String' },
+        instantiatesCanonical: {
+          type: 'Array',
+          contents: { type: 'Pointer', targetClass: 'ActivityDefinition' },
+        },
+        category: { type: 'Object' },
+        status: { type: 'String' },
+        authoredOn: { type: 'Number' },
+      },
+    };
+    const procedureDefinition = {
+      __type: 'Pointer',
+      className: 'ActivityDefinition',
+      objectId: 'procedureDefinition',
+    };
+    await adapter.createClass('IndexedArrayOrderClass', schema);
+    await adapter.createIndex(
+      'IndexedArrayOrderClass',
+      { instantiatesCanonical: 1, status: 1, authoredOn: -1 },
+      { name: 'canonical_status_authoredOn' }
+    );
+
+    const insertHistoricalRequest = adapter._prepare(
+      `INSERT INTO ${adapter._tableName('IndexedArrayOrderClass')} ` +
+        `("objectId", "instantiatesCanonical", "status", "authoredOn") VALUES (?, ?, ?, ?)`
+    );
+    adapter._db.transaction(() => {
+      for (let index = 0; index < 2000; index += 1) {
+        insertHistoricalRequest.run(
+          `historical${index}`,
+          JSON.stringify([
+            {
+              __type: 'Pointer',
+              className: 'ActivityDefinition',
+              objectId: `otherDefinition${index % 20}`,
+            },
+          ]),
+          index % 20 === 0 ? 'active' : 'completed',
+          -index - 1
+        );
+      }
+    })();
+    await adapter.createObject('IndexedArrayOrderClass', schema, {
+      objectId: 'modernActive',
+      instantiatesCanonical: [procedureDefinition, procedureDefinition],
+      status: 'active',
+      authoredOn: 30,
+    });
+    await adapter.createObject('IndexedArrayOrderClass', schema, {
+      objectId: 'modernHeld',
+      instantiatesCanonical: [procedureDefinition],
+      status: 'on-hold',
+      authoredOn: 10,
+    });
+    await adapter.createObject('IndexedArrayOrderClass', schema, {
+      objectId: 'legacyHeld',
+      category: { code: 'procedure' },
+      status: 'on-hold',
+      authoredOn: 20,
+    });
+    adapter._db.exec('ANALYZE');
+
+    const query = {
+      $and: [
+        {
+          $or: [
+            { instantiatesCanonical: { $in: [procedureDefinition] } },
+            {
+              instantiatesCanonical: { $exists: false },
+              'category.code': { $in: ['procedure'] },
+            },
+          ],
+        },
+        { status: { $in: ['active', 'on-hold'] } },
+      ],
+    };
+    const unionQueries = adapter._getOrderedSetUnionQueries(
+      'IndexedArrayOrderClass',
+      schema,
+      query,
+      { authoredOn: -1 },
+      25
+    );
+    expect(unionQueries.length).toBe(2);
+
+    const unionSelects = [];
+    const unionParams = [];
+    for (const unionQuery of unionQueries) {
+      const branchWhere = adapter._buildWhereClause(
+        'IndexedArrayOrderClass',
+        schema,
+        unionQuery,
+        false,
+        false,
+        true
+      );
+      unionSelects.push(
+        `SELECT * FROM ${adapter._tableName('IndexedArrayOrderClass')} WHERE ${branchWhere.sql}`
+      );
+      unionParams.push(...branchWhere.params);
+    }
+    const unionSql =
+      `SELECT * FROM (${unionSelects.join(' UNION ALL ')}) ` +
+      `ORDER BY "authoredOn" DESC LIMIT 25`;
+    const queryPlan = adapter._prepare(`EXPLAIN QUERY PLAN ${unionSql}`).all(...unionParams);
+    const planDetails = queryPlan.map(row => row.detail).join('\n');
+    const hiddenBaseIndexName = adapter._arrayCompoundBaseIndexName('canonical_status_authoredOn');
+    const arrayIndexTableName = adapter._rawArrayElementIndexTableName(
+      'IndexedArrayOrderClass',
+      'instantiatesCanonical'
+    );
+    const { objectIdLookupIndex } = adapter._getArrayElementIndexArtifactNames(arrayIndexTableName);
+
+    expect(planDetails).toContain('MERGE (UNION ALL)');
+    expect(planDetails).toContain(hiddenBaseIndexName);
+    expect(planDetails).toContain(objectIdLookupIndex.slice(1, -1));
+    expect(planDetails).not.toContain('USE TEMP B-TREE FOR ORDER BY');
+
+    spyOn(adapter._db, 'prepare').and.callThrough();
+    const results = await adapter.find('IndexedArrayOrderClass', schema, query, {
+      sort: { authoredOn: -1 },
+      limit: 25,
+    });
+    const preparedSql = adapter._db.prepare.calls.allArgs().map(args => args[0]);
+    expect(
+      preparedSql.some(sql => typeof sql === 'string' && sql.includes('UNION ALL'))
+    ).toBeTrue();
+    expect(results.map(result => result.objectId)).toEqual([
+      'modernActive',
+      'legacyHeld',
+      'modernHeld',
+    ]);
+
+    const visibleIndexes = await adapter.getIndexes('IndexedArrayOrderClass');
+    expect(visibleIndexes.some(index => index.name === hiddenBaseIndexName)).toBeFalse();
+
+    await adapter.createIndex(
+      'IndexedArrayOrderClass',
+      { status: 1, authoredOn: -1 },
+      { name: 'status_authoredOn' }
+    );
+    const hiddenBaseIndexAfterScalarIndex = adapter
+      ._prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?")
+      .get(hiddenBaseIndexName);
+    expect(hiddenBaseIndexAfterScalarIndex).toBeUndefined();
+
+    await adapter.dropIndexes('IndexedArrayOrderClass', ['canonical_status_authoredOn']);
+    const hiddenBaseIndexAfterDrop = adapter
+      ._prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?")
+      .get(hiddenBaseIndexName);
+    expect(hiddenBaseIndexAfterDrop).toBeUndefined();
+  });
+
+
   it('uses hidden array-element indexes for equalTo membership on Array fields', async () => {
     const schema = {
       className: 'IndexedArrayFieldClass',

@@ -1879,3 +1879,12 @@
   - source/spec lint green
   - build green
   - adapter + live Parse query specs: 90 specs, 0 failures
+
+### Ordered Array-Membership Queue Fix
+- Reproduced the remaining planner gap with the real query shape: indexed Array membership plus a two-value scalar status set and `authoredOn DESC` still used a temp sort after fetching base rows.
+- Limited, single-sort finds now split a small same-type scalar `$in` into disjoint equality branches only when a declared compound index can satisfy the equality prefix and sort. SQLite merges those ordered branches with `UNION ALL`; unordered and non-indexed queries keep the old path.
+- Ordered branches probe Array shadow rows through correlated `EXISTS`. The shadow table now has one covering `(objectId, valueType, value)` index instead of the old objectId-only index, so this lookup does not scan one object's array rows.
+- Compound indexes containing an Array field get a hidden base-field companion index when needed. If an equivalent declared scalar index already exists or is later added, the hidden duplicate is not maintained and any stale helper is removed.
+- The hidden companion does not appear through `getIndexes()` and is removed with the declared Array compound index.
+- A 100,000-row benchmark with 2 KB rows measured the old ordered shape at roughly 4.6-30 ms and the merged ordered shape at roughly 0.13-1.75 ms across tested membership sizes and limits.
+- Validation: source/spec lint green; build green; 80 SQLite adapter specs green; refreshed standalone package boot/query smoke green; downstream SQLite compatibility test and bundled build green.
