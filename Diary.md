@@ -1862,3 +1862,20 @@
   - `$regex`
 - Added red coverage for those operators at both adapter level and live Parse integration level.
 - Rebuilt `lib/` and refreshed the standalone adapter package copy after the fix.
+
+## 2026-08-27
+
+### Scalar Queue Planner Fixes
+- Reproduced two real live project queue planner misses in adapter tests before changing source:
+  - scalar `$in` used `field IN (SELECT value FROM json_each(?))`, which made SQLite scan a 5%-open queue instead of seeking through `status + authoredOn`
+  - top-level Pointer equality used a JSON-pointer-or-scalar predicate even though this adapter stores those columns as objectId text, blocking `subject + status + authoredOn`
+- Fixed bounded set matching to use direct `IN (?, ...)` bindings for up to 1,000 values. Larger lists keep the one-JSON-binding fallback and the existing 1,501-value tests still pass.
+- Fixed schema-declared top-level Pointer equality / set matching to compare the native objectId column directly. Pointer values inside Object/Array JSON keep the JSON-compatible matcher.
+- A two-value status filter still needs SQLite's temp merge-sort across the two index ranges. The important table scan is gone; rewriting `IN` as app-side `OR` produces the same plan.
+- In a 100,000-row / 5%-open local benchmark:
+  - status `$in`: about 9.23 ms -> 0.023 ms median
+  - patient Pointer equality: about 0.148 ms -> 0.014 ms median
+- Validation:
+  - source/spec lint green
+  - build green
+  - adapter + live Parse query specs: 90 specs, 0 failures

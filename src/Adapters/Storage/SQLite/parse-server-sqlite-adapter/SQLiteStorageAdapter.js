@@ -89,6 +89,10 @@ const authDataFieldPrefix = '_auth_data_';
 const arrayIndexValueTypeColumn = 'valueType';
 const arrayIndexValueColumn = 'value';
 const sqliteArrayIndexPointerSeparator = '\u001F';
+// Direct IN bindings let SQLite seek through normal compound indexes. Larger
+// lists stay in one JSON binding so unusual bulk queries cannot exhaust SQLite's
+// host-parameter limit.
+const sqliteDirectSetMembershipLimit = 1000;
 // The shadow array-member table stores SQLite scalars directly, then derives a
 // couple of object-shaped Parse primitives into lookupable text keys too.
 const sqliteIndexedArrayScalarTypeNames = Object.freeze(['text', 'integer', 'real', 'true', 'false', 'null']);
@@ -1207,8 +1211,14 @@ const appendSQLiteSetMembershipClause = (sqlParts, params, valueExpression, comp
   if (comparisonValues.length === 0) {
     return;
   }
-  sqlParts.push(`(${valueExpression} IN (SELECT value FROM json_each(?)))`);
-  params.push(JSON.stringify(comparisonValues));
+  if (comparisonValues.length <= sqliteDirectSetMembershipLimit) {
+    const placeholders = `${'?, '.repeat(comparisonValues.length - 1)}?`;
+    sqlParts.push(`(${valueExpression} IN (${placeholders}))`);
+    params.push(...comparisonValues);
+  } else {
+    sqlParts.push(`(${valueExpression} IN (SELECT value FROM json_each(?)))`);
+    params.push(JSON.stringify(comparisonValues));
+  }
 };
 const appendSQLitePointerAnyMatchClauses = (sqlParts, params, valueExpression, pointerObjectIds, pointerObjectIdsByClassName) => {
   if (pointerObjectIds.length === 0) {
@@ -1518,8 +1528,33 @@ const getSQLiteArrayIndexRangeMatchExpression = (arrayIndexTableName, comparison
     params
   };
 };
-const getScalarValueMatchExpression = (targetSql, comparisonValue) => getJsonValueMatchExpression(targetSql, comparisonValue);
-const getScalarAnyMatchExpression = (targetSql, comparisonValues) => getSQLiteAnyMatchExpression(targetSql, comparisonValues, getScalarValueMatchExpression);
+const getScalarValueMatchExpression = (targetSql, comparisonValue, usesNativePointerStorage = false) => {
+  // Top-level Pointer columns always store the objectId as TEXT. The JSON form
+  // is only valid inside Array/Object values and would block normal indexes here.
+  if (usesNativePointerStorage && isPointerValue(comparisonValue)) {
+    return {
+      sql: `${targetSql} = ?`,
+      params: [comparisonValue.objectId]
+    };
+  }
+  return getJsonValueMatchExpression(targetSql, comparisonValue);
+};
+const getScalarAnyMatchExpression = (targetSql, comparisonValues, usesNativePointerStorage = false) => {
+  if (usesNativePointerStorage) {
+    const sqlParts = [];
+    const params = [];
+    const pointerObjectIds = [];
+    for (const comparisonValue of comparisonValues) {
+      pointerObjectIds.push(toSQLiteValue(comparisonValue));
+    }
+    appendSQLiteSetMembershipClause(sqlParts, params, targetSql, pointerObjectIds);
+    return {
+      sql: sqlParts.join(' OR '),
+      params
+    };
+  }
+  return getSQLiteAnyMatchExpression(targetSql, comparisonValues, getScalarValueMatchExpression);
+};
 const validateRegexPattern = (pattern, flags) => {
   try {
     const normalizedRegex = normalizeRegexPattern(pattern, flags);
@@ -3112,6 +3147,7 @@ class SQLiteStorageAdapter {
       }
       const usesCaseInsensitiveComparison = caseInsensitive && !authDataProvider && !isDotNotation && (normalizedKey === 'username' || normalizedKey === 'email');
       const isArrayField = normalizedKey === '_rperm' || normalizedKey === '_wperm' || schemaFields[normalizedKey] && schemaFields[normalizedKey].type === 'Array';
+      const usesNativePointerStorage = !authDataProvider && !isDotNotation && Boolean(schemaFields[normalizedKey] && schemaFields[normalizedKey].type === 'Pointer');
       const explicitNullFieldMatch = shouldTrackExplicitNullFields(className) && !authDataProvider && !isDotNotation ? getExplicitNullFieldMatchExpression(normalizedKey) : null;
       /** Bare text columns can keep index-friendly LIKE/GLOB/=`...` lowering without CAST(... AS TEXT). */
       const canUseLoweredRegexRawTextTarget = !authDataProvider && !isDotNotation && !isArrayField && targetSql !== 'NULL' && isLowerableRegexTextColumn(schemaFields, normalizedKey);
@@ -3191,7 +3227,7 @@ class SQLiteStorageAdapter {
               conditions.push(`(LOWER(${targetSql}) = LOWER(?))`);
               params.push(opVal);
             } else {
-              const valueMatch = getScalarValueMatchExpression(targetSql, opVal);
+              const valueMatch = getScalarValueMatchExpression(targetSql, opVal, usesNativePointerStorage);
               conditions.push(`(${valueMatch.sql})`);
               params.push(...valueMatch.params);
             }
@@ -3237,7 +3273,7 @@ class SQLiteStorageAdapter {
               conditions.push(`(${targetSql} IS NULL OR LOWER(${targetSql}) != LOWER(?))`);
               params.push(opVal);
             } else {
-              const valueMatch = getScalarValueMatchExpression(targetSql, opVal);
+              const valueMatch = getScalarValueMatchExpression(targetSql, opVal, usesNativePointerStorage);
               conditions.push(`(${targetSql} IS NULL OR NOT (${valueMatch.sql}))`);
               params.push(...valueMatch.params);
             }
@@ -3402,7 +3438,7 @@ class SQLiteStorageAdapter {
                 }
               } else {
                 if (nonNulls.length > 0) {
-                  const scalarMatch = getScalarAnyMatchExpression(targetSql, nonNulls);
+                  const scalarMatch = getScalarAnyMatchExpression(targetSql, nonNulls, usesNativePointerStorage);
                   if (hasNull) {
                     conditions.push(`(${targetSql} IS NULL OR (${scalarMatch.sql}))`);
                   } else {
@@ -3501,7 +3537,7 @@ class SQLiteStorageAdapter {
                 }
               } else {
                 if (nonNulls.length > 0) {
-                  const scalarMatch = getScalarAnyMatchExpression(targetSql, nonNulls);
+                  const scalarMatch = getScalarAnyMatchExpression(targetSql, nonNulls, usesNativePointerStorage);
                   if (hasNull) {
                     conditions.push(`(${targetSql} IS NOT NULL AND NOT (${scalarMatch.sql}))`);
                   } else {
@@ -3696,7 +3732,7 @@ class SQLiteStorageAdapter {
                       params.push(...elementMatch.params);
                     }
                   } else {
-                    const valueMatch = getScalarValueMatchExpression(targetSql, elem);
+                    const valueMatch = getScalarValueMatchExpression(targetSql, elem, usesNativePointerStorage);
                     conditions.push(`(${valueMatch.sql})`);
                     params.push(...valueMatch.params);
                   }
@@ -3716,7 +3752,7 @@ class SQLiteStorageAdapter {
                 conditions.push(`(${targetSql} IS NULL OR NOT EXISTS (SELECT 1 FROM ${eachTableName}(${targetSql}) WHERE NOT (${valueMatch.sql})))`);
                 params.push(...valueMatch.params);
               } else {
-                const scalarMatch = getScalarAnyMatchExpression(targetSql, opVal);
+                const scalarMatch = getScalarAnyMatchExpression(targetSql, opVal, usesNativePointerStorage);
                 conditions.push(`(${targetSql} IS NULL OR (${scalarMatch.sql}))`);
                 params.push(...scalarMatch.params);
               }
@@ -3755,7 +3791,7 @@ class SQLiteStorageAdapter {
           conditions.push(`(LOWER(${targetSql}) = LOWER(?))`);
           params.push(val);
         } else {
-          const valueMatch = getScalarValueMatchExpression(targetSql, val);
+          const valueMatch = getScalarValueMatchExpression(targetSql, val, usesNativePointerStorage);
           conditions.push(`(${valueMatch.sql})`);
           params.push(...valueMatch.params);
         }

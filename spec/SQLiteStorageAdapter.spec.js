@@ -576,6 +576,143 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
     expect(results.map(result => result.objectId)).toEqual(['idx1']);
   });
 
+  it('uses scalar compound indexes for small $in filters', async () => {
+    const schema = {
+      className: 'IndexedScalarInClass',
+      fields: {
+        objectId: { type: 'String' },
+        status: { type: 'String' },
+        authoredOn: { type: 'Number' },
+      },
+    };
+    await adapter.createClass('IndexedScalarInClass', schema);
+    await adapter.createIndex(
+      'IndexedScalarInClass',
+      { status: 1, authoredOn: -1 },
+      { name: 'status_authoredOn' }
+    );
+    await adapter.createObject('IndexedScalarInClass', schema, {
+      objectId: 'activeRequest',
+      status: 'active',
+      authoredOn: 20,
+    });
+    await adapter.createObject('IndexedScalarInClass', schema, {
+      objectId: 'completedRequest',
+      status: 'completed',
+      authoredOn: 10,
+    });
+
+    // Match the real queue skew: only about 5% of historical rows are still open.
+    // ANALYZE is what made SQLite reject the old json_each(?) predicate's index.
+    const insertHistoricalRequest = adapter._prepare(
+      `INSERT INTO ${adapter._tableName('IndexedScalarInClass')} ("objectId", "status", "authoredOn") VALUES (?, ?, ?)`
+    );
+    adapter._db.transaction(() => {
+      for (let i = 0; i < 2000; i += 1) {
+        insertHistoricalRequest.run(
+          `historical${i}`,
+          i % 20 === 0 ? 'active' : 'completed',
+          -i - 1
+        );
+      }
+    })();
+    adapter._db.exec('ANALYZE');
+
+    const where = adapter._buildWhereClause('IndexedScalarInClass', schema, {
+      status: { $in: ['active', 'held'] },
+    });
+    const queryPlan = adapter
+      ._prepare(
+        `EXPLAIN QUERY PLAN SELECT "objectId" FROM ${adapter._tableName('IndexedScalarInClass')} WHERE ${where.sql} ORDER BY "authoredOn" DESC LIMIT 25`
+      )
+      .all(...where.params);
+
+    expect(where.sql).toContain('"status" IN (?, ?)');
+    expect(where.sql).not.toContain('json_each');
+    expect(
+      queryPlan.some(
+        row => typeof row.detail === 'string' && row.detail.includes('status_authoredOn')
+      )
+    ).toBeTrue();
+    expect(
+      (
+        await adapter.find(
+          'IndexedScalarInClass',
+          schema,
+          { status: { $in: ['active', 'held'] } },
+          { sort: { authoredOn: -1 }, limit: 25 }
+        )
+      )[0].objectId
+    ).toBe('activeRequest');
+  });
+
+  it('uses pointer compound indexes for top-level pointer equality', async () => {
+    const schema = {
+      className: 'IndexedPointerEqualityClass',
+      fields: {
+        objectId: { type: 'String' },
+        subject: { type: 'Pointer', targetClass: 'ClientInfo' },
+        status: { type: 'String' },
+        authoredOn: { type: 'Number' },
+      },
+    };
+    const subject = {
+      __type: 'Pointer',
+      className: 'ClientInfo',
+      objectId: 'patient1',
+    };
+    await adapter.createClass('IndexedPointerEqualityClass', schema);
+    await adapter.createIndex(
+      'IndexedPointerEqualityClass',
+      { _p_subject: 1, status: 1, authoredOn: -1 },
+      { name: 'subject_status_authoredOn' }
+    );
+    await adapter.createObject('IndexedPointerEqualityClass', schema, {
+      objectId: 'patientRequest',
+      subject,
+      status: 'active',
+      authoredOn: 20,
+    });
+    await adapter.createObject('IndexedPointerEqualityClass', schema, {
+      objectId: 'otherRequest',
+      subject: {
+        __type: 'Pointer',
+        className: 'ClientInfo',
+        objectId: 'patient2',
+      },
+      status: 'active',
+      authoredOn: 10,
+    });
+
+    const where = adapter._buildWhereClause('IndexedPointerEqualityClass', schema, {
+      subject,
+      status: 'active',
+    });
+    const queryPlan = adapter
+      ._prepare(
+        `EXPLAIN QUERY PLAN SELECT "objectId" FROM ${adapter._tableName('IndexedPointerEqualityClass')} WHERE ${where.sql} ORDER BY "authoredOn" DESC LIMIT 25`
+      )
+      .all(...where.params);
+
+    expect(where.sql).toContain('"subject" = ?');
+    expect(where.sql).not.toContain('json_valid("subject")');
+    expect(
+      queryPlan.some(
+        row => typeof row.detail === 'string' && row.detail.includes('subject_status_authoredOn')
+      )
+    ).toBeTrue();
+    expect(
+      (
+        await adapter.find(
+          'IndexedPointerEqualityClass',
+          schema,
+          { subject, status: 'active' },
+          { sort: { authoredOn: -1 }, limit: 25 }
+        )
+      ).map(result => result.objectId)
+    ).toEqual(['patientRequest']);
+  });
+
   it('uses hidden array-element indexes for equalTo membership on Array fields', async () => {
     const schema = {
       className: 'IndexedArrayFieldClass',

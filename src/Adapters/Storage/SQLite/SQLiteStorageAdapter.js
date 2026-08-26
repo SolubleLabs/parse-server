@@ -103,6 +103,10 @@ const authDataFieldPrefix = '_auth_data_';
 const arrayIndexValueTypeColumn = 'valueType';
 const arrayIndexValueColumn = 'value';
 const sqliteArrayIndexPointerSeparator = '\u001F';
+// Direct IN bindings let SQLite seek through normal compound indexes. Larger
+// lists stay in one JSON binding so one unusual bulk list cannot exhaust
+// SQLite's host-parameter limit.
+const sqliteDirectSetMembershipLimit = 1000;
 // The shadow array-member table stores SQLite scalars directly, then derives a
 // couple of object-shaped Parse primitives into lookupable text keys too.
 const sqliteIndexedArrayScalarTypeNames = Object.freeze([
@@ -1472,8 +1476,14 @@ const appendSQLiteSetMembershipClause = (
   if (comparisonValues.length === 0) {
     return;
   }
-  sqlParts.push(`(${valueExpression} IN (SELECT value FROM json_each(?)))`);
-  params.push(JSON.stringify(comparisonValues));
+  if (comparisonValues.length <= sqliteDirectSetMembershipLimit) {
+    const placeholders = `${'?, '.repeat(comparisonValues.length - 1)}?`;
+    sqlParts.push(`(${valueExpression} IN (${placeholders}))`);
+    params.push(...comparisonValues);
+  } else {
+    sqlParts.push(`(${valueExpression} IN (SELECT value FROM json_each(?)))`);
+    params.push(JSON.stringify(comparisonValues));
+  }
 };
 
 const appendSQLitePointerAnyMatchClauses = (
@@ -2130,14 +2140,40 @@ const getSQLiteArrayIndexRangeMatchExpression = (
 
 const getScalarValueMatchExpression = (
   targetSql: string,
-  comparisonValue: any
-): { sql: string, params: Array<any> } => getJsonValueMatchExpression(targetSql, comparisonValue);
+  comparisonValue: any,
+  usesNativePointerStorage: boolean = false
+): { sql: string, params: Array<any> } => {
+  // Top-level Pointer columns always store the objectId as TEXT. The JSON form
+  // is only valid inside Array/Object values and would block normal indexes here.
+  if (usesNativePointerStorage && isPointerValue(comparisonValue)) {
+    return {
+      sql: `${targetSql} = ?`,
+      params: [comparisonValue.objectId],
+    };
+  }
+  return getJsonValueMatchExpression(targetSql, comparisonValue);
+};
 
 const getScalarAnyMatchExpression = (
   targetSql: string,
-  comparisonValues: Array<any>
-): { sql: string, params: Array<any> } =>
-  getSQLiteAnyMatchExpression(targetSql, comparisonValues, getScalarValueMatchExpression);
+  comparisonValues: Array<any>,
+  usesNativePointerStorage: boolean = false
+): { sql: string, params: Array<any> } => {
+  if (usesNativePointerStorage) {
+    const sqlParts = [];
+    const params = [];
+    const pointerObjectIds = [];
+    for (const comparisonValue of comparisonValues) {
+      pointerObjectIds.push(toSQLiteValue(comparisonValue));
+    }
+    appendSQLiteSetMembershipClause(sqlParts, params, targetSql, pointerObjectIds);
+    return {
+      sql: sqlParts.join(' OR '),
+      params,
+    };
+  }
+  return getSQLiteAnyMatchExpression(targetSql, comparisonValues, getScalarValueMatchExpression);
+};
 
 const validateRegexPattern = (pattern: string, flags: string): { pattern: string, flags: string } => {
   try {
@@ -4310,6 +4346,12 @@ export class SQLiteStorageAdapter implements StorageAdapter {
         normalizedKey === '_rperm' ||
         normalizedKey === '_wperm' ||
         (schemaFields[normalizedKey] && schemaFields[normalizedKey].type === 'Array');
+      const usesNativePointerStorage =
+        !authDataProvider &&
+        !isDotNotation &&
+        Boolean(
+          schemaFields[normalizedKey] && schemaFields[normalizedKey].type === 'Pointer'
+        );
       const explicitNullFieldMatch =
         shouldTrackExplicitNullFields(className) && !authDataProvider && !isDotNotation
           ? getExplicitNullFieldMatchExpression(normalizedKey)
@@ -4446,7 +4488,11 @@ export class SQLiteStorageAdapter implements StorageAdapter {
               conditions.push(`(LOWER(${targetSql}) = LOWER(?))`);
               params.push(opVal);
             } else {
-              const valueMatch = getScalarValueMatchExpression(targetSql, opVal);
+              const valueMatch = getScalarValueMatchExpression(
+                targetSql,
+                opVal,
+                usesNativePointerStorage
+              );
               conditions.push(`(${valueMatch.sql})`);
               params.push(...valueMatch.params);
             }
@@ -4515,7 +4561,11 @@ export class SQLiteStorageAdapter implements StorageAdapter {
               conditions.push(`(${targetSql} IS NULL OR LOWER(${targetSql}) != LOWER(?))`);
               params.push(opVal);
             } else {
-              const valueMatch = getScalarValueMatchExpression(targetSql, opVal);
+              const valueMatch = getScalarValueMatchExpression(
+                targetSql,
+                opVal,
+                usesNativePointerStorage
+              );
               conditions.push(`(${targetSql} IS NULL OR NOT (${valueMatch.sql}))`);
               params.push(...valueMatch.params);
             }
@@ -4771,7 +4821,11 @@ export class SQLiteStorageAdapter implements StorageAdapter {
                 }
               } else {
                 if (nonNulls.length > 0) {
-                  const scalarMatch = getScalarAnyMatchExpression(targetSql, nonNulls);
+                  const scalarMatch = getScalarAnyMatchExpression(
+                    targetSql,
+                    nonNulls,
+                    usesNativePointerStorage
+                  );
                   if (hasNull) {
                     conditions.push(`(${targetSql} IS NULL OR (${scalarMatch.sql}))`);
                   } else {
@@ -4854,11 +4908,11 @@ export class SQLiteStorageAdapter implements StorageAdapter {
                 const nestedArrayAnyMatch =
                   nonNulls.length > 0
                     ? getNestedDotArrayTraversalAnyMatchExpression(
-                        nestedDotArrayRootSql,
-                        dotFieldPath.components,
-                        key,
-                        nonNulls
-                      )
+                      nestedDotArrayRootSql,
+                      dotFieldPath.components,
+                      key,
+                      nonNulls
+                    )
                     : null;
                 if (hasNull) {
                   const nestedArrayNonNullMatch = getNestedDotArrayTraversalNonNullValueExpression(
@@ -4934,7 +4988,11 @@ export class SQLiteStorageAdapter implements StorageAdapter {
                 }
               } else {
                 if (nonNulls.length > 0) {
-                  const scalarMatch = getScalarAnyMatchExpression(targetSql, nonNulls);
+                  const scalarMatch = getScalarAnyMatchExpression(
+                    targetSql,
+                    nonNulls,
+                    usesNativePointerStorage
+                  );
                   if (hasNull) {
                     conditions.push(`(${targetSql} IS NOT NULL AND NOT (${scalarMatch.sql}))`);
                   } else {
@@ -5209,7 +5267,11 @@ export class SQLiteStorageAdapter implements StorageAdapter {
                       params.push(...elementMatch.params);
                     }
                   } else {
-                    const valueMatch = getScalarValueMatchExpression(targetSql, elem);
+                    const valueMatch = getScalarValueMatchExpression(
+                      targetSql,
+                      elem,
+                      usesNativePointerStorage
+                    );
                     conditions.push(`(${valueMatch.sql})`);
                     params.push(...valueMatch.params);
                   }
@@ -5234,7 +5296,11 @@ export class SQLiteStorageAdapter implements StorageAdapter {
                 );
                 params.push(...valueMatch.params);
               } else {
-                const scalarMatch = getScalarAnyMatchExpression(targetSql, opVal);
+                const scalarMatch = getScalarAnyMatchExpression(
+                  targetSql,
+                  opVal,
+                  usesNativePointerStorage
+                );
                 conditions.push(`(${targetSql} IS NULL OR (${scalarMatch.sql}))`);
                 params.push(...scalarMatch.params);
               }
@@ -5286,7 +5352,11 @@ export class SQLiteStorageAdapter implements StorageAdapter {
           conditions.push(`(LOWER(${targetSql}) = LOWER(?))`);
           params.push(val);
         } else {
-          const valueMatch = getScalarValueMatchExpression(targetSql, val);
+          const valueMatch = getScalarValueMatchExpression(
+            targetSql,
+            val,
+            usesNativePointerStorage
+          );
           conditions.push(`(${valueMatch.sql})`);
           params.push(...valueMatch.params);
         }
