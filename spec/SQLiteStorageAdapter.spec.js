@@ -863,6 +863,12 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
       .get(hiddenBaseIndexName);
     expect(hiddenBaseIndexAfterScalarIndex).toBeUndefined();
 
+    await adapter.dropIndexes('IndexedArrayOrderClass', ['status_authoredOn']);
+    const hiddenBaseIndexAfterScalarDrop = adapter
+      ._prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?")
+      .get(hiddenBaseIndexName);
+    expect(hiddenBaseIndexAfterScalarDrop).toBeDefined();
+
     await adapter.dropIndexes('IndexedArrayOrderClass', ['canonical_status_authoredOn']);
     const hiddenBaseIndexAfterDrop = adapter
       ._prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?")

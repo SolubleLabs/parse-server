@@ -1888,3 +1888,8 @@
 - The hidden companion does not appear through `getIndexes()` and is removed with the declared Array compound index.
 - A 100,000-row benchmark with 2 KB rows measured the old ordered shape at roughly 4.6-30 ms and the merged ordered shape at roughly 0.13-1.75 ms across tested membership sizes and limits.
 - Validation: source/spec lint green; build green; 80 SQLite adapter specs green; refreshed standalone package boot/query smoke green; downstream SQLite compatibility test and bundled build green.
+
+### Array Companion Index Drop Lifecycle
+- Verified the audit with a red regression: dropping a scalar index equivalent to an existing Array compound index left the retained Array declaration without its hidden base ordering helper.
+- Centralized companion-index reconciliation and run it after both index creation and index deletion. A scalar equivalent still suppresses the duplicate helper; dropping that scalar index now recreates the helper for the retained Array index.
+- Validation: source/spec lint green; build green; 80 SQLite adapter specs green; standalone package regenerated; downstream SQLite compatibility test and backend build green.

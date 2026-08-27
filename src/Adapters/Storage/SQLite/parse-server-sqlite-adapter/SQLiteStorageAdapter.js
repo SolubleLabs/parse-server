@@ -2834,6 +2834,25 @@ class SQLiteStorageAdapter {
     }
     return false;
   }
+  _reconcileArrayCompoundBaseIndex(className, schemaFields, indexName, indexDefinition, indexDefinitions, sparse = false, connection) {
+    const baseFieldNames = this._getArrayCompoundBaseIndexFields(schemaFields, indexDefinition);
+    if (baseFieldNames.length === 0) {
+      return;
+    }
+    const baseIndexName = this._arrayCompoundBaseIndexName(indexName);
+    const quotedBaseIndexName = `"${baseIndexName.replace(/"/g, '""')}"`;
+    if (this._hasEquivalentDeclaredBaseIndex(schemaFields, indexName, indexDefinition, indexDefinitions)) {
+      this._prepare(`DROP INDEX IF EXISTS ${quotedBaseIndexName}`, connection).run();
+      return;
+    }
+    const baseExpressions = baseFieldNames.map(fieldName => this._buildIndexFieldExpression(fieldName).expression);
+    const orderedBaseExpressions = baseFieldNames.map((fieldName, fieldIndex) => `${baseExpressions[fieldIndex]} ${Number(indexDefinition[fieldName]) < 0 ? 'DESC' : 'ASC'}`);
+    let sql = `CREATE INDEX IF NOT EXISTS ${quotedBaseIndexName} ` + `ON ${this._tableName(className)} (${orderedBaseExpressions.join(', ')})`;
+    if (sparse) {
+      sql += ` WHERE ${baseExpressions.map(expression => `${expression} IS NOT NULL`).join(' AND ')}`;
+    }
+    this._prepare(sql, connection).run();
+  }
   _fieldExistsForIndex(fields, fieldName) {
     if (defaultSchemaIndexFields.has(fieldName)) {
       return true;
@@ -3969,6 +3988,9 @@ class SQLiteStorageAdapter {
       }
     };
     visitConjunctiveQuery(query, []);
+    if (setCandidates.length === 0) {
+      return null;
+    }
     const storedSchema = this._getStoredSchemaObject(className, connection);
     const storedIndexes = storedSchema && storedSchema.schema && storedSchema.schema.indexes || {};
     const schemaIndexes = schema && !Array.isArray(schema.indexes) ? schema.indexes || {} : {};
@@ -5819,9 +5841,13 @@ class SQLiteStorageAdapter {
     const knownIndexDefinitions = {
       ...(storedSchema.schema && storedSchema.schema.indexes || {})
     };
+    const sparseIndexNames = new Set();
     for (const index of normalizedIndexes) {
       if (!index.skipDatabaseCreation) {
         knownIndexDefinitions[index.name] = index.key || {};
+        if (index.sparse) {
+          sparseIndexNames.add(index.name);
+        }
       }
     }
     const tableName = this._tableName(className);
@@ -5851,37 +5877,18 @@ class SQLiteStorageAdapter {
       } catch (err) {
         throw this._transformDuplicateKeyError(err, className);
       }
-      const arrayCompoundBaseFieldNames = this._getArrayCompoundBaseIndexFields(schemaFields, key);
-      if (arrayCompoundBaseFieldNames.length > 0) {
-        const baseIndexName = this._arrayCompoundBaseIndexName(index.name);
-        if (this._hasEquivalentDeclaredBaseIndex(schemaFields, index.name, key, knownIndexDefinitions)) {
-          this._prepare(`DROP INDEX IF EXISTS "${baseIndexName.replace(/"/g, '""')}"`, conn).run();
-        } else {
-          const baseExpressions = arrayCompoundBaseFieldNames.map(fieldName => this._buildIndexFieldExpression(fieldName).expression);
-          const orderedBaseExpressions = arrayCompoundBaseFieldNames.map((fieldName, fieldIndex) => `${baseExpressions[fieldIndex]} ${Number(key[fieldName]) < 0 ? 'DESC' : 'ASC'}`);
-          let baseIndexSql = `CREATE INDEX IF NOT EXISTS "${baseIndexName.replace(/"/g, '""')}" ` + `ON ${tableName} (${orderedBaseExpressions.join(', ')})`;
-          if (index.sparse) {
-            baseIndexSql += ` WHERE ${baseExpressions.map(expression => `${expression} IS NOT NULL`).join(' AND ')}`;
-          }
-          this._prepare(baseIndexSql, conn).run();
-        }
-      }
       for (const fieldName of indexFieldNames) {
         await this._ensureArrayElementIndex(className, schemaFields, fieldName, conn);
       }
     }
 
-    // If a scalar equivalent was added after its array compound index, remove
-    // the older helper now instead of maintaining duplicate indexes forever.
+    // Reconcile every retained declaration so adding indexes in either order
+    // cannot leave a missing helper or a duplicate scalar equivalent.
     for (const indexName in knownIndexDefinitions) {
       if (!Object.prototype.hasOwnProperty.call(knownIndexDefinitions, indexName)) {
         continue;
       }
-      const indexDefinition = knownIndexDefinitions[indexName] || {};
-      if (this._getArrayCompoundBaseIndexFields(schemaFields, indexDefinition).length > 0 && this._hasEquivalentDeclaredBaseIndex(schemaFields, indexName, indexDefinition, knownIndexDefinitions)) {
-        const baseIndexName = this._arrayCompoundBaseIndexName(indexName);
-        this._prepare(`DROP INDEX IF EXISTS "${baseIndexName.replace(/"/g, '""')}"`, conn).run();
-      }
+      this._reconcileArrayCompoundBaseIndex(className, schemaFields, indexName, knownIndexDefinitions[indexName] || {}, knownIndexDefinitions, sparseIndexNames.has(indexName), conn);
     }
   }
   async getIndexes(className, connection) {
@@ -5944,11 +5951,17 @@ class SQLiteStorageAdapter {
     const storedIndexes = storedSchema.schema && storedSchema.schema.indexes || {};
     const droppedArrayIndexFieldNames = new Set();
     const retainedArrayIndexFieldNames = new Set();
+    const droppedIndexNames = new Set(indexes);
+    const retainedIndexDefinitions = {};
     for (const indexName in storedIndexes) {
       if (!Object.prototype.hasOwnProperty.call(storedIndexes, indexName)) {
         continue;
       }
       const indexDefinition = storedIndexes[indexName] || {};
+      const isDroppingIndex = droppedIndexNames.has(indexName);
+      if (!isDroppingIndex) {
+        retainedIndexDefinitions[indexName] = indexDefinition;
+      }
       for (const fieldName in indexDefinition) {
         if (!Object.prototype.hasOwnProperty.call(indexDefinition, fieldName)) {
           continue;
@@ -5957,7 +5970,7 @@ class SQLiteStorageAdapter {
         if (!arrayIndexField) {
           continue;
         }
-        if (indexes.includes(indexName)) {
+        if (isDroppingIndex) {
           droppedArrayIndexFieldNames.add(arrayIndexField.normalizedFieldName);
         } else {
           retainedArrayIndexFieldNames.add(arrayIndexField.normalizedFieldName);
@@ -5975,6 +5988,12 @@ class SQLiteStorageAdapter {
       if (!retainedArrayIndexFieldNames.has(fieldName)) {
         this._dropArrayElementIndexArtifactsForField(className, fieldName, schemaFields, conn);
       }
+    }
+    for (const indexName in retainedIndexDefinitions) {
+      if (!Object.prototype.hasOwnProperty.call(retainedIndexDefinitions, indexName)) {
+        continue;
+      }
+      this._reconcileArrayCompoundBaseIndex(className, schemaFields, indexName, retainedIndexDefinitions[indexName], retainedIndexDefinitions, false, conn);
     }
   }
   async updateSchemaWithIndexes() {
