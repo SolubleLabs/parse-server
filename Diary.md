@@ -1893,3 +1893,11 @@
 - Verified the audit with a red regression: dropping a scalar index equivalent to an existing Array compound index left the retained Array declaration without its hidden base ordering helper.
 - Centralized companion-index reconciliation and run it after both index creation and index deletion. A scalar equivalent still suppresses the duplicate helper; dropping that scalar index now recreates the helper for the retained Array index.
 - Validation: source/spec lint green; build green; 80 SQLite adapter specs green; standalone package regenerated; downstream SQLite compatibility test and backend build green.
+
+## 2026-08-28
+
+### Array Helper Isolation And Timestamp Planner Guard
+- Verified that array compound helper names were not class-scoped even though SQLite index names are database-global. Two classes reusing one declared index name could therefore share only one helper, and dropping one declaration could remove the other class's optimization.
+- Helper names now encode both class and declared index names at every creation and drop path. Reconciliation also skips helpers whose base fields are absent, matching the normal physical-index creation guard instead of issuing invalid SQL.
+- Ordered set-UNION eligibility now normalizes storage timestamp aliases before rejecting `createdAt` and `updatedAt`, so `_created_at` and `_updated_at` cannot bypass the existing timestamp-sort guard.
+- Validation: red regressions for all three failures; source/spec lint and build green; 83 adapter specs green; 94 adapter plus live-query integration specs green on serial rerun; standalone package regenerated; downstream compatibility test and backend build green.

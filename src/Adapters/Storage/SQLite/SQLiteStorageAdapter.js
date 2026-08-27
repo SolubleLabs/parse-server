@@ -3922,8 +3922,12 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     };
   }
 
-  _arrayCompoundBaseIndexName(indexName: string): string {
-    return `${sqliteArrayCompoundBaseIndexPrefix}${encodeSQLiteFieldToken(indexName)}`;
+  _arrayCompoundBaseIndexName(className: string, indexName: string): string {
+    // SQLite index names are database-global, even when their tables differ.
+    return (
+      `${sqliteArrayCompoundBaseIndexPrefix}${encodeSQLiteTableNameToken(className)}_` +
+      encodeSQLiteFieldToken(indexName)
+    );
   }
 
   _getArrayCompoundBaseIndexFields(schemaFields: any, indexDefinition: any): Array<string> {
@@ -4013,8 +4017,11 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     if (baseFieldNames.length === 0) {
       return;
     }
+    if (baseFieldNames.some(fieldName => !this._fieldExistsForIndex(schemaFields, fieldName))) {
+      return;
+    }
 
-    const baseIndexName = this._arrayCompoundBaseIndexName(indexName);
+    const baseIndexName = this._arrayCompoundBaseIndexName(className, indexName);
     const quotedBaseIndexName = `"${baseIndexName.replace(/"/g, '""')}"`;
     if (
       this._hasEquivalentDeclaredBaseIndex(
@@ -5635,7 +5642,9 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     const sortFieldNames = [];
     for (const fieldName in sort) {
       if (Object.prototype.hasOwnProperty.call(sort, fieldName)) {
-        sortFieldNames.push(this._normalizeIndexFieldPath(fieldName));
+        sortFieldNames.push(
+          this._normalizeIndexFieldPath(normalizeStorageFieldName(fieldName))
+        );
       }
     }
     if (sortFieldNames.length !== 1) {
@@ -8023,7 +8032,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
         conn
       ).run();
       this._prepare(
-        `DROP INDEX IF EXISTS "${this._arrayCompoundBaseIndexName(String(indexName)).replace(/"/g, '""')}"`,
+        `DROP INDEX IF EXISTS "${this._arrayCompoundBaseIndexName(className, String(indexName)).replace(/"/g, '""')}"`,
         conn
       ).run();
     }

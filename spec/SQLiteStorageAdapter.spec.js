@@ -713,6 +713,39 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
     ).toEqual(['patientRequest']);
   });
 
+  it('rejects storage timestamp aliases from ordered set union planning', async () => {
+    const schema = {
+      className: 'IndexedTimestampSortClass',
+      fields: {
+        status: { type: 'String' },
+      },
+      indexes: {
+        status_createdAt: { status: 1, _created_at: -1 },
+        status_updatedAt: { status: 1, _updated_at: -1 },
+      },
+    };
+    const query = { status: { $in: ['active', 'on-hold'] } };
+
+    expect(
+      adapter._getOrderedSetUnionQueries(
+        'IndexedTimestampSortClass',
+        schema,
+        query,
+        { _created_at: -1 },
+        25
+      )
+    ).toBeNull();
+    expect(
+      adapter._getOrderedSetUnionQueries(
+        'IndexedTimestampSortClass',
+        schema,
+        query,
+        { _updated_at: -1 },
+        25
+      )
+    ).toBeNull();
+  });
+
   it('merges ordered scalar-set scans with indexed array membership', async () => {
     const schema = {
       className: 'IndexedArrayOrderClass',
@@ -823,7 +856,10 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
       `ORDER BY "authoredOn" DESC LIMIT 25`;
     const queryPlan = adapter._prepare(`EXPLAIN QUERY PLAN ${unionSql}`).all(...unionParams);
     const planDetails = queryPlan.map(row => row.detail).join('\n');
-    const hiddenBaseIndexName = adapter._arrayCompoundBaseIndexName('canonical_status_authoredOn');
+    const hiddenBaseIndexName = adapter._arrayCompoundBaseIndexName(
+      'IndexedArrayOrderClass',
+      'canonical_status_authoredOn'
+    );
     const arrayIndexTableName = adapter._rawArrayElementIndexTableName(
       'IndexedArrayOrderClass',
       'instantiatesCanonical'
@@ -874,6 +910,74 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
       ._prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?")
       .get(hiddenBaseIndexName);
     expect(hiddenBaseIndexAfterDrop).toBeUndefined();
+  });
+
+  it('scopes array compound helpers to their class', async () => {
+    const createSchema = className => ({
+      className,
+      fields: {
+        objectId: { type: 'String' },
+        tags: { type: 'Array', contents: { type: 'String' } },
+        authoredOn: { type: 'Number' },
+      },
+    });
+    const firstClassName = 'FirstArrayHelperClass';
+    const secondClassName = 'SecondArrayHelperClass';
+    const indexName = 'shared_tags_authoredOn';
+    const indexDefinition = { tags: 1, authoredOn: -1 };
+
+    await adapter.createClass(firstClassName, createSchema(firstClassName));
+    await adapter.createClass(secondClassName, createSchema(secondClassName));
+    await adapter.createIndex(firstClassName, indexDefinition, { name: indexName });
+    await adapter.createIndex(secondClassName, indexDefinition, { name: indexName });
+
+    const firstHelperName = adapter._arrayCompoundBaseIndexName(firstClassName, indexName);
+    const secondHelperName = adapter._arrayCompoundBaseIndexName(secondClassName, indexName);
+    expect(firstHelperName).not.toBe(secondHelperName);
+    expect(
+      adapter
+        ._prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?")
+        .get(firstHelperName)
+    ).toBeDefined();
+    expect(
+      adapter
+        ._prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?")
+        .get(secondHelperName)
+    ).toBeDefined();
+
+    await adapter.dropIndexes(firstClassName, [indexName]);
+    expect(
+      adapter
+        ._prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?")
+        .get(secondHelperName)
+    ).toBeDefined();
+  });
+
+  it('skips array compound helpers with missing base columns', async () => {
+    const className = 'MissingArrayHelperBaseClass';
+    const schema = {
+      className,
+      fields: {
+        objectId: { type: 'String' },
+        tags: { type: 'Array', contents: { type: 'String' } },
+      },
+    };
+    const indexName = 'tags_missingField';
+    await adapter.createClass(className, schema);
+
+    await expectAsync(
+      adapter.createIndexes(className, [
+        {
+          name: indexName,
+          key: { tags: 1, missingField: -1 },
+        },
+      ])
+    ).toBeResolved();
+    expect(
+      adapter
+        ._prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?")
+        .get(adapter._arrayCompoundBaseIndexName(className, indexName))
+    ).toBeUndefined();
   });
 
 
