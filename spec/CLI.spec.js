@@ -216,11 +216,24 @@ describe('execution', () => {
 
   function waitForStartup(cp, requiredOutput) {
     return new Promise((resolve, reject) => {
-      const aggregated = [];
-      cp.stdout.on('data', data => {
-        aggregated.push(data.toString());
-        if (requiredOutput.every(r => aggregated.some(a => a.includes(r)))) {
+      let aggregated = '';
+      let resolved = false;
+      const appendOutput = data => {
+        aggregated += data.toString();
+        if (!resolved && requiredOutput.every(output => aggregated.includes(output))) {
+          resolved = true;
           resolve();
+        }
+      };
+      cp.stdout.on('data', appendOutput);
+      cp.stderr.on('data', appendOutput);
+      cp.on('close', code => {
+        if (!resolved) {
+          reject(
+            new Error(
+              `Parse Server process exited before startup output was observed (code: ${code}). Output:\n${aggregated}`
+            )
+          );
         }
       });
       cp.on('error', reject);

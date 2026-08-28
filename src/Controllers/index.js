@@ -22,6 +22,7 @@ import { InMemoryCacheAdapter } from '../Adapters/Cache/InMemoryCacheAdapter';
 import { AnalyticsAdapter } from '../Adapters/Analytics/AnalyticsAdapter';
 import MongoStorageAdapter from '../Adapters/Storage/Mongo/MongoStorageAdapter';
 import PostgresStorageAdapter from '../Adapters/Storage/Postgres/PostgresStorageAdapter';
+import SQLiteStorageAdapter from '../Adapters/Storage/SQLite/SQLiteStorageAdapter';
 import ParseGraphQLController from './ParseGraphQLController';
 import SchemaCache from '../Adapters/Cache/SchemaCache';
 
@@ -218,12 +219,26 @@ export function getDatabaseAdapter(databaseURI, collectionPrefix, databaseOption
     const parsedURI = new URL(databaseURI);
     protocol = parsedURI.protocol ? parsedURI.protocol.toLowerCase() : null;
   } catch {
-    /* */
+    if (typeof databaseURI === 'string') {
+      const normalizedURI = databaseURI.toLowerCase();
+      if (normalizedURI.startsWith('sqlite://')) {
+        protocol = 'sqlite:';
+      } else if (normalizedURI.startsWith('file:')) {
+        protocol = 'file:';
+      }
+    }
   }
   switch (protocol) {
     case 'postgres:':
     case 'postgresql:':
       return new PostgresStorageAdapter({
+        uri: databaseURI,
+        collectionPrefix,
+        databaseOptions,
+      });
+    case 'sqlite:':
+    case 'file:':
+      return new SQLiteStorageAdapter({
         uri: databaseURI,
         collectionPrefix,
         databaseOptions,

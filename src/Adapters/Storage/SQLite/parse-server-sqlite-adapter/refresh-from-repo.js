@@ -1,0 +1,118 @@
+"use strict";
+
+const fs = require("fs");
+const path = require("path");
+
+const repoRoot = path.resolve(__dirname, "../../../../..");
+const sourceDir = path.join(repoRoot, "lib/Adapters/Storage/SQLite");
+const targetDir = __dirname;
+
+const fileHeaders = {
+  "SQLiteClient.js":
+    `// Standalone package copy of the built SQLite client helpers.\n` +
+    `/* eslint-disable indent -- Babel emits extra blocks around switch lexical declarations. */\n\n`,
+  "SQLiteConfigParser.js": `// Standalone package copy of the built SQLite URI parser.\n\n`,
+  "SQLiteStorageAdapter.js":
+    `// Standalone package copy of the built SQLite adapter.\n` +
+    `// The only functional edits here retarget Parse Server internals to the host app.\n` +
+    `/* eslint-disable no-cond-assign, unused-imports/no-unused-vars -- Babel output. */\n\n`,
+  "SQLiteStorageAdapterWorker.js":
+    `// Standalone package copy of the built SQLite worker runtime.\n\n`,
+  "SQLiteUtils.js":
+    `// Standalone package copy of the built SQLite adapter utility helpers.\n\n`,
+  "SQLiteWorkerStorageAdapter.js":
+    `// Standalone package copy of the built SQLite worker facade.\n\n`,
+};
+
+const importRewrite = {
+  search: [
+    `var _StorageAdapter = require("../StorageAdapter");\n`,
+    `var _SQLiteClient = require("./SQLiteClient");\n`,
+    `var _SQLiteConfigParser = require("./SQLiteConfigParser");\n`,
+    `var _PostgresStorageAdapter = _interopRequireDefault(require("../Postgres/PostgresStorageAdapter"));\n`,
+    `var _RestQuery = _interopRequireDefault(require("../../../RestQuery"));\n`,
+    `var _node = _interopRequireDefault(require("parse/node"));\n`,
+    `var _fs = _interopRequireDefault(require("fs"));\n`,
+    `var _os = _interopRequireDefault(require("os"));\n`,
+    `var _path = _interopRequireDefault(require("path"));\n`,
+    `var _bson = require("bson");\n`,
+    `var _Utils = _interopRequireDefault(require("../../../Utils"));\n`,
+    `var _Error = require("../../../Error");\n`,
+    `var _logger = _interopRequireDefault(require("../../../logger"));\n`,
+  ].join(""),
+  replace: [
+    `var _SQLiteClient = require("./SQLiteClient");\n`,
+    `var _SQLiteConfigParser = require("./SQLiteConfigParser");\n`,
+    `var _loadParseServerInternal = require("./loadParseServerInternal");\n`,
+    `var _PostgresStorageAdapter = _interopRequireDefault((0, _loadParseServerInternal.loadParseServerInternal)("lib/Adapters/Storage/Postgres/PostgresStorageAdapter"));\n`,
+    `var _RestQuery = _interopRequireDefault((0, _loadParseServerInternal.loadParseServerInternal)("lib/RestQuery"));\n`,
+    `var _node = _interopRequireDefault(require("parse/node"));\n`,
+    `var _fs = _interopRequireDefault(require("fs"));\n`,
+    `var _os = _interopRequireDefault(require("os"));\n`,
+    `var _path = _interopRequireDefault(require("path"));\n`,
+    `var _bson = require("bson");\n`,
+    `var _Utils = _interopRequireDefault((0, _loadParseServerInternal.loadParseServerInternal)("lib/Utils"));\n`,
+    `var _Error = (0, _loadParseServerInternal.loadParseServerInternal)("lib/Error");\n`,
+    `var _logger = _interopRequireDefault((0, _loadParseServerInternal.loadParseServerInternal)("lib/logger"));\n`,
+  ].join(""),
+};
+
+const utilsCompatSearch = [
+  "const {\n",
+  "  getRegexLeadingLiteralSetInfo,\n",
+  "  getSimpleNormalizedRegexInfo,\n",
+  "  getRegexPrefixPrefilterInfo,\n",
+  "  isNumericArrayIndexComponent,\n",
+  "  normalizeRegexPattern\n",
+  "} = require('./SQLiteUtils');\n",
+].join("");
+
+const utilsCompatReplace =
+  utilsCompatSearch +
+  "const parseServerUtils = _Utils.default ?? _Utils;\n" +
+  "if (typeof parseServerUtils.isDate !== 'function') {\n" +
+  "  // Older Parse Server builds expose Utils without the realm-safe Date helper this adapter expects.\n" +
+  "  parseServerUtils.isDate = value => Object.prototype.toString.call(value) === '[object Date]';\n" +
+  "}\n";
+
+function stripSourceMap(content) {
+  return `${content.replace(/\n\/\/# sourceMappingURL=.*$/s, "").trimEnd()}\n`;
+}
+
+function withHeader(filename, content) {
+  const header = fileHeaders[filename];
+  if (!header) {
+    return content;
+  }
+  return content.replace(/^"use strict";\n\n/, `"use strict";\n\n${header}`);
+}
+
+function rewriteStandaloneImports(content) {
+  if (!content.includes(importRewrite.search)) {
+    throw new Error("Could not find the built SQLite import block to rewrite.");
+  }
+  return content.replace(importRewrite.search, importRewrite.replace);
+}
+
+function applyStandaloneCompat(content) {
+  if (!content.includes(utilsCompatSearch)) {
+    throw new Error("Could not find the SQLite utils import block to patch.");
+  }
+  return content.replace(utilsCompatSearch, utilsCompatReplace);
+}
+
+for (const filename of Object.keys(fileHeaders)) {
+  const sourceFile = path.join(sourceDir, filename);
+  const targetFile = path.join(targetDir, filename);
+  let content = fs.readFileSync(sourceFile, "utf8");
+  content = stripSourceMap(content);
+  if (filename === "SQLiteStorageAdapter.js") {
+    content = rewriteStandaloneImports(content);
+    content = applyStandaloneCompat(content);
+  }
+  content = withHeader(filename, content);
+  fs.writeFileSync(targetFile, content);
+}
+
+// eslint-disable-next-line no-console
+console.log(`Refreshed standalone package files in ${targetDir}`);
