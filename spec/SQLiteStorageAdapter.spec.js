@@ -235,6 +235,46 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
     }
   });
 
+  it('does not apply worker property updates before older parked operations', async () => {
+    const workerAdapter = new SQLiteStorageAdapter({
+      uri: 'sqlite://:memory:',
+      executionMode: 'worker',
+    });
+    const schema = {
+      className: 'WorkerPropertyOrderClass',
+      fields: { objectId: { type: 'String' } },
+    };
+
+    try {
+      await workerAdapter.createClass(schema.className, schema);
+      const transaction = await workerAdapter.createTransactionalSession();
+      const earlierIndexResult = workerAdapter
+        .setIndexesWithSchemaFormat(
+          schema.className,
+          { missing_before_update_1: { missingBeforeUpdate: 1 } },
+          {},
+          schema.fields
+        )
+        .then(
+          () => null,
+          error => error
+        );
+
+      workerAdapter.disableIndexFieldValidation = true;
+      await workerAdapter.commitTransactionalSession(transaction);
+
+      expect((await earlierIndexResult)?.message).toContain('does not exist');
+      await workerAdapter.setIndexesWithSchemaFormat(
+        schema.className,
+        { missing_after_update_1: { missingAfterUpdate: 1 } },
+        {},
+        schema.fields
+      );
+    } finally {
+      await workerAdapter.handleShutdown();
+    }
+  });
+
   it('supports pluggable synchronous sqlite client providers', async () => {
     let createClientCalls = 0;
     const providerAdapter = new SQLiteStorageAdapter({

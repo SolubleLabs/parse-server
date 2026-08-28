@@ -1962,3 +1962,9 @@
 - URI integer options now require a complete signed decimal-integer token and a JavaScript safe-integer value; numeric suffixes, decimal forms, exponent forms, and overflow are ignored.
 - The node:sqlite provider test now checks whether the runtime can resolve the built-in module and is pending rather than failing on older Node releases.
 - Validation: build and lint green; generated standalone package refreshed from source; 109/109 adapter specs green; 99/99 executed worker schema specs green with one pre-existing xit.
+
+### Worker Property FIFO Correction
+- Supersedes the control-queue design above. A later control update could overtake an older regular invocation parked during a transaction and retroactively change that invocation's behavior.
+- Property updates now enter the regular FIFO directly. Transaction-affine operations retain priority until COMMIT/ROLLBACK, then older regular work runs before the property update and later regular work runs after it.
+- Removed the third queue, sequence counter, and head comparisons; the corrected scheduler is smaller and retains O(1) enqueue/dequeue behavior.
+- Validation: a red regression proves index validation is unchanged for an older parked call and changed for a later call; build, lint, generated-package refresh, diff checks, and 110/110 adapter specs are green.

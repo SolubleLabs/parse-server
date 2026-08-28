@@ -135,8 +135,8 @@ class SQLiteWorkerClient {
     if (this._closed) {
       throw new Error('SQLite worker is already shut down');
     }
-    // The worker queues this control message by port submission order. The
-    // assignment is asynchronous, but a later eligible invocation cannot pass it.
+    // The worker treats this asynchronous assignment as regular FIFO work so
+    // it cannot overtake an earlier operation parked behind a transaction.
     this._worker.postMessage({
       type: 'setAdapterProperty',
       property,
