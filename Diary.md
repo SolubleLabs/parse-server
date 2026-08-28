@@ -1955,3 +1955,10 @@
 - Current official APIs are not one interchangeable surface: Node `DatabaseSync` is synchronous and supports connection UDFs; Expo exposes both sync and Promise statement APIs but no JS UDF registration; libSQL is Promise-oriented and likewise does not expose the adapter's per-connection UDF mechanism.
 - A genuine Expo/libSQL implementation therefore needs a separate async executor plus SQL/capability fallbacks for residual regex and geo operations. Making the direct engine await every low-level statement would add Promise overhead to roughly 130 result-dependent database calls while still not solving the missing-UDF behavior.
 - Final focused validation: build, lint, and diff checks green; 109/109 adapter specs green; worker query integration 11/11 green on both better-sqlite3 and node:sqlite.
+
+### Worker Queue And URI Parser Audit
+- Kept regular database work parked while a transaction is active. Falling back to it would let reads observe pre-commit state and could let a synchronous write block the worker before it processes the transaction's COMMIT.
+- Mutable adapter properties now use an O(1) control queue. Monotonic sequence numbers preserve their submission order against whichever database queue is currently eligible without scanning or sorting.
+- URI integer options now require a complete signed decimal-integer token and a JavaScript safe-integer value; numeric suffixes, decimal forms, exponent forms, and overflow are ignored.
+- The node:sqlite provider test now checks whether the runtime can resolve the built-in module and is pending rather than failing on older Node releases.
+- Validation: build and lint green; generated standalone package refreshed from source; 109/109 adapter specs green; 99/99 executed worker schema specs green with one pre-existing xit.

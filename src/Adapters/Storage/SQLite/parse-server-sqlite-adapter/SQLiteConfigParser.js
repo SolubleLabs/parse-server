@@ -13,8 +13,11 @@ const parseOptionalInteger = value => {
   if (value === undefined || value === null || value === '') {
     return null;
   }
-  const parsedValue = parseInt(value, 10);
-  return Number.isFinite(parsedValue) ? parsedValue : null;
+  if (!/^[+-]?\d+$/.test(value)) {
+    return null;
+  }
+  const parsedValue = Number(value);
+  return Number.isSafeInteger(parsedValue) ? parsedValue : null;
 };
 const applySQLiteQueryOptions = (options, searchParams) => {
   if (searchParams.has('fileMustExist')) {

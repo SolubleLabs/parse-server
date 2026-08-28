@@ -30,6 +30,9 @@ class InvocationQueue {
   push(invocation) {
     this._items.push(invocation);
   }
+  peek() {
+    return this._items[this._head] || null;
+  }
   shift() {
     const invocation = this._items[this._head];
     if (!invocation) {
@@ -52,8 +55,10 @@ class InvocationQueue {
 }
 const regularInvocations = new InvocationQueue();
 const transactionInvocations = new InvocationQueue();
+const controlInvocations = new InvocationQueue();
 let activeTransactionId = null;
 let nextTransactionId = 1;
+let nextInvocationSequence = 1;
 let isDraining = false;
 adapter.watch(() => parentPort.postMessage({
   type: 'schemaChange'
@@ -137,6 +142,11 @@ const invokeAdaptiveCollectionMethod = async invocation => {
   }
 };
 const runInvocation = async invocation => {
+  if (invocation.method === '__setAdapterProperty') {
+    const [property, value] = invocation.args;
+    adapter[property] = value;
+    return;
+  }
   if (invocation.method.startsWith('__legacyDatabase')) {
     return invokeLegacyDatabaseMethod(invocation);
   }
@@ -178,29 +188,49 @@ const runInvocation = async invocation => {
     }
   }
 };
+const getNextInvocation = () => {
+  // Regular database work must stay parked while another connection owns a
+  // transaction, or a blocking write could prevent its queued COMMIT forever.
+  const databaseQueue = activeTransactionId == null ? regularInvocations : transactionInvocations;
+  const databaseInvocation = databaseQueue.peek();
+  const controlInvocation = controlInvocations.peek();
+  if (!databaseInvocation) {
+    return controlInvocations.shift();
+  }
+  if (!controlInvocation || databaseInvocation.sequence < controlInvocation.sequence) {
+    return databaseQueue.shift();
+  }
+  return controlInvocations.shift();
+};
 const drainInvocations = async () => {
   if (isDraining) {
     return;
   }
   isDraining = true;
   try {
-    let invocation = activeTransactionId == null ? regularInvocations.shift() : transactionInvocations.shift();
+    let invocation = getNextInvocation();
     while (invocation) {
       try {
         const result = await runInvocation(invocation);
-        parentPort.postMessage({
-          type: 'response',
-          id: invocation.id,
-          result
-        });
+        if (invocation.expectsResponse !== false) {
+          parentPort.postMessage({
+            type: 'response',
+            id: invocation.id,
+            result
+          });
+        }
       } catch (error) {
-        parentPort.postMessage({
-          type: 'response',
-          id: invocation.id,
-          error: serializeError(error)
-        });
+        if (invocation.expectsResponse !== false) {
+          parentPort.postMessage({
+            type: 'response',
+            id: invocation.id,
+            error: serializeError(error)
+          });
+        } else {
+          throw error;
+        }
       }
-      invocation = activeTransactionId == null ? regularInvocations.shift() : transactionInvocations.shift();
+      invocation = getNextInvocation();
     }
   } finally {
     isDraining = false;
@@ -211,12 +241,21 @@ parentPort.on('message', message => {
     if (message.property !== 'disableIndexFieldValidation') {
       throw new Error(`Unsupported mutable SQLite adapter property ${message.property}`);
     }
-    adapter.disableIndexFieldValidation = !!message.value;
+    controlInvocations.push({
+      method: '__setAdapterProperty',
+      args: [message.property, !!message.value],
+      expectsResponse: false,
+      sequence: nextInvocationSequence
+    });
+    nextInvocationSequence += 1;
+    void drainInvocations();
     return;
   }
   if (message?.type !== 'invoke') {
     return;
   }
+  message.sequence = nextInvocationSequence;
+  nextInvocationSequence += 1;
   const transactionId = getInvocationTransactionId(message);
   if (activeTransactionId != null && (message.method === 'handleShutdown' || transactionId === activeTransactionId)) {
     transactionInvocations.push(message);

@@ -4,6 +4,14 @@ const {
   getDatabaseOptionsFromURI,
 } = require('../lib/Adapters/Storage/SQLite/SQLiteConfigParser');
 const Parse = require('parse/node');
+const itIfNodeSQLiteAvailable = (() => {
+  try {
+    require.resolve('node:sqlite');
+    return it;
+  } catch {
+    return xit;
+  }
+})();
 
 describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
   let adapter;
@@ -115,6 +123,16 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
     });
 
     expect(getDatabaseOptionsFromURI('file::memory:?cache=shared').filename).toBe(':memory:');
+    expect(
+      getDatabaseOptionsFromURI(
+        'sqlite://invalid-options.sqlite?timeout=100ms&cacheSizeKb=4096.5'
+      )
+    ).toEqual({ filename: 'invalid-options.sqlite' });
+    expect(
+      getDatabaseOptionsFromURI(
+        'sqlite://unsafe-options.sqlite?timeout=9007199254740992&cacheSizeKb=1e3'
+      )
+    ).toEqual({ filename: 'unsafe-options.sqlite' });
   });
 
   it('parses supported sqlite execution options without accepting arbitrary providers', () => {
@@ -256,7 +274,7 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
     ).toThrowError(/must implement prepare/);
   });
 
-  it('runs through the node sqlite synchronous provider', async () => {
+  itIfNodeSQLiteAvailable('runs through the node sqlite synchronous provider', async () => {
     const nodeSQLiteAdapter = new SQLiteStorageAdapter({
       uri: 'sqlite://:memory:',
       executionProvider: 'node:sqlite',

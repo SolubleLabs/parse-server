@@ -151,8 +151,8 @@ class SQLiteWorkerClient {
     if (this._closed) {
       throw new Error('SQLite worker is already shut down');
     }
-    // Messages from one port are ordered, so a following adapter invocation
-    // cannot overtake this synchronous configuration update in the worker.
+    // The worker queues this control message by port submission order. The
+    // assignment is asynchronous, but a later eligible invocation cannot pass it.
     this._worker.postMessage({ type: 'setAdapterProperty', property, value });
   }
 
