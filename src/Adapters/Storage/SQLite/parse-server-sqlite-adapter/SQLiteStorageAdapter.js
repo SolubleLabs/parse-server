@@ -85,10 +85,16 @@ const nullFieldTrackerColumn = '_nullFields';
 const writeSequenceColumn = '_writeSeq';
 const sqliteEncodedTableNamePrefix = '__psa__';
 const sqliteArrayIndexTableNamePrefix = '__arridx__';
+const sqliteSpatialIndexTableNamePrefix = '__spidx__';
+const sqliteSpatialIdIndexPrefix = '__psa_spatialid__';
 const sqliteArrayCompoundBaseIndexPrefix = '__psa_arrbase__';
+const sqlitePhysicalIndexPrefix = '__psa_idx__';
+const sqliteArrayIndexTriggerVersion = 2;
+const sqliteSpatialIndexTriggerVersion = 3;
 const authDataFieldPrefix = '_auth_data_';
 const arrayIndexValueTypeColumn = 'valueType';
 const arrayIndexValueColumn = 'value';
+const spatialIdColumn = '_spatialId';
 const sqliteArrayIndexPointerSeparator = '\u001F';
 // Direct IN bindings let SQLite seek through normal compound indexes. Larger
 // lists stay in one JSON binding so one unusual bulk list cannot exhaust
@@ -135,7 +141,7 @@ const implicitSQLiteUserColumnFields = Object.freeze({
 });
 const hiddenUserSchemaFields = new Set(['_hashed_password', '_password_history', '_email_verify_token_expires_at', '_email_verify_token', '_account_lockout_expires_at', '_failed_login_count', '_perishable_token', '_perishable_token_expires_at', '_password_changed_at']);
 const userDateLikeStringFields = new Set(['_email_verify_token_expires_at', '_account_lockout_expires_at', '_perishable_token_expires_at', '_password_changed_at']);
-const isAdapterInternalColumn = fieldName => fieldName === nullFieldTrackerColumn || fieldName === writeSequenceColumn;
+const isAdapterInternalColumn = fieldName => fieldName === nullFieldTrackerColumn || fieldName === writeSequenceColumn || fieldName === spatialIdColumn;
 const getAuthDataProviderFieldName = fieldName => {
   if (typeof fieldName !== 'string' || !fieldName.startsWith(authDataFieldPrefix)) {
     return null;
@@ -372,30 +378,45 @@ const isTextIndexDefinition = index => {
   return values.length > 0 && values.every(value => value === 'text');
 };
 const isUniqueConstraintError = err => err && (err.code === 'SQLITE_CONSTRAINT_PRIMARYKEY' || err.code === 'SQLITE_CONSTRAINT_UNIQUE' || err.message && err.message.includes('UNIQUE constraint failed'));
-const buildDuplicateKeyLogMessage = (tableName, err) => {
-  const expressionIndexMatch = err && err.message && err.message.match(/UNIQUE constraint failed:\s+index '([^']+)'/);
-  if (expressionIndexMatch) {
-    return `E11000 duplicate key error collection: ${tableName} index: ${expressionIndexMatch[1]} dup key`;
-  }
-  const uniqueMatch = err && err.message && err.message.match(/UNIQUE constraint failed:\s+(.+)/);
+const getUniqueConstraintFieldNames = message => {
+  const uniqueMatch = message.match(/UNIQUE constraint failed:\s+(.+)/);
+  const fields = [];
   if (!uniqueMatch) {
+    return fields;
+  }
+  for (const qualifiedFieldName of uniqueMatch[1].split(',')) {
+    const fieldName = qualifiedFieldName.trim().split('.').pop();
+    if (fieldName) {
+      fields.push(fieldName);
+    }
+  }
+  return fields;
+};
+const getUniqueConstraintIndexName = err => {
+  const match = err && err.message && err.message.match(/UNIQUE constraint failed:\s+index '([^']+)'/);
+  return match ? match[1] : null;
+};
+const buildDuplicateKeyLogMessage = (tableName, err) => {
+  const indexName = getUniqueConstraintIndexName(err);
+  if (indexName) {
+    return `E11000 duplicate key error collection: ${tableName} index: ${indexName} dup key`;
+  }
+  const fields = getUniqueConstraintFieldNames(err && err.message || '');
+  if (fields.length === 0) {
     return `E11000 duplicate key error collection: ${tableName}`;
   }
-  const fields = uniqueMatch[1].split(',').map(field => field.trim().split('.').pop()).filter(Boolean);
-  const indexName = fields.length > 0 ? `${fields.join('_')}_1` : 'unknown_1';
-  return `E11000 duplicate key error collection: ${tableName} index: ${indexName} dup key`;
+  const fallbackIndexName = `${fields.join('_')}_1`;
+  return `E11000 duplicate key error collection: ${tableName} index: ${fallbackIndexName} dup key`;
 };
 const getDuplicatedFieldFromUniqueConstraint = (className, err) => {
-  const message = err && err.message || '';
-  const authDataMatch = message.match(/index '_User_unique_authData_([a-zA-Z0-9_]+)_id'/);
+  const indexName = getUniqueConstraintIndexName(err) || '';
+  // Physical names prepend a class token; the logical auth index name remains
+  // after the final separator so Parse can still return ACCOUNT_ALREADY_LINKED.
+  const authDataMatch = indexName.match(/(?:^|\.)_User_unique_authData_([a-zA-Z0-9_]+)_id$/);
   if (className === '_User' && authDataMatch) {
     return `_auth_data_${authDataMatch[1]}`;
   }
-  const uniqueMatch = message.match(/UNIQUE constraint failed:\s+(.+)/);
-  if (!uniqueMatch) {
-    return null;
-  }
-  const fields = uniqueMatch[1].split(',').map(field => field.trim().split('.').pop()).filter(Boolean);
+  const fields = getUniqueConstraintFieldNames(err && err.message || '');
   if (fields.length === 1) {
     return fields[0];
   }
@@ -780,15 +801,29 @@ const parseTrackedNullFields = value => {
   }
   try {
     const parsed = JSON.parse(value);
-    return new Set(Array.isArray(parsed) ? parsed.filter(field => typeof field === 'string') : []);
+    const fields = new Set();
+    if (Array.isArray(parsed)) {
+      for (const field of parsed) {
+        if (typeof field === 'string') {
+          fields.add(field);
+        }
+      }
+    }
+    return fields;
   } catch {
     return new Set();
   }
 };
-const getExplicitNullFieldMatchExpression = fieldName => ({
-  sql: `EXISTS (` + `SELECT 1 FROM json_each(COALESCE(${quoteColumnName(nullFieldTrackerColumn)}, '[]')) ` + `WHERE json_each.value = ?` + `)`,
-  params: [fieldName]
-});
+const getExplicitNullFieldMatchExpression = fieldName => {
+  const serializedFieldName = JSON.stringify(fieldName).replace(/'/g, "''");
+  return {
+    // The tracker is always compact JSON produced by JSON.stringify. Searching
+    // for the complete quoted token cannot match a longer or escaped field name,
+    // and avoids opening a json_each virtual table for every candidate row.
+    sql: `instr(COALESCE(${quoteColumnName(nullFieldTrackerColumn)}, '[]'), ` + `'${serializedFieldName}') > 0`,
+    params: []
+  };
+};
 const waitForNextEventLoopTurn = (() => {
   let postMessageToNextTurn;
   if (typeof MessageChannel === 'function') {
@@ -798,25 +833,38 @@ const waitForNextEventLoopTurn = (() => {
       port1,
       port2
     } = new MessageChannel();
-    if (typeof port1.unref === 'function') {
-      port1.unref();
-    }
-    if (typeof port2.unref === 'function') {
-      port2.unref();
-    }
     port1.onmessage = () => {
       const resolve = pendingResolvers[pendingResolverHead];
       if (resolve) {
         pendingResolvers[pendingResolverHead] = undefined;
         pendingResolverHead += 1;
-        if (pendingResolverHead > 1024 && pendingResolverHead * 2 >= pendingResolvers.length) {
+        if (pendingResolverHead === pendingResolvers.length) {
+          pendingResolvers = [];
+          pendingResolverHead = 0;
+          if (typeof port1.unref === 'function') {
+            // Node refs a MessagePort when its listener is installed. Release
+            // that handle whenever no queued SQLite operation needs the turn.
+            port1.unref();
+          }
+        } else if (pendingResolverHead > 1024 && pendingResolverHead * 2 >= pendingResolvers.length) {
           pendingResolvers = pendingResolvers.slice(pendingResolverHead);
           pendingResolverHead = 0;
         }
         resolve();
       }
     };
+    if (typeof port1.unref === 'function') {
+      port1.unref();
+    }
+    if (typeof port2.unref === 'function') {
+      port2.unref();
+    }
     postMessageToNextTurn = () => new Promise(resolve => {
+      if (pendingResolverHead === pendingResolvers.length && typeof port1.ref === 'function') {
+        // An unresolved Promise alone does not keep Node alive. Keep the
+        // receive port referenced only until this queue drains.
+        port1.ref();
+      }
       pendingResolvers.push(resolve);
       port2.postMessage(null);
     });
@@ -828,6 +876,10 @@ const waitForNextEventLoopTurn = (() => {
   return () => postMessageToNextTurn();
 })();
 const shouldYieldBeforeTopLevelSQLiteOperation = transactionalSession => !(transactionalSession && typeof transactionalSession.prepare === 'function');
+
+// A separate transaction connection owns SQLite's write lock. Query through
+// it immediately, but defer lazy DDL until a normal main-connection query.
+const canCreateSQLiteQueryArtifacts = (transactionalSession, mainDatabase) => !transactionalSession || transactionalSession === mainDatabase;
 const shouldIgnoreSQLiteOperationAfterShutdown = (dbHandle, isShutDown) => !dbHandle && isShutDown;
 const waitForSQLiteShutdownDrainWindow = async () => {
   if (sqliteShutdownDrainDelayMs > 0) {
@@ -1211,6 +1263,39 @@ const isSQLitePrimitiveSetComparisonValue = value => {
   }
   return typeof value === 'number' && Number.isFinite(value);
 };
+const getSQLiteOrderedSetValueIdentity = (value, fieldType) => {
+  if (fieldType === 'String' && typeof value === 'string') {
+    return `string:${value}`;
+  }
+  if (fieldType === 'Boolean' && typeof value === 'boolean') {
+    return `boolean:${String(value)}`;
+  }
+  if (fieldType === 'Number' && typeof value === 'number' && Number.isFinite(value)) {
+    return `number:${String(value)}`;
+  }
+  if (fieldType === 'Pointer' && isPointerValue(value)) {
+    return `pointer:${String(toSQLiteValue(value))}`;
+  }
+  if (fieldType === 'Date' && (value && typeof value === 'object' && value.__type === 'Date' || _Utils.default.isDate(value))) {
+    return `date:${String(toSQLiteValue(value))}`;
+  }
+  return null;
+};
+const getSQLiteOrderedSetValues = (comparisonValues, fieldType) => {
+  const uniqueValues = [];
+  const seenValues = new Set();
+  for (const comparisonValue of comparisonValues) {
+    const valueIdentity = getSQLiteOrderedSetValueIdentity(comparisonValue, fieldType);
+    if (valueIdentity === null) {
+      return null;
+    }
+    if (!seenValues.has(valueIdentity)) {
+      seenValues.add(valueIdentity);
+      uniqueValues.push(comparisonValue);
+    }
+  }
+  return uniqueValues.length > 1 && uniqueValues.length <= sqliteOrderedSetUnionBranchLimit ? uniqueValues : null;
+};
 const replaceSQLiteQueryValueAtPath = (queryPart, path, replacementValue) => {
   if (path.length === 0) {
     return replacementValue;
@@ -1342,12 +1427,20 @@ const getArrayRootDotExistsExpression = (arraySourceExpression, typeExpression, 
  * arrays, then resumes normal object/index traversal once it reaches a
  * non-array value again.
  */
-const getNestedDotArrayTraversalExpression = (rootExpression, components, fieldName, terminalMatchBuilder) => {
+const getNestedDotTraversalRowsExpression = (rootExpression, components, fieldName, {
+  requireArrayTraversal,
+  expandTerminalArrays,
+  seedFromSql = '',
+  identityExpression = null
+}) => {
   const cteName = '__dot_walk';
+  const terminalTableName = '__dot_terminal';
+  const identityColumn = '__dot_identity';
   const valueColumn = '__dot_value';
   const typeColumn = '__dot_type';
   const depthColumn = '__dot_depth';
   const usedArrayColumn = '__dot_used_array';
+  const recursiveIdentitySql = identityExpression ? `${cteName}.${identityColumn} AS ${identityColumn}, ` : '';
   const recursiveTerms = [];
   const flattenDepthConditions = [];
   for (let index = 0; index < components.length; index += 1) {
@@ -1355,24 +1448,53 @@ const getNestedDotArrayTraversalExpression = (rootExpression, components, fieldN
       flattenDepthConditions.push(`${cteName}.${depthColumn} = ${index}`);
     }
   }
+  if (expandTerminalArrays) {
+    // Mongo multikey indexes flatten an array found at the indexed terminal path.
+    // Keeping that expansion in this shared walker makes trigger rows and query
+    // fallback semantics follow the same path traversal rules.
+    flattenDepthConditions.push(`${cteName}.${depthColumn} = ${components.length}`);
+  }
   if (flattenDepthConditions.length > 0) {
-    recursiveTerms.push(`SELECT ` + `array_item.value AS ${valueColumn}, ` + `array_item.type AS ${typeColumn}, ` + `${cteName}.${depthColumn} AS ${depthColumn}, ` + `1 AS ${usedArrayColumn} ` + `FROM ${cteName}, json_each(${cteName}.${valueColumn}) AS array_item ` + `WHERE ${cteName}.${typeColumn} = 'array' ` + `AND ${cteName}.${depthColumn} < ${components.length} ` + `AND (${flattenDepthConditions.join(' OR ')})`);
+    recursiveTerms.push(`SELECT ` + recursiveIdentitySql + `array_item.value AS ${valueColumn}, ` + `array_item.type AS ${typeColumn}, ` + `${cteName}.${depthColumn} AS ${depthColumn}, ` + `1 AS ${usedArrayColumn} ` + `FROM ${cteName}, json_each(${cteName}.${valueColumn}) AS array_item ` + `WHERE ${cteName}.${typeColumn} = 'array' ` + `AND (${flattenDepthConditions.join(' OR ')})`);
   }
   for (let index = 0; index < components.length; index += 1) {
     const component = components[index];
     if (isNumericArrayIndexComponent(component)) {
       const arrayPath = `$[${component}]`;
       const objectPath = `$."${component}"`;
-      recursiveTerms.push(`SELECT ` + `(CASE ${cteName}.${typeColumn} ` + `WHEN 'array' THEN json_extract(${cteName}.${valueColumn}, '${arrayPath}') ` + `WHEN 'object' THEN json_extract(${cteName}.${valueColumn}, '${objectPath}') ` + `ELSE NULL END) AS ${valueColumn}, ` + `(CASE ${cteName}.${typeColumn} ` + `WHEN 'array' THEN json_type(${cteName}.${valueColumn}, '${arrayPath}') ` + `WHEN 'object' THEN json_type(${cteName}.${valueColumn}, '${objectPath}') ` + `ELSE NULL END) AS ${typeColumn}, ` + `${index + 1} AS ${depthColumn}, ` + `${cteName}.${usedArrayColumn} AS ${usedArrayColumn} ` + `FROM ${cteName} ` + `WHERE ${cteName}.${depthColumn} = ${index} ` + `AND ${cteName}.${typeColumn} IN ('array', 'object')`);
+      recursiveTerms.push(`SELECT ` + recursiveIdentitySql + `(CASE ${cteName}.${typeColumn} ` + `WHEN 'array' THEN json_extract(${cteName}.${valueColumn}, '${arrayPath}') ` + `WHEN 'object' THEN json_extract(${cteName}.${valueColumn}, '${objectPath}') ` + `ELSE NULL END) AS ${valueColumn}, ` + `(CASE ${cteName}.${typeColumn} ` + `WHEN 'array' THEN json_type(${cteName}.${valueColumn}, '${arrayPath}') ` + `WHEN 'object' THEN json_type(${cteName}.${valueColumn}, '${objectPath}') ` + `ELSE NULL END) AS ${typeColumn}, ` + `${index + 1} AS ${depthColumn}, ` + `${cteName}.${usedArrayColumn} AS ${usedArrayColumn} ` + `FROM ${cteName} ` + `WHERE ${cteName}.${depthColumn} = ${index} ` + `AND ${cteName}.${typeColumn} IN ('array', 'object')`);
       continue;
     }
     validateObjectPathComponent(component, fieldName);
     const objectPath = `$."${component}"`;
-    recursiveTerms.push(`SELECT ` + `json_extract(${cteName}.${valueColumn}, '${objectPath}') AS ${valueColumn}, ` + `json_type(${cteName}.${valueColumn}, '${objectPath}') AS ${typeColumn}, ` + `${index + 1} AS ${depthColumn}, ` + `${cteName}.${usedArrayColumn} AS ${usedArrayColumn} ` + `FROM ${cteName} ` + `WHERE ${cteName}.${depthColumn} = ${index} ` + `AND ${cteName}.${typeColumn} = 'object'`);
+    recursiveTerms.push(`SELECT ` + recursiveIdentitySql + `json_extract(${cteName}.${valueColumn}, '${objectPath}') AS ${valueColumn}, ` + `json_type(${cteName}.${valueColumn}, '${objectPath}') AS ${typeColumn}, ` + `${index + 1} AS ${depthColumn}, ` + `${cteName}.${usedArrayColumn} AS ${usedArrayColumn} ` + `FROM ${cteName} ` + `WHERE ${cteName}.${depthColumn} = ${index} ` + `AND ${cteName}.${typeColumn} = 'object'`);
   }
-  const terminalMatch = terminalMatchBuilder(`${cteName}.${valueColumn}`, `${cteName}.${typeColumn}`);
+  const terminalConditions = [`${cteName}.${depthColumn} = ${components.length}`];
+  if (requireArrayTraversal) {
+    terminalConditions.push(`${cteName}.${usedArrayColumn} = 1`);
+  }
+  if (expandTerminalArrays) {
+    terminalConditions.push(`${cteName}.${typeColumn} != 'array'`);
+  }
+  const recursiveSql = recursiveTerms.length > 0 ? ` UNION ALL ${recursiveTerms.join(' UNION ALL ')}` : '';
+  const cteIdentityColumnSql = identityExpression ? `${identityColumn}, ` : '';
+  const seedIdentitySql = identityExpression ? `${identityExpression} AS ${identityColumn}, ` : '';
+  const terminalIdentitySql = identityExpression ? `${cteName}.${identityColumn} AS ${identityColumn}, ` : '';
   return {
-    sql: `EXISTS (` + `WITH RECURSIVE ${cteName}(${valueColumn}, ${typeColumn}, ${depthColumn}, ${usedArrayColumn}) AS (` + `SELECT ` + `${rootExpression} AS ${valueColumn}, ` + `${getJsonRootTypeExpression(rootExpression)} AS ${typeColumn}, ` + `0 AS ${depthColumn}, ` + `0 AS ${usedArrayColumn} ` + `UNION ALL ` + recursiveTerms.join(' UNION ALL ') + `) ` + `SELECT 1 FROM ${cteName} ` + `WHERE ${cteName}.${depthColumn} = ${components.length} ` + `AND ${cteName}.${usedArrayColumn} = 1 ` + `AND ${terminalMatch.sql}` + `)`,
+    sql: `(` + `WITH RECURSIVE ${cteName}(${cteIdentityColumnSql}${valueColumn}, ${typeColumn}, ${depthColumn}, ${usedArrayColumn}) AS (` + `SELECT ` + seedIdentitySql + `${rootExpression} AS ${valueColumn}, ` + `${getJsonRootTypeExpression(rootExpression)} AS ${typeColumn}, ` + `0 AS ${depthColumn}, ` + `0 AS ${usedArrayColumn}${seedFromSql}` + recursiveSql + `) ` + `SELECT ${terminalIdentitySql}${cteName}.${valueColumn} AS ${valueColumn}, ` + `${cteName}.${typeColumn} AS ${typeColumn} ` + `FROM ${cteName} WHERE ${terminalConditions.join(' AND ')}` + `)`,
+    valueExpression: `${terminalTableName}.${valueColumn}`,
+    typeExpression: `${terminalTableName}.${typeColumn}`,
+    identityExpression: identityExpression ? `${terminalTableName}.${identityColumn}` : null
+  };
+};
+const getNestedDotArrayTraversalExpression = (rootExpression, components, fieldName, terminalMatchBuilder) => {
+  const terminalRows = getNestedDotTraversalRowsExpression(rootExpression, components, fieldName, {
+    requireArrayTraversal: true,
+    expandTerminalArrays: true
+  });
+  const terminalMatch = terminalMatchBuilder(terminalRows.valueExpression, terminalRows.typeExpression);
+  return {
+    sql: `EXISTS (` + `SELECT 1 FROM ${terminalRows.sql} AS __dot_terminal ` + `WHERE ${terminalMatch.sql}` + `)`,
     params: terminalMatch.params
   };
 };
@@ -1390,6 +1512,106 @@ const getNestedDotArrayTraversalRangeMatchExpression = (rootExpression, componen
   params: [toSQLiteValue(comparisonValue)]
 }));
 const isGeoPointValue = value => value && typeof value === 'object' && !Array.isArray(value) && value.__type === 'GeoPoint' && typeof value.latitude === 'number' && typeof value.longitude === 'number';
+const normalizeGeoLongitude = longitude => {
+  let normalized = longitude;
+  while (normalized < -180) {
+    normalized += 360;
+  }
+  while (normalized > 180) {
+    normalized -= 360;
+  }
+  return normalized;
+};
+const getSphericalCircleBounds = (latitude, longitude, radiusRadians) => {
+  const latitudeRadians = latitude * Math.PI / 180;
+  const latitudeDelta = radiusRadians * 180 / Math.PI;
+  const minLatitude = Math.max(-90, latitude - latitudeDelta);
+  const maxLatitude = Math.min(90, latitude + latitudeDelta);
+  const longitudeIntervals = [];
+  if (radiusRadians >= Math.PI || minLatitude <= -90 || maxLatitude >= 90 || Math.abs(Math.cos(latitudeRadians)) < Number.EPSILON) {
+    longitudeIntervals.push({
+      min: -180,
+      max: 180
+    });
+    return {
+      minLatitude,
+      maxLatitude,
+      longitudeIntervals
+    };
+  }
+  const longitudeDelta = Math.asin(Math.min(1, Math.sin(radiusRadians) / Math.cos(latitudeRadians))) * 180 / Math.PI;
+  const minLongitude = normalizeGeoLongitude(longitude - longitudeDelta);
+  const maxLongitude = normalizeGeoLongitude(longitude + longitudeDelta);
+  if (minLongitude <= maxLongitude) {
+    longitudeIntervals.push({
+      min: minLongitude,
+      max: maxLongitude
+    });
+  } else {
+    // A spherical cap crossing the antimeridian is two ordinary R*Tree ranges.
+    longitudeIntervals.push({
+      min: -180,
+      max: maxLongitude
+    });
+    longitudeIntervals.push({
+      min: minLongitude,
+      max: 180
+    });
+  }
+  return {
+    minLatitude,
+    maxLatitude,
+    longitudeIntervals
+  };
+};
+const shouldUseSQLiteSpatialRadiusIndex = radiusRadians => {
+  if (!Number.isFinite(radiusRadians) || radiusRadians < 0) {
+    return false;
+  }
+  // An R*Tree rowid list is counterproductive once a spherical cap covers a
+  // large part of the world. One quarter of the sphere is the measured cutoff
+  // where selective lookup still beats a compact sequential distance scan.
+  const boundedRadius = Math.min(Math.PI, radiusRadians);
+  return (1 - Math.cos(boundedRadius)) / 2 <= 0.25;
+};
+const shouldUseSQLiteSpatialBoundsIndex = bounds => {
+  let longitudeSpan = 0;
+  for (const interval of bounds.longitudeIntervals) {
+    longitudeSpan += Math.max(0, interval.max - interval.min);
+  }
+  const minLatitudeRadians = bounds.minLatitude * Math.PI / 180;
+  const maxLatitudeRadians = bounds.maxLatitude * Math.PI / 180;
+  const latitudeFraction = Math.max(0, Math.sin(maxLatitudeRadians) - Math.sin(minLatitudeRadians)) / 2;
+  const estimatedSphereFraction = Math.min(1, longitudeSpan / 360) * latitudeFraction;
+  return estimatedSphereFraction <= 0.25;
+};
+const getPolygonSpatialQueryInfo = polygon => {
+  const coordinates = polygon.coordinates;
+  const geopolyCoordinates = [];
+  let minLatitude = Infinity;
+  let maxLatitude = -Infinity;
+  let minLongitude = Infinity;
+  let maxLongitude = -Infinity;
+
+  // Parse Polygon coordinates are [latitude, longitude], while GEOPOLY uses
+  // GeoJSON's [x, y] / [longitude, latitude] order. Convert and bound once.
+  for (let index = 0; index < coordinates.length; index += 1) {
+    const latitude = Number(coordinates[index][0]);
+    const longitude = Number(coordinates[index][1]);
+    geopolyCoordinates.push([longitude, latitude]);
+    minLatitude = Math.min(minLatitude, latitude);
+    maxLatitude = Math.max(maxLatitude, latitude);
+    minLongitude = Math.min(minLongitude, longitude);
+    maxLongitude = Math.max(maxLongitude, longitude);
+  }
+  return {
+    minLatitude,
+    maxLatitude,
+    minLongitude,
+    maxLongitude,
+    geopolyJSON: JSON.stringify(geopolyCoordinates)
+  };
+};
 const getArrayAnyMatchExpression = (targetSql, comparisonValues) => {
   const eachTableName = getJSONArrayTableFunctionName(comparisonValues);
   const valueMatch = getJsonValueAnyMatchExpression(`${eachTableName}.value`, comparisonValues);
@@ -1418,9 +1640,26 @@ const getNestedDotArrayTraversalRegexMatchExpression = (rootExpression, componen
   });
   return getSQLiteRegexValueMatchExpression(valueExpression, normalizedRegex, regexMatchPlan);
 });
+const getNestedDotTraversalContainedByExpression = (rootExpression, components, fieldName, comparisonValues) => {
+  const terminalRows = getNestedDotTraversalRowsExpression(rootExpression, components, fieldName, {
+    requireArrayTraversal: false,
+    expandTerminalArrays: true
+  });
+  if (comparisonValues.length === 0) {
+    return {
+      sql: `NOT EXISTS (SELECT 1 FROM ${terminalRows.sql} AS __dot_terminal)`,
+      params: []
+    };
+  }
+  const allowedValueMatch = getJsonValueAnyMatchExpression(terminalRows.valueExpression, comparisonValues);
+  return {
+    sql: `NOT EXISTS (` + `SELECT 1 FROM ${terminalRows.sql} AS __dot_terminal ` + `WHERE NOT (${allowedValueMatch.sql})` + `)`,
+    params: allowedValueMatch.params
+  };
+};
 const getSQLiteArrayIndexPointerLookupValue = (className, objectId) => `${className}${sqliteArrayIndexPointerSeparator}${objectId}`;
-const getSQLiteArrayIndexStoredValueTypeExpression = (typeExpression, valueExpression) => `CASE ` + `WHEN ${typeExpression} IN (${sqliteIndexedArrayScalarTypeNameSQL}) THEN ${typeExpression} ` + `WHEN json_valid(${valueExpression}) AND json_type(${valueExpression}) = 'object' ` + `AND json_extract(${valueExpression}, '$.__type') = 'Date' ` + `AND json_extract(${valueExpression}, '$.iso') IS NOT NULL THEN 'date' ` + `WHEN json_valid(${valueExpression}) AND json_type(${valueExpression}) = 'object' ` + `AND json_extract(${valueExpression}, '$.__type') = 'Pointer' ` + `AND json_extract(${valueExpression}, '$.className') IS NOT NULL ` + `AND json_extract(${valueExpression}, '$.objectId') IS NOT NULL THEN 'pointer' ` + `ELSE NULL END`;
-const getSQLiteArrayIndexStoredValueExpression = (typeExpression, valueExpression) => `CASE ` + `WHEN ${typeExpression} IN (${sqliteIndexedArrayScalarTypeNameSQL}) THEN ${valueExpression} ` + `WHEN json_valid(${valueExpression}) AND json_type(${valueExpression}) = 'object' ` + `AND json_extract(${valueExpression}, '$.__type') = 'Date' ` + `AND json_extract(${valueExpression}, '$.iso') IS NOT NULL THEN json_extract(${valueExpression}, '$.iso') ` + `WHEN json_valid(${valueExpression}) AND json_type(${valueExpression}) = 'object' ` + `AND json_extract(${valueExpression}, '$.__type') = 'Pointer' ` + `AND json_extract(${valueExpression}, '$.className') IS NOT NULL ` + `AND json_extract(${valueExpression}, '$.objectId') IS NOT NULL THEN ` + `json_extract(${valueExpression}, '$.className') || '${sqliteArrayIndexPointerSeparator}' || ` + `json_extract(${valueExpression}, '$.objectId') ` + `ELSE NULL END`;
+const getSQLiteArrayIndexStoredValueTypeExpression = (typeExpression, valueExpression) => `CASE ` + `WHEN ${typeExpression} IN (${sqliteIndexedArrayScalarTypeNameSQL}) THEN ${typeExpression} ` + `WHEN json_valid(${valueExpression}) AND json_type(${valueExpression}) = 'object' ` + `AND json_extract(${valueExpression}, '$.__type') = 'Date' ` + `AND json_extract(${valueExpression}, '$.iso') IS NOT NULL THEN 'date' ` + `WHEN json_valid(${valueExpression}) AND json_type(${valueExpression}) = 'object' ` + `AND json_extract(${valueExpression}, '$.__type') = 'Pointer' ` + `AND json_extract(${valueExpression}, '$.className') IS NOT NULL ` + `AND json_extract(${valueExpression}, '$.objectId') IS NOT NULL THEN 'pointer' ` + `WHEN ${typeExpression} = 'object' AND json_valid(${valueExpression}) THEN 'object' ` + `ELSE NULL END`;
+const getSQLiteArrayIndexStoredValueExpression = (typeExpression, valueExpression) => `CASE ` + `WHEN ${typeExpression} IN (${sqliteIndexedArrayScalarTypeNameSQL}) THEN ${valueExpression} ` + `WHEN json_valid(${valueExpression}) AND json_type(${valueExpression}) = 'object' ` + `AND json_extract(${valueExpression}, '$.__type') = 'Date' ` + `AND json_extract(${valueExpression}, '$.iso') IS NOT NULL THEN json_extract(${valueExpression}, '$.iso') ` + `WHEN json_valid(${valueExpression}) AND json_type(${valueExpression}) = 'object' ` + `AND json_extract(${valueExpression}, '$.__type') = 'Pointer' ` + `AND json_extract(${valueExpression}, '$.className') IS NOT NULL ` + `AND json_extract(${valueExpression}, '$.objectId') IS NOT NULL THEN ` + `json_extract(${valueExpression}, '$.className') || '${sqliteArrayIndexPointerSeparator}' || ` + `json_extract(${valueExpression}, '$.objectId') ` + `WHEN ${typeExpression} = 'object' AND json_valid(${valueExpression}) THEN json(${valueExpression}) ` + `ELSE NULL END`;
 const getSQLiteArrayIndexLookup = comparisonValue => {
   if (comparisonValue === null) {
     return {
@@ -1461,7 +1700,62 @@ const getSQLiteArrayIndexLookup = comparisonValue => {
       value: getSQLiteArrayIndexPointerLookupValue(comparisonValue.className, comparisonValue.objectId)
     };
   }
+  if (comparisonValue && typeof comparisonValue === 'object' && !Array.isArray(comparisonValue)) {
+    return {
+      valueType: 'object',
+      value: stringifySQLiteJSONValue(comparisonValue)
+    };
+  }
   return null;
+};
+const getSQLiteArrayIndexDistinctValueTypes = fieldSchema => {
+  const contentsType = fieldSchema && fieldSchema.contents && typeof fieldSchema.contents === 'object' ? fieldSchema.contents.type : null;
+  switch (contentsType) {
+    case 'String':
+      return ['text'];
+    case 'Number':
+      return ['integer', 'real'];
+    case 'Boolean':
+      return ['true', 'false'];
+    case 'Date':
+      return ['date'];
+    case 'Pointer':
+      return ['pointer'];
+    case 'Object':
+    case 'Bytes':
+    case 'GeoPoint':
+    case 'Polygon':
+      return ['object'];
+    default:
+      return null;
+  }
+};
+const sqliteArrayIndexDistinctValueToParseValue = (valueType, value) => {
+  if (valueType === 'true') {
+    return true;
+  }
+  if (valueType === 'false') {
+    return false;
+  }
+  if (valueType === 'date') {
+    return {
+      __type: 'Date',
+      iso: String(value)
+    };
+  }
+  if (valueType === 'pointer') {
+    const pointerValue = String(value);
+    const separatorIndex = pointerValue.indexOf(sqliteArrayIndexPointerSeparator);
+    return {
+      __type: 'Pointer',
+      className: pointerValue.slice(0, separatorIndex),
+      objectId: pointerValue.slice(separatorIndex + sqliteArrayIndexPointerSeparator.length)
+    };
+  }
+  if (valueType === 'object') {
+    return parseJSONValue(value);
+  }
+  return value;
 };
 const getSQLiteArrayIndexMatchSql = (arrayIndexTableName, matchSql, outerObjectIdExpression = null) => {
   const arrayIndexObjectId = `${arrayIndexTableName}.${quoteColumnName('objectId')}`;
@@ -1521,6 +1815,59 @@ const getSQLiteArrayIndexAnyMatchExpression = (arrayIndexTableName, comparisonVa
     params
   };
 };
+const getSQLiteArrayIndexAllMatchExpression = (arrayIndexTableName, comparisonValues, outerObjectIdExpression = null) => {
+  if (!arrayIndexTableName) {
+    return null;
+  }
+  const uniqueValuesByType = new Map();
+  let uniqueValueCount = 0;
+  for (const comparisonValue of comparisonValues) {
+    const lookup = getSQLiteArrayIndexLookup(comparisonValue);
+    if (!lookup) {
+      return null;
+    }
+    let values = uniqueValuesByType.get(lookup.valueType);
+    if (!values) {
+      values = new Set();
+      uniqueValuesByType.set(lookup.valueType, values);
+    }
+    if (!values.has(lookup.value)) {
+      values.add(lookup.value);
+      uniqueValueCount += 1;
+    }
+  }
+  const valueTypeSql = getSQLiteArrayIndexColumnSql(arrayIndexTableName, arrayIndexValueTypeColumn);
+  const valueSql = getSQLiteArrayIndexColumnSql(arrayIndexTableName, arrayIndexValueColumn);
+  const clauses = [];
+  const params = [];
+  for (const [valueType, values] of uniqueValuesByType) {
+    if (valueType === 'null') {
+      clauses.push(`${valueTypeSql} = 'null'`);
+      continue;
+    }
+    if (values.size === 1) {
+      clauses.push(`(${valueTypeSql} = ? AND ${valueSql} = ?)`);
+      params.push(valueType, values.values().next().value);
+      continue;
+    }
+    clauses.push(`(${valueTypeSql} = ? AND ${valueSql} IN (SELECT value FROM json_each(?)))`);
+    params.push(valueType, JSON.stringify(Array.from(values)));
+  }
+  const objectIdSql = getSQLiteArrayIndexColumnSql(arrayIndexTableName, 'objectId');
+  const valueMatchSql = clauses.length === 1 ? clauses[0] : `(${clauses.join(' OR ')})`;
+  const whereSql = outerObjectIdExpression ? `${objectIdSql} = ${outerObjectIdExpression} AND (${valueMatchSql})` : valueMatchSql;
+  const distinctMatchesSql = `SELECT ${objectIdSql} AS __arridx_object_id, ${valueTypeSql} AS __arridx_type, ` + `${valueSql} AS __arridx_value FROM ${arrayIndexTableName} ` + `WHERE ${whereSql} ` + `GROUP BY ${objectIdSql}, ${valueTypeSql}, ${valueSql}`;
+  if (outerObjectIdExpression) {
+    return {
+      sql: `(SELECT COUNT(*) FROM (${distinctMatchesSql}) AS __arridx_matches) = ?`,
+      params: [...params, uniqueValueCount]
+    };
+  }
+  return {
+    sql: `${quoteColumnName('objectId')} IN (` + `SELECT __arridx_object_id FROM (${distinctMatchesSql}) AS __arridx_matches ` + `GROUP BY __arridx_object_id HAVING COUNT(*) = ?` + `)`,
+    params: [...params, uniqueValueCount]
+  };
+};
 const getSQLiteArrayIndexNullMatchExpression = (arrayIndexTableName, outerObjectIdExpression = null) => ({
   sql: getSQLiteArrayIndexMatchSql(arrayIndexTableName, `${getSQLiteArrayIndexColumnSql(arrayIndexTableName, arrayIndexValueTypeColumn)} = 'null'`, outerObjectIdExpression),
   params: []
@@ -1555,19 +1902,53 @@ const getSQLiteArrayIndexRangeMatchExpression = (arrayIndexTableName, comparison
     params
   };
 };
-const getScalarValueMatchExpression = (targetSql, comparisonValue, usesNativePointerStorage = false) => {
-  // Top-level Pointer columns always store the objectId as TEXT. The JSON form
-  // is only valid inside Array/Object values and would block normal indexes here.
-  if (usesNativePointerStorage && isPointerValue(comparisonValue)) {
+const getScalarValueMatchExpression = (targetSql, comparisonValue, nativeStorageType = null) => {
+  // Compact top-level Parse scalars are TEXT columns. Their JSON forms are only
+  // valid inside Array/Object values and would block normal indexes here.
+  if (nativeStorageType === 'Pointer' && isPointerValue(comparisonValue)) {
     return {
       sql: `${targetSql} = ?`,
       params: [comparisonValue.objectId]
     };
   }
+  if (nativeStorageType === 'Date' && comparisonValue && typeof comparisonValue === 'object' && comparisonValue.__type === 'Date') {
+    return {
+      sql: `${targetSql} = ?`,
+      params: [toSQLiteValue(comparisonValue)]
+    };
+  }
+  if (nativeStorageType === 'File' && comparisonValue && typeof comparisonValue === 'object' && comparisonValue.__type === 'File') {
+    return {
+      sql: `${targetSql} = ?`,
+      params: [toSQLiteValue(comparisonValue)]
+    };
+  }
+  if (nativeStorageType === 'Object' && typeof comparisonValue === 'object') {
+    // Top-level Object columns and their query values use the same compact JSON
+    // representation. Direct comparison preserves Mongo's key-order semantics
+    // and, unlike jsonb(column), can seek through a declared Object index.
+    return {
+      sql: `${targetSql} = ?`,
+      params: [toSQLiteValue(comparisonValue)]
+    };
+  }
   return getJsonValueMatchExpression(targetSql, comparisonValue);
 };
-const getScalarAnyMatchExpression = (targetSql, comparisonValues, usesNativePointerStorage = false) => {
-  if (usesNativePointerStorage) {
+const getCaseInsensitiveScalarValueMatchExpression = (targetSql, comparisonValue) => ({
+  sql: `${targetSql} = ? COLLATE NOCASE`,
+  params: [comparisonValue]
+});
+const getCaseInsensitiveScalarAnyMatchExpression = (targetSql, comparisonValues) => {
+  const sqlParts = [];
+  const params = [];
+  appendSQLiteSetMembershipClause(sqlParts, params, `${targetSql} COLLATE NOCASE`, comparisonValues);
+  return {
+    sql: sqlParts.join(' OR '),
+    params
+  };
+};
+const getScalarAnyMatchExpression = (targetSql, comparisonValues, nativeStorageType = null) => {
+  if (nativeStorageType === 'Pointer') {
     const sqlParts = [];
     const params = [];
     const pointerObjectIds = [];
@@ -1575,6 +1956,23 @@ const getScalarAnyMatchExpression = (targetSql, comparisonValues, usesNativePoin
       pointerObjectIds.push(toSQLiteValue(comparisonValue));
     }
     appendSQLiteSetMembershipClause(sqlParts, params, targetSql, pointerObjectIds);
+    return {
+      sql: sqlParts.join(' OR '),
+      params
+    };
+  }
+  if (nativeStorageType === 'Date' || nativeStorageType === 'File' || nativeStorageType === 'Object') {
+    const nativeValues = [];
+    for (const comparisonValue of comparisonValues) {
+      const matchesNativeStorageType = nativeStorageType === 'Object' ? comparisonValue && typeof comparisonValue === 'object' : comparisonValue && typeof comparisonValue === 'object' && comparisonValue.__type === nativeStorageType;
+      if (!matchesNativeStorageType) {
+        return getSQLiteAnyMatchExpression(targetSql, comparisonValues, getScalarValueMatchExpression);
+      }
+      nativeValues.push(toSQLiteValue(comparisonValue));
+    }
+    const sqlParts = [];
+    const params = [];
+    appendSQLiteSetMembershipClause(sqlParts, params, targetSql, nativeValues);
     return {
       sql: sqlParts.join(' OR '),
       params
@@ -1880,6 +2278,7 @@ class SQLiteStorageAdapter {
     this._schemaCache = new Map();
     this._resolvedTableNames = new Map();
     this._tableColumnsCache = new Map();
+    this._spatialIndexedFields = new Set();
     this._temporaryDirectory = null;
     this._usesSharedMemoryDatabase = false;
     this._lastWriteSequence = 0;
@@ -1896,6 +2295,16 @@ class SQLiteStorageAdapter {
     }
     this._dbOptions = dbOptions;
     this._db = (0, _SQLiteClient.createClient)(dbOptions);
+    this._supportsSQLiteRTree = false;
+    this._supportsSQLiteGeopoly = false;
+    try {
+      const sqliteCapabilities = this._db.prepare("SELECT sqlite_compileoption_used('ENABLE_RTREE') AS rtree, " + "sqlite_compileoption_used('ENABLE_GEOPOLY') AS geopoly").get();
+      this._supportsSQLiteRTree = Boolean(sqliteCapabilities && sqliteCapabilities.rtree);
+      this._supportsSQLiteGeopoly = Boolean(sqliteCapabilities && sqliteCapabilities.geopoly);
+    } catch {
+      // Some embedded builds omit compile-option diagnostics. Geo queries stay
+      // correct through their scan path instead of making adapter startup fail.
+    }
     this._initSchemaTable();
     this.database = this._buildLegacyDatabaseCompat();
   }
@@ -1951,6 +2360,7 @@ class SQLiteStorageAdapter {
     this._schemaCache.clear();
     this._resolvedTableNames.clear();
     this._tableColumnsCache.clear();
+    this._spatialIndexedFields.clear();
     this._onSchemaChange = () => {};
     if (this._temporaryDirectory) {
       temporarySQLiteDirectories.delete(this._temporaryDirectory);
@@ -2123,20 +2533,286 @@ class SQLiteStorageAdapter {
         normalizedFieldName,
         rootFieldName: normalizedFieldName,
         valueExpression: 'array_index_item.value',
-        typeExpression: 'array_index_item.type'
+        typeExpression: 'array_index_item.type',
+        nestedPathComponents: null
       };
     }
-    const arrayFieldPath = buildArrayRootDotFieldPath(normalizedFieldName, 'array_index_item');
-    const rootField = schemaFields && schemaFields[arrayFieldPath.rootFieldName];
-    if (!rootField || rootField.type !== 'Array' || arrayFieldPath.components.length === 0 || isNumericArrayIndexComponent(arrayFieldPath.components[0])) {
+    const {
+      rootFieldName,
+      components
+    } = getDotFieldPathParts(normalizedFieldName);
+    const rootField = schemaFields && schemaFields[rootFieldName];
+    if (!rootField || rootField.type !== 'Array' && rootField.type !== 'Object' || components.length === 0 || components.some(isNumericArrayIndexComponent)) {
       return null;
     }
     return {
       normalizedFieldName,
-      rootFieldName: arrayFieldPath.rootFieldName,
-      valueExpression: arrayFieldPath.valueExpression,
-      typeExpression: arrayFieldPath.typeExpression
+      rootFieldName,
+      valueExpression: 'array_index_item.value',
+      typeExpression: 'array_index_item.type',
+      nestedPathComponents: components
     };
+  }
+  _getArrayElementIndexRowsSourceSql(arrayIndexField, rootExpression, seedFromSql = '', identityExpression = null) {
+    if (arrayIndexField.nestedPathComponents) {
+      const terminalRows = getNestedDotTraversalRowsExpression(rootExpression, arrayIndexField.nestedPathComponents, arrayIndexField.normalizedFieldName, {
+        requireArrayTraversal: false,
+        expandTerminalArrays: true,
+        seedFromSql,
+        identityExpression
+      });
+      return {
+        sql: `${terminalRows.sql} AS array_index_item`,
+        valueExpression: 'array_index_item.__dot_value',
+        typeExpression: 'array_index_item.__dot_type',
+        identityExpression: terminalRows.identityExpression ? 'array_index_item.__dot_identity' : null
+      };
+    }
+    return {
+      sql: `json_each(COALESCE(${rootExpression}, '[]')) AS array_index_item`,
+      valueExpression: arrayIndexField.valueExpression,
+      typeExpression: arrayIndexField.typeExpression,
+      identityExpression: null
+    };
+  }
+  _spatialIndexCacheKey(className, fieldName) {
+    return `${className}\u001F${fieldName}`;
+  }
+  _rawSpatialIndexTableName(className, fieldName) {
+    return `${this._rawTableName(className)}` + `${sqliteSpatialIndexTableNamePrefix}${encodeSQLiteFieldToken(fieldName)}`;
+  }
+  _quotedSpatialIndexTableName(className, fieldName) {
+    return `"${this._rawSpatialIndexTableName(className, fieldName).replace(/"/g, '""')}"`;
+  }
+  _quotedSpatialIdIndexName(className) {
+    const rawIndexName = `${sqliteSpatialIdIndexPrefix}${encodeSQLiteTableNameToken(className)}`;
+    return `"${rawIndexName.replace(/"/g, '""')}"`;
+  }
+  _ensureStableSpatialIds(className, transactionalSession) {
+    const db = transactionalSession || this._db;
+    const tableName = this._tableName(className);
+    const existingColumns = this._getTableColumns(className, db);
+    if (!existingColumns.includes(spatialIdColumn)) {
+      db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${quoteColumnName(spatialIdColumn)} INTEGER`);
+      this._setTableColumnsCache(className, [...existingColumns, spatialIdColumn], db);
+    }
+
+    // The first backfill reuses rowid values. Later nulls start above the
+    // retained maximum, so a rebuilt or imported table cannot collide.
+    db.exec(`WITH __spatial_id_base(value) AS (` + `SELECT COALESCE(MAX(${quoteColumnName(spatialIdColumn)}), 0) FROM ${tableName}` + `) UPDATE ${tableName} SET ${quoteColumnName(spatialIdColumn)} = ` + `(SELECT value FROM __spatial_id_base) + rowid ` + `WHERE ${quoteColumnName(spatialIdColumn)} IS NULL`);
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS ${this._quotedSpatialIdIndexName(className)} ` + `ON ${tableName} (${quoteColumnName(spatialIdColumn)})`);
+  }
+  _getSpatialIndexTriggerNames(rawSpatialIndexTableName, fieldType, triggerVersion = sqliteSpatialIndexTriggerVersion) {
+    const artifactBaseName = sanitizeFTS5Identifier(rawSpatialIndexTableName);
+    const fieldTypeToken = fieldType === 'GeoPoint' ? 'point' : 'polygon';
+    const triggerBaseName = `${artifactBaseName}_${fieldTypeToken}_v${triggerVersion}`;
+    return {
+      insertTrigger: `"${`${triggerBaseName}_insert`.replace(/"/g, '""')}"`,
+      deleteTrigger: `"${`${triggerBaseName}_delete`.replace(/"/g, '""')}"`,
+      updateTrigger: `"${`${triggerBaseName}_update`.replace(/"/g, '""')}"`
+    };
+  }
+  _getSpatialPointRowSelectSql(fieldSql, rowIdSql, baseFromSql = '') {
+    const latitudeSql = `CAST(json_extract(${fieldSql}, '$.latitude') AS REAL)`;
+    const longitudeSql = `CAST(json_extract(${fieldSql}, '$.longitude') AS REAL)`;
+    return `SELECT ${rowIdSql}, ${longitudeSql}, ${longitudeSql}, ` + `${latitudeSql}, ${latitudeSql}, ${longitudeSql}, ${latitudeSql}, NULL ` + `${baseFromSql} ` + `WHERE json_type(${fieldSql}) = 'object' ` + `AND json_type(${fieldSql}, '$.latitude') IN ('integer', 'real') ` + `AND json_type(${fieldSql}, '$.longitude') IN ('integer', 'real')`;
+  }
+  _getSpatialPolygonRowSelectSql(fieldSql, rowIdSql, baseFromSql = '') {
+    const coordinateTableSql = `${baseFromSql ? `${baseFromSql} JOIN ` : 'FROM '}` + `json_each(${fieldSql}, '$.coordinates') AS __spatial_coordinate`;
+    const latitudeSql = `CAST(json_extract(__spatial_coordinate.value, '$[0]') AS REAL)`;
+    const longitudeSql = `CAST(json_extract(__spatial_coordinate.value, '$[1]') AS REAL)`;
+    return `SELECT ${rowIdSql}, MIN(${longitudeSql}), MAX(${longitudeSql}), ` + `MIN(${latitudeSql}), MAX(${latitudeSql}), NULL, NULL, ` + `geopoly_blob(json_group_array(json_array(${longitudeSql}, ${latitudeSql}) ` + `ORDER BY CAST(__spatial_coordinate.key AS INTEGER))) ` + `${coordinateTableSql} ` + `WHERE json_type(__spatial_coordinate.value) = 'array' ` + `AND json_type(__spatial_coordinate.value, '$[0]') IN ('integer', 'real') ` + `AND json_type(__spatial_coordinate.value, '$[1]') IN ('integer', 'real') ` + `GROUP BY ${rowIdSql} HAVING COUNT(*) >= 3`;
+  }
+  _dropSpatialIndexArtifactsByRawTableName(rawSpatialIndexTableName, transactionalSession) {
+    const db = transactionalSession || this._db;
+    for (const fieldType of ['GeoPoint', 'Polygon']) {
+      for (let triggerVersion = 1; triggerVersion <= sqliteSpatialIndexTriggerVersion; triggerVersion += 1) {
+        const triggerNames = this._getSpatialIndexTriggerNames(rawSpatialIndexTableName, fieldType, triggerVersion);
+        db.exec(`DROP TRIGGER IF EXISTS ${triggerNames.updateTrigger}`);
+        db.exec(`DROP TRIGGER IF EXISTS ${triggerNames.deleteTrigger}`);
+        db.exec(`DROP TRIGGER IF EXISTS ${triggerNames.insertTrigger}`);
+      }
+    }
+    db.exec(`DROP TABLE IF EXISTS "${rawSpatialIndexTableName.replace(/"/g, '""')}"`);
+  }
+  _dropSpatialIndexArtifactsForField(className, fieldName, transactionalSession) {
+    this._dropSpatialIndexArtifactsByRawTableName(this._rawSpatialIndexTableName(className, fieldName), transactionalSession);
+    this._spatialIndexedFields.delete(this._spatialIndexCacheKey(className, fieldName));
+  }
+  _dropSpatialIndexArtifactsForClass(className, transactionalSession) {
+    const db = transactionalSession || this._db;
+    const rawSpatialIndexPrefix = `${this._rawTableName(className)}${sqliteSpatialIndexTableNamePrefix}`;
+    const rows = this._prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE ? " + "AND sql LIKE 'CREATE VIRTUAL TABLE%USING rtree%'", db).all(`${rawSpatialIndexPrefix}%`);
+    for (const row of rows) {
+      this._dropSpatialIndexArtifactsByRawTableName(row.name, db);
+    }
+    const cacheKeyPrefix = `${className}\u001F`;
+    for (const cacheKey of this._spatialIndexedFields) {
+      if (cacheKey.startsWith(cacheKeyPrefix)) {
+        this._spatialIndexedFields.delete(cacheKey);
+      }
+    }
+  }
+  _dropAllSpatialIndexArtifacts(transactionalSession) {
+    const db = transactionalSession || this._db;
+    const rows = this._prepare("SELECT name FROM sqlite_master WHERE type = 'table' " + "AND name LIKE ? AND sql LIKE 'CREATE VIRTUAL TABLE%USING rtree%'", db).all(`%${sqliteSpatialIndexTableNamePrefix}%`);
+    for (const row of rows) {
+      this._dropSpatialIndexArtifactsByRawTableName(row.name, db);
+    }
+    this._spatialIndexedFields.clear();
+  }
+  _ensureSpatialIndex(className, fieldName, fieldType, transactionalSession) {
+    const canIndexField = this._supportsSQLiteRTree && (fieldType === 'GeoPoint' || this._supportsSQLiteGeopoly);
+    if (!canIndexField) {
+      return;
+    }
+    validateFieldName(fieldName);
+    const db = transactionalSession || this._db;
+    if (!this._getTableColumns(className, db).includes(fieldName)) {
+      return;
+    }
+    this._ensureStableSpatialIds(className, db);
+    const rawSpatialIndexTableName = this._rawSpatialIndexTableName(className, fieldName);
+    const spatialIndexTableName = this._quotedSpatialIndexTableName(className, fieldName);
+    const tableName = this._tableName(className);
+    const triggerNames = this._getSpatialIndexTriggerNames(rawSpatialIndexTableName, fieldType);
+    const currentTriggerNames = [triggerNames.insertTrigger.slice(1, -1), triggerNames.deleteTrigger.slice(1, -1), triggerNames.updateTrigger.slice(1, -1)];
+    const currentTriggerCount = this._prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'trigger' AND name IN (?, ?, ?)", db).get(...currentTriggerNames);
+    const shouldBackfillSpatialIndex = !this._tableNameExistsByRawName(rawSpatialIndexTableName, db) || !currentTriggerCount || Number(currentTriggerCount.count) !== currentTriggerNames.length;
+    const otherFieldType = fieldType === 'GeoPoint' ? 'Polygon' : 'GeoPoint';
+    const obsoleteTriggerNames = this._getSpatialIndexTriggerNames(rawSpatialIndexTableName, otherFieldType);
+    db.exec(`DROP TRIGGER IF EXISTS ${obsoleteTriggerNames.updateTrigger}`);
+    db.exec(`DROP TRIGGER IF EXISTS ${obsoleteTriggerNames.deleteTrigger}`);
+    db.exec(`DROP TRIGGER IF EXISTS ${obsoleteTriggerNames.insertTrigger}`);
+    for (const historicalFieldType of ['GeoPoint', 'Polygon']) {
+      for (let triggerVersion = 1; triggerVersion < sqliteSpatialIndexTriggerVersion; triggerVersion += 1) {
+        const historicalTriggerNames = this._getSpatialIndexTriggerNames(rawSpatialIndexTableName, historicalFieldType, triggerVersion);
+        db.exec(`DROP TRIGGER IF EXISTS ${historicalTriggerNames.updateTrigger}`);
+        db.exec(`DROP TRIGGER IF EXISTS ${historicalTriggerNames.deleteTrigger}`);
+        db.exec(`DROP TRIGGER IF EXISTS ${historicalTriggerNames.insertTrigger}`);
+      }
+    }
+    db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS ${spatialIndexTableName} USING rtree(` + `id, minLongitude, maxLongitude, minLatitude, maxLatitude, ` + `+longitude, +latitude, +polygon)`);
+    const quotedSpatialIdColumn = quoteColumnName(spatialIdColumn);
+    const fieldSql = `new.${quoteColumnName(fieldName)}`;
+    const currentSpatialIdSql = `(SELECT ${quotedSpatialIdColumn} FROM ${tableName} WHERE rowid = new.rowid)`;
+    const assignSpatialIdSql = `UPDATE ${tableName} SET ${quotedSpatialIdColumn} = (` + `SELECT COALESCE(MAX(${quotedSpatialIdColumn}), 0) + 1 FROM ${tableName}` + `) WHERE rowid = new.rowid AND ${quotedSpatialIdColumn} IS NULL; `;
+    const insertRowSelectSql = fieldType === 'GeoPoint' ? this._getSpatialPointRowSelectSql(fieldSql, currentSpatialIdSql) : this._getSpatialPolygonRowSelectSql(fieldSql, currentSpatialIdSql);
+    db.exec(`CREATE TRIGGER IF NOT EXISTS ${triggerNames.insertTrigger} ` + `AFTER INSERT ON ${tableName} BEGIN ` + assignSpatialIdSql + `INSERT INTO ${spatialIndexTableName} ` + `(id, minLongitude, maxLongitude, minLatitude, maxLatitude, longitude, latitude, polygon) ` + `${insertRowSelectSql}; END`);
+    db.exec(`CREATE TRIGGER IF NOT EXISTS ${triggerNames.deleteTrigger} ` + `AFTER DELETE ON ${tableName} BEGIN ` + `DELETE FROM ${spatialIndexTableName} WHERE id = old.${quotedSpatialIdColumn}; END`);
+    db.exec(`CREATE TRIGGER IF NOT EXISTS ${triggerNames.updateTrigger} ` + `AFTER UPDATE OF ${quoteColumnName(fieldName)} ON ${tableName} BEGIN ` + assignSpatialIdSql + `DELETE FROM ${spatialIndexTableName} WHERE id = old.${quotedSpatialIdColumn}; ` + `INSERT INTO ${spatialIndexTableName} ` + `(id, minLongitude, maxLongitude, minLatitude, maxLatitude, longitude, latitude, polygon) ` + `${insertRowSelectSql}; END`);
+    if (shouldBackfillSpatialIndex) {
+      const baseFieldSql = `base.${quoteColumnName(fieldName)}`;
+      const backfillRowSelectSql = fieldType === 'GeoPoint' ? this._getSpatialPointRowSelectSql(baseFieldSql, `base.${quotedSpatialIdColumn}`, `FROM ${tableName} AS base`) : this._getSpatialPolygonRowSelectSql(baseFieldSql, `base.${quotedSpatialIdColumn}`, `FROM ${tableName} AS base`);
+      db.exec(`DELETE FROM ${spatialIndexTableName}`);
+      db.exec(`INSERT INTO ${spatialIndexTableName} ` + `(id, minLongitude, maxLongitude, minLatitude, maxLatitude, longitude, latitude, polygon) ` + backfillRowSelectSql);
+    }
+    this._spatialIndexedFields.add(this._spatialIndexCacheKey(className, fieldName));
+  }
+  _ensureSpatialIndexForQuery(className, schemaFields, fieldName) {
+    const fieldType = schemaFields[fieldName] && schemaFields[fieldName].type;
+    if (fieldType !== 'GeoPoint' && fieldType !== 'Polygon') {
+      return null;
+    }
+    try {
+      this._ensureSpatialIndex(className, fieldName, fieldType);
+      return this._getQuotedSpatialIndexTableName(className, schemaFields, fieldName);
+    } catch (error) {
+      // A hidden optimization must never make an otherwise-correct geo query
+      // fail against an unusual SQLite build or malformed historical row.
+      try {
+        this._dropSpatialIndexArtifactsForField(className, fieldName);
+      } catch {
+        // A read-only database can reject both creation and cleanup. The
+        // caller still receives the scan-based query below.
+      }
+      _logger.default.warn(`Unable to build SQLite spatial index for ${className}.${fieldName}: ${error.message}`);
+      return null;
+    }
+  }
+  _getQuotedSpatialIndexTableName(className, schemaFields, fieldName) {
+    const fieldType = schemaFields[fieldName] && schemaFields[fieldName].type;
+    if (fieldType !== 'GeoPoint' && fieldType !== 'Polygon') {
+      return null;
+    }
+    if (!this._spatialIndexedFields.has(this._spatialIndexCacheKey(className, fieldName))) {
+      return null;
+    }
+    return this._quotedSpatialIndexTableName(className, fieldName);
+  }
+  _getGeoDistanceExpression(latitudeSql, longitudeSql, latitude, longitude) {
+    return {
+      sql: `parse_geo_distance(${latitudeSql}, ${longitudeSql}, ?, ?)`,
+      params: [latitude, longitude]
+    };
+  }
+  _getSpatialBoundsMatchExpression(spatialAlias, bounds) {
+    const longitudeConditions = [];
+    const params = [bounds.minLatitude, bounds.maxLatitude];
+    for (const interval of bounds.longitudeIntervals) {
+      longitudeConditions.push(`(${spatialAlias}.maxLongitude >= ? AND ${spatialAlias}.minLongitude <= ?)`);
+      params.push(interval.min, interval.max);
+    }
+    return {
+      sql: `${spatialAlias}.maxLatitude >= ? AND ${spatialAlias}.minLatitude <= ? AND ` + `(${longitudeConditions.join(' OR ')})`,
+      params
+    };
+  }
+  _getSpatialRowIdMatchExpression(className, spatialIndexTableName, spatialWhere) {
+    return {
+      sql: `${this._tableName(className)}.${quoteColumnName(spatialIdColumn)} IN (` + `SELECT __spatial.id FROM ${spatialIndexTableName} AS __spatial ` + `WHERE ${spatialWhere.sql})`,
+      params: spatialWhere.params
+    };
+  }
+  _getSpatialPointBoxMatchExpression(className, spatialIndexTableName, minLatitude, maxLatitude, minLongitude, maxLongitude) {
+    const boundsMatch = this._getSpatialBoundsMatchExpression('__spatial', {
+      minLatitude,
+      maxLatitude,
+      longitudeIntervals: [{
+        min: minLongitude,
+        max: maxLongitude
+      }]
+    });
+    return this._getSpatialRowIdMatchExpression(className, spatialIndexTableName, {
+      sql: `${boundsMatch.sql} AND __spatial.latitude >= ? AND __spatial.latitude <= ? ` + `AND __spatial.longitude >= ? AND __spatial.longitude <= ?`,
+      params: [...boundsMatch.params, minLatitude, maxLatitude, minLongitude, maxLongitude]
+    });
+  }
+  _getSpatialPointRadiusMatchExpression(className, spatialIndexTableName, latitude, longitude, radiusRadians) {
+    const boundsMatch = this._getSpatialBoundsMatchExpression('__spatial', getSphericalCircleBounds(latitude, longitude, radiusRadians));
+    const distanceMatch = this._getGeoDistanceExpression('__spatial.latitude', '__spatial.longitude', latitude, longitude);
+    return this._getSpatialRowIdMatchExpression(className, spatialIndexTableName, {
+      sql: `${boundsMatch.sql} AND ${distanceMatch.sql} <= ?`,
+      params: [...boundsMatch.params, ...distanceMatch.params, radiusRadians]
+    });
+  }
+  _getSpatialPointPolygonMatchExpression(className, spatialIndexTableName, polygonInfo) {
+    const boundsMatch = this._getSpatialBoundsMatchExpression('__spatial', {
+      minLatitude: polygonInfo.minLatitude,
+      maxLatitude: polygonInfo.maxLatitude,
+      longitudeIntervals: [{
+        min: polygonInfo.minLongitude,
+        max: polygonInfo.maxLongitude
+      }]
+    });
+    return this._getSpatialRowIdMatchExpression(className, spatialIndexTableName, {
+      sql: `${boundsMatch.sql} AND ` + `geopoly_contains_point(geopoly_blob(?), __spatial.longitude, __spatial.latitude) != 0`,
+      params: [...boundsMatch.params, polygonInfo.geopolyJSON]
+    });
+  }
+  _getSpatialPolygonPointMatchExpression(className, spatialIndexTableName, latitude, longitude) {
+    const boundsMatch = this._getSpatialBoundsMatchExpression('__spatial', {
+      minLatitude: latitude,
+      maxLatitude: latitude,
+      longitudeIntervals: [{
+        min: longitude,
+        max: longitude
+      }]
+    });
+    return this._getSpatialRowIdMatchExpression(className, spatialIndexTableName, {
+      sql: `${boundsMatch.sql} AND ` + `geopoly_contains_point(__spatial.polygon, ?, ?) != 0`,
+      params: [...boundsMatch.params, longitude, latitude]
+    });
   }
   _rawArrayElementIndexTableName(className, fieldName) {
     return `${this._rawTableName(className)}` + `${sqliteArrayIndexTableNamePrefix}${encodeSQLiteFieldToken(fieldName)}`;
@@ -2144,12 +2820,13 @@ class SQLiteStorageAdapter {
   _quotedArrayElementIndexTableName(className, fieldName) {
     return `"${this._rawArrayElementIndexTableName(className, fieldName).replace(/"/g, '""')}"`;
   }
-  _getArrayElementIndexArtifactNames(rawArrayIndexTableName) {
+  _getArrayElementIndexArtifactNames(rawArrayIndexTableName, triggerVersion = sqliteArrayIndexTriggerVersion) {
     const artifactBaseName = sanitizeFTS5Identifier(rawArrayIndexTableName);
+    const triggerVersionSuffix = triggerVersion > 1 ? `_v${triggerVersion}` : '';
     return {
-      insertTrigger: `"${`${artifactBaseName}_insert`.replace(/"/g, '""')}"`,
-      deleteTrigger: `"${`${artifactBaseName}_delete`.replace(/"/g, '""')}"`,
-      updateTrigger: `"${`${artifactBaseName}_update`.replace(/"/g, '""')}"`,
+      insertTrigger: `"${`${artifactBaseName}${triggerVersionSuffix}_insert`.replace(/"/g, '""')}"`,
+      deleteTrigger: `"${`${artifactBaseName}${triggerVersionSuffix}_delete`.replace(/"/g, '""')}"`,
+      updateTrigger: `"${`${artifactBaseName}${triggerVersionSuffix}_update`.replace(/"/g, '""')}"`,
       lookupIndex: `"${`${artifactBaseName}_lookup`.replace(/"/g, '""')}"`,
       objectIdIndex: `"${`${artifactBaseName}_objectId`.replace(/"/g, '""')}"`,
       objectIdLookupIndex: `"${`${artifactBaseName}_object_lookup`.replace(/"/g, '""')}"`
@@ -2163,9 +2840,13 @@ class SQLiteStorageAdapter {
       deleteTrigger,
       updateTrigger
     } = this._getArrayElementIndexArtifactNames(rawArrayIndexTableName);
+    const legacyTriggers = this._getArrayElementIndexArtifactNames(rawArrayIndexTableName, 1);
     db.exec(`DROP TRIGGER IF EXISTS ${updateTrigger}`);
     db.exec(`DROP TRIGGER IF EXISTS ${deleteTrigger}`);
     db.exec(`DROP TRIGGER IF EXISTS ${insertTrigger}`);
+    db.exec(`DROP TRIGGER IF EXISTS ${legacyTriggers.updateTrigger}`);
+    db.exec(`DROP TRIGGER IF EXISTS ${legacyTriggers.deleteTrigger}`);
+    db.exec(`DROP TRIGGER IF EXISTS ${legacyTriggers.insertTrigger}`);
     db.exec(`DROP TABLE IF EXISTS ${arrayIndexTableName}`);
   }
   _dropArrayElementIndexArtifactsForField(className, fieldName, schemaFields, transactionalSession) {
@@ -2186,8 +2867,17 @@ class SQLiteStorageAdapter {
     }
   }
   _hasStoredIndexForField(className, fieldName, connection) {
-    const storedSchema = this._getStoredSchemaObject(className, connection);
-    const storedIndexes = storedSchema && storedSchema.schema && storedSchema.schema.indexes || {};
+    const canUseCachedSchema = !connection || connection === this._db;
+    const cachedSchema = canUseCachedSchema ? this._schemaCache.get(className) : null;
+    let storedIndexes;
+    if (cachedSchema) {
+      // Normal queries already have this class in memory. Do not reread and
+      // JSON.parse `_SCHEMA` for every indexed Array predicate.
+      storedIndexes = cachedSchema.indexes || {};
+    } else {
+      const storedSchema = this._getStoredSchemaObject(className, connection);
+      storedIndexes = storedSchema && storedSchema.schema && storedSchema.schema.indexes || {};
+    }
     for (const indexName in storedIndexes) {
       if (!Object.prototype.hasOwnProperty.call(storedIndexes, indexName)) {
         continue;
@@ -2235,14 +2925,21 @@ class SQLiteStorageAdapter {
       objectIdIndex,
       objectIdLookupIndex
     } = this._getArrayElementIndexArtifactNames(rawArrayIndexTableName);
-    const shouldBackfillArrayIndexTable = !this._tableNameExistsByRawName(rawArrayIndexTableName, db);
+    const legacyTriggers = this._getArrayElementIndexArtifactNames(rawArrayIndexTableName, 1);
+    const currentTriggerNames = [insertTrigger.slice(1, -1), deleteTrigger.slice(1, -1), updateTrigger.slice(1, -1)];
+    const currentTriggerCount = this._prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'trigger' AND name IN (?, ?, ?)", db).get(...currentTriggerNames);
+    const shouldBackfillArrayIndexTable = !this._tableNameExistsByRawName(rawArrayIndexTableName, db) || !currentTriggerCount || Number(currentTriggerCount.count) !== currentTriggerNames.length;
+    db.exec(`DROP TRIGGER IF EXISTS ${legacyTriggers.updateTrigger}`);
+    db.exec(`DROP TRIGGER IF EXISTS ${legacyTriggers.deleteTrigger}`);
+    db.exec(`DROP TRIGGER IF EXISTS ${legacyTriggers.insertTrigger}`);
     const rootColumnSql = `new.${quoteColumnName(arrayIndexField.rootFieldName)}`;
     const quotedObjectId = quoteColumnName('objectId');
     const quotedValueType = quoteColumnName(arrayIndexValueTypeColumn);
     const quotedValue = quoteColumnName(arrayIndexValueColumn);
-    const storedValueTypeExpression = getSQLiteArrayIndexStoredValueTypeExpression(arrayIndexField.typeExpression, arrayIndexField.valueExpression);
-    const storedValueExpression = getSQLiteArrayIndexStoredValueExpression(arrayIndexField.typeExpression, arrayIndexField.valueExpression);
-    const derivedInsertRowsSql = `SELECT ` + `${storedValueTypeExpression} AS __arridx_value_type, ` + `${storedValueExpression} AS __arridx_value ` + `FROM json_each(COALESCE(${rootColumnSql}, '[]')) AS array_index_item`;
+    const insertRowsSource = this._getArrayElementIndexRowsSourceSql(arrayIndexField, rootColumnSql);
+    const storedValueTypeExpression = getSQLiteArrayIndexStoredValueTypeExpression(insertRowsSource.typeExpression, insertRowsSource.valueExpression);
+    const storedValueExpression = getSQLiteArrayIndexStoredValueExpression(insertRowsSource.typeExpression, insertRowsSource.valueExpression);
+    const derivedInsertRowsSql = `SELECT ` + `${storedValueTypeExpression} AS __arridx_value_type, ` + `${storedValueExpression} AS __arridx_value ` + `FROM ${insertRowsSource.sql}`;
 
     // Array membership semantics only care whether one element matches, so the
     // shadow table can tolerate duplicate rows from duplicate array elements.
@@ -2266,9 +2963,12 @@ class SQLiteStorageAdapter {
       return;
     }
     db.exec(`DELETE FROM ${arrayIndexTableName}`);
-    const backfillStoredValueTypeExpression = getSQLiteArrayIndexStoredValueTypeExpression(backfillField.typeExpression, backfillField.valueExpression);
-    const backfillStoredValueExpression = getSQLiteArrayIndexStoredValueExpression(backfillField.typeExpression, backfillField.valueExpression);
-    const derivedBackfillRowsSql = `SELECT ` + `base.${quotedObjectId} AS __arridx_object_id, ` + `${backfillStoredValueTypeExpression} AS __arridx_value_type, ` + `${backfillStoredValueExpression} AS __arridx_value ` + `FROM ${tableName} AS base, ` + `json_each(COALESCE(base.${quoteColumnName(backfillField.rootFieldName)}, '[]')) AS array_index_item`;
+    const backfillRowsSource = this._getArrayElementIndexRowsSourceSql(backfillField, `base.${quoteColumnName(backfillField.rootFieldName)}`, ` FROM ${tableName} AS base`, `base.${quotedObjectId}`);
+    const backfillStoredValueTypeExpression = getSQLiteArrayIndexStoredValueTypeExpression(backfillRowsSource.typeExpression, backfillRowsSource.valueExpression);
+    const backfillStoredValueExpression = getSQLiteArrayIndexStoredValueExpression(backfillRowsSource.typeExpression, backfillRowsSource.valueExpression);
+    const backfillObjectIdExpression = backfillRowsSource.identityExpression || `base.${quotedObjectId}`;
+    const backfillFromSql = backfillRowsSource.identityExpression ? backfillRowsSource.sql : `${tableName} AS base, ${backfillRowsSource.sql}`;
+    const derivedBackfillRowsSql = `SELECT ` + `${backfillObjectIdExpression} AS __arridx_object_id, ` + `${backfillStoredValueTypeExpression} AS __arridx_value_type, ` + `${backfillStoredValueExpression} AS __arridx_value ` + `FROM ${backfillFromSql}`;
     db.exec(`INSERT INTO ${arrayIndexTableName}(${quotedObjectId}, ${quotedValueType}, ${quotedValue}) ` + `SELECT derived.__arridx_object_id, derived.__arridx_value_type, derived.__arridx_value ` + `FROM (${derivedBackfillRowsSql}) AS derived ` + `WHERE derived.__arridx_value_type IS NOT NULL`);
   }
   _rawFTSTableName(className, fieldName, diacriticSensitive) {
@@ -2578,6 +3278,7 @@ class SQLiteStorageAdapter {
       }
     }
     this._dropArrayElementIndexArtifactsForClass(className);
+    this._dropSpatialIndexArtifactsForClass(className);
     this._dropFTS5ArtifactsForClass(className);
     this._db.exec(`DROP TABLE IF EXISTS ${tableName}`);
     this._prepare('DELETE FROM "_SCHEMA" WHERE "className" = ?').run(className);
@@ -2586,6 +3287,7 @@ class SQLiteStorageAdapter {
     return className.indexOf('_Join:') !== 0;
   }
   async deleteAllClasses() {
+    this._dropAllSpatialIndexArtifacts();
     const rows = this._prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").all();
     for (const row of rows) {
       this._db.exec(`DROP TABLE IF EXISTS "${row.name.replace(/"/g, '""')}"`);
@@ -2622,6 +3324,17 @@ class SQLiteStorageAdapter {
         delete schemaObj.fields[fieldName];
       }
     }
+    let hasRetainedSpatialField = false;
+    for (const fieldName in schemaObj.fields || {}) {
+      if (!Object.prototype.hasOwnProperty.call(schemaObj.fields, fieldName)) {
+        continue;
+      }
+      const fieldType = schemaObj.fields[fieldName].type;
+      if (fieldType === 'GeoPoint' || fieldType === 'Polygon') {
+        hasRetainedSpatialField = true;
+        break;
+      }
+    }
     if (schemaObj.indexes) {
       for (const indexName in schemaObj.indexes) {
         if (!Object.prototype.hasOwnProperty.call(schemaObj.indexes, indexName)) {
@@ -2645,6 +3358,11 @@ class SQLiteStorageAdapter {
       }
     }
     const deletedColumnNames = fieldNames.filter(fieldName => !relationalFieldNames.has(fieldName));
+    if (deletedColumnNames.length > 0) {
+      // Rebuilding drops the triggers owned by the base table. Recreate every
+      // retained explicit spatial index after the replacement table is live.
+      this._dropSpatialIndexArtifactsForClass(className);
+    }
     for (const fieldName of deletedColumnNames) {
       this._dropArrayElementIndexArtifactsForField(className, fieldName, originalFields);
       this._dropFTS5ArtifactsForField(className, fieldName);
@@ -2655,7 +3373,7 @@ class SQLiteStorageAdapter {
       const rebuildTableRawName = `${rawName}__rebuild__${Date.now()}_${Math.random().toString(16).slice(2)}`;
       const rebuildTableName = `"${rebuildTableRawName.replace(/"/g, '""')}"`;
       const tableInfo = this._db.prepare(`PRAGMA table_info(${this._quoteRawTableName(rawName)})`).all();
-      const keptColumns = tableInfo.filter(column => !deletedFieldNames.has(column.name));
+      const keptColumns = tableInfo.filter(column => !deletedFieldNames.has(column.name) && (hasRetainedSpatialField || column.name !== spatialIdColumn));
       if (keptColumns.length > 0) {
         const columnDefinitions = keptColumns.map(column => {
           let definition = `${quoteColumnName(column.name)} ${column.type || 'TEXT'}`;
@@ -2781,9 +3499,77 @@ class SQLiteStorageAdapter {
       requiredColumns: [dotFieldPath.rootFieldName]
     };
   }
+  _getSparseIndexFieldPresenceExpression(className, fieldName, indexExpression) {
+    const normalizedFieldName = this._normalizeIndexFieldPath(fieldName);
+    if (normalizedFieldName.indexOf('.') >= 0) {
+      return `${buildDotFieldPath(normalizedFieldName).typeExpression} IS NOT NULL`;
+    }
+    if (shouldPersistExplicitNullField(className, normalizedFieldName)) {
+      return `(${indexExpression} IS NOT NULL OR ${getExplicitNullFieldMatchExpression(normalizedFieldName).sql})`;
+    }
+    return `${indexExpression} IS NOT NULL`;
+  }
+  _getSparseIndexWhereClause(className, fieldNames, fieldExpressions) {
+    const presenceExpressions = [];
+    for (let index = 0; index < fieldNames.length; index += 1) {
+      presenceExpressions.push(this._getSparseIndexFieldPresenceExpression(className, fieldNames[index], fieldExpressions[index]));
+    }
+    // Mongo compound sparse indexes retain a document when any ordinary
+    // ascending/descending key exists, rather than requiring every key.
+    return presenceExpressions.join(' OR ');
+  }
+  _dropSQLiteIndexIfKeyShapeChanged(indexName, expectedKeys, expectedWhere = null, connection) {
+    const escapedIndexName = indexName.replace(/"/g, '""');
+    const indexParts = this._prepare(`PRAGMA index_xinfo("${escapedIndexName}")`, connection).all();
+    const existingKeys = [];
+    for (const indexPart of indexParts) {
+      if (Number(indexPart.key) === 1) {
+        existingKeys.push(indexPart);
+      }
+    }
+    if (existingKeys.length === 0) {
+      return;
+    }
+    let matches = existingKeys.length === expectedKeys.length;
+    for (let index = 0; matches && index < expectedKeys.length; index += 1) {
+      const expectedKey = expectedKeys[index];
+      const existingKey = existingKeys[index];
+      matches = (existingKey.name == null ? null : existingKey.name) === expectedKey.columnName && String(existingKey.coll || 'BINARY').toUpperCase() === expectedKey.collation && Boolean(existingKey.desc) === expectedKey.descending;
+    }
+    if (matches) {
+      const indexDefinition = this._prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?", connection).get(indexName);
+      const actualSql = indexDefinition && indexDefinition.sql ? String(indexDefinition.sql) : '';
+      const actualWhereMatch = actualSql.match(/\sWHERE\s([\s\S]*)$/i);
+      const actualWhere = actualWhereMatch ? actualWhereMatch[1].replace(/\s+/g, ' ').trim() : null;
+      const normalizedExpectedWhere = expectedWhere ? expectedWhere.replace(/\s+/g, ' ').trim() : null;
+      matches = actualWhere === normalizedExpectedWhere;
+    }
+    if (!matches) {
+      // CREATE INDEX IF NOT EXISTS would otherwise retain stale direction or
+      // expression definitions after upgrading an existing SQLite database.
+      this._prepare(`DROP INDEX IF EXISTS "${escapedIndexName}"`, connection).run();
+    }
+  }
   _arrayCompoundBaseIndexName(className, indexName) {
     // SQLite index names are database-global, even when their tables differ.
     return `${sqliteArrayCompoundBaseIndexPrefix}${encodeSQLiteTableNameToken(className)}_` + encodeSQLiteFieldToken(indexName);
+  }
+  _physicalIndexName(className, indexName) {
+    // SQLite index names are database-global, unlike Mongo index names which
+    // are scoped to one collection. Keep the logical name readable after a
+    // class token so query plans remain diagnosable.
+    return `${sqlitePhysicalIndexPrefix}${encodeSQLiteTableNameToken(className)}.${indexName}`;
+  }
+  _logicalIndexNameFromPhysical(className, physicalIndexName) {
+    const classPrefix = `${sqlitePhysicalIndexPrefix}${encodeSQLiteTableNameToken(className)}.`;
+    return physicalIndexName.startsWith(classPrefix) ? physicalIndexName.slice(classPrefix.length) : null;
+  }
+  _dropLegacyUnscopedIndexForClass(className, indexName, connection) {
+    const db = connection || this._db;
+    const legacyIndex = this._prepare("SELECT tbl_name FROM sqlite_master WHERE type = 'index' AND name = ?", db).get(indexName);
+    if (legacyIndex && legacyIndex.tbl_name === this._rawTableName(className, db)) {
+      this._prepare(`DROP INDEX IF EXISTS "${indexName.replace(/"/g, '""')}"`, db).run();
+    }
   }
   _getArrayCompoundBaseIndexFields(schemaFields, indexDefinition) {
     const baseFieldNames = [];
@@ -2851,9 +3637,19 @@ class SQLiteStorageAdapter {
     }
     const baseExpressions = baseFieldNames.map(fieldName => this._buildIndexFieldExpression(fieldName).expression);
     const orderedBaseExpressions = baseFieldNames.map((fieldName, fieldIndex) => `${baseExpressions[fieldIndex]} ${Number(indexDefinition[fieldName]) < 0 ? 'DESC' : 'ASC'}`);
+    const sparseWhere = sparse ? this._getSparseIndexWhereClause(className, baseFieldNames, baseExpressions) : null;
+    const expectedKeys = baseFieldNames.map(fieldName => {
+      const normalizedFieldName = this._normalizeIndexFieldPath(fieldName);
+      return {
+        columnName: normalizedFieldName.indexOf('.') < 0 ? normalizedFieldName : null,
+        collation: 'BINARY',
+        descending: Number(indexDefinition[fieldName]) < 0
+      };
+    });
+    this._dropSQLiteIndexIfKeyShapeChanged(baseIndexName, expectedKeys, sparseWhere, connection);
     let sql = `CREATE INDEX IF NOT EXISTS ${quotedBaseIndexName} ` + `ON ${this._tableName(className)} (${orderedBaseExpressions.join(', ')})`;
-    if (sparse) {
-      sql += ` WHERE ${baseExpressions.map(expression => `${expression} IS NOT NULL`).join(' AND ')}`;
+    if (sparseWhere) {
+      sql += ` WHERE ${sparseWhere}`;
     }
     this._prepare(sql, connection).run();
   }
@@ -3140,7 +3936,7 @@ class SQLiteStorageAdapter {
       ops: [object]
     };
   }
-  _buildWhereClause(className, schema, query, caseInsensitive = false, preserveSpecialFieldNames = false, preferBaseTableArrayIndexOrder = false) {
+  _buildWhereClause(className, schema, query, caseInsensitive = false, preserveSpecialFieldNames = false, preferBaseTableArrayIndexOrder = false, allowSpatialIndexCreation = true) {
     if (!query) {
       return {
         sql: '',
@@ -3169,7 +3965,7 @@ class SQLiteStorageAdapter {
       if (key === '$or' || key === '$and' || key === '$nor') {
         const subConds = [];
         for (const subQuery of val) {
-          const res = this._buildWhereClause(className, schema, subQuery, caseInsensitive, preserveSpecialFieldNames, preferBaseTableArrayIndexOrder);
+          const res = this._buildWhereClause(className, schema, subQuery, caseInsensitive, preserveSpecialFieldNames, preferBaseTableArrayIndexOrder, allowSpatialIndexCreation);
           if (res.sql) {
             subConds.push(`(${res.sql})`);
             params.push(...res.params);
@@ -3226,9 +4022,9 @@ class SQLiteStorageAdapter {
       const dotFieldRootExists = dotFieldPath && doesSQLiteFieldExistInSchema(schemaFields, dotFieldPath.rootFieldName);
       const dotFieldUsesRootArrayTraversal = dotFieldPath && dotFieldRootExists && schemaFields[dotFieldPath.rootFieldName] && schemaFields[dotFieldPath.rootFieldName].type === 'Array' && dotFieldPath.components.length > 0 && !isNumericArrayIndexComponent(dotFieldPath.components[0]);
       const dotFieldArrayPath = dotFieldUsesRootArrayTraversal ? buildArrayRootDotFieldPath(key) : null;
-      const hasNestedDotPathSegmentsBeyondOneLevel = dotFieldPath && dotFieldPath.components.length > 1;
+      const hasNestedDotPathComponents = dotFieldPath && dotFieldPath.components.length > 0;
       const hasExplicitNumericDotPathSegment = dotFieldPath && dotFieldPath.components.some(isNumericArrayIndexComponent);
-      const shouldUseNestedDotArrayTraversalFallback = dotFieldPath && dotFieldRootExists && !dotFieldArrayPath && hasNestedDotPathSegmentsBeyondOneLevel && !hasExplicitNumericDotPathSegment;
+      const shouldUseNestedDotArrayTraversalFallback = dotFieldPath && dotFieldRootExists && !dotFieldArrayPath && hasNestedDotPathComponents && !hasExplicitNumericDotPathSegment;
       const nestedDotArrayRootSql = shouldUseNestedDotArrayTraversalFallback ? quoteColumnName(dotFieldPath.rootFieldName) : null;
       const dotFieldArraySourceSql = dotFieldArrayPath ? quoteColumnName(dotFieldArrayPath.rootFieldName) : null;
       let targetSql;
@@ -3255,15 +4051,22 @@ class SQLiteStorageAdapter {
       }
       const usesCaseInsensitiveComparison = caseInsensitive && !authDataProvider && !isDotNotation && (normalizedKey === 'username' || normalizedKey === 'email');
       const isArrayField = normalizedKey === '_rperm' || normalizedKey === '_wperm' || schemaFields[normalizedKey] && schemaFields[normalizedKey].type === 'Array';
-      const usesNativePointerStorage = !authDataProvider && !isDotNotation && Boolean(schemaFields[normalizedKey] && schemaFields[normalizedKey].type === 'Pointer');
+      const nativeScalarStorageType = !authDataProvider && !isDotNotation && schemaFields[normalizedKey] && (schemaFields[normalizedKey].type === 'Pointer' || schemaFields[normalizedKey].type === 'Date' || schemaFields[normalizedKey].type === 'File' || schemaFields[normalizedKey].type === 'Object') ? schemaFields[normalizedKey].type : null;
       const explicitNullFieldMatch = shouldTrackExplicitNullFields(className) && !authDataProvider && !isDotNotation ? getExplicitNullFieldMatchExpression(normalizedKey) : null;
       /** Bare text columns can keep index-friendly LIKE/GLOB/=`...` lowering without CAST(... AS TEXT). */
       const canUseLoweredRegexRawTextTarget = !authDataProvider && !isDotNotation && !isArrayField && targetSql !== 'NULL' && isLowerableRegexTextColumn(schemaFields, normalizedKey);
       let indexedArrayElementTableName = null;
-      if (isArrayField || dotFieldArraySourceSql) {
+      if (isArrayField || dotFieldArraySourceSql || shouldUseNestedDotArrayTraversalFallback) {
         indexedArrayElementTableName = this._getQuotedIndexedArrayElementTableName(className, schemaFields, isArrayField ? normalizedKey : key);
       }
       const arrayIndexOuterObjectIdExpression = preferBaseTableArrayIndexOrder ? `${this._tableName(className)}.${quoteColumnName('objectId')}` : null;
+      let spatialIndexTableName = !preserveSpecialFieldNames && !authDataProvider && !isDotNotation ? this._getQuotedSpatialIndexTableName(className, schemaFields, normalizedKey) : null;
+      const ensureSpatialIndexForQuery = () => {
+        if (!spatialIndexTableName && allowSpatialIndexCreation && !preserveSpecialFieldNames && !authDataProvider && !isDotNotation) {
+          spatialIndexTableName = this._ensureSpatialIndexForQuery(className, schemaFields, normalizedKey);
+        }
+        return spatialIndexTableName;
+      };
       if (val === null || val === undefined) {
         if (dotFieldArraySourceSql) {
           const indexedArrayNullMatch = indexedArrayElementTableName ? getSQLiteArrayIndexNullMatchExpression(indexedArrayElementTableName, arrayIndexOuterObjectIdExpression) : null;
@@ -3328,15 +4131,22 @@ class SQLiteStorageAdapter {
                 params.push(...valueMatch.params);
               }
             } else if (shouldUseNestedDotArrayTraversalFallback) {
-              const directValueMatch = getScalarValueMatchExpression(targetSql, opVal);
-              const nestedArrayValueMatch = getNestedDotArrayTraversalValueMatchExpression(nestedDotArrayRootSql, dotFieldPath.components, key, opVal);
-              conditions.push(`((${directValueMatch.sql}) OR ${nestedArrayValueMatch.sql})`);
-              params.push(...directValueMatch.params, ...nestedArrayValueMatch.params);
+              const indexedArrayValueMatch = indexedArrayElementTableName ? getSQLiteArrayIndexValueMatchExpression(indexedArrayElementTableName, opVal, arrayIndexOuterObjectIdExpression) : null;
+              if (indexedArrayValueMatch) {
+                conditions.push(indexedArrayValueMatch.sql);
+                params.push(...indexedArrayValueMatch.params);
+              } else {
+                const directValueMatch = getScalarValueMatchExpression(targetSql, opVal);
+                const nestedArrayValueMatch = getNestedDotArrayTraversalValueMatchExpression(nestedDotArrayRootSql, dotFieldPath.components, key, opVal);
+                conditions.push(`((${directValueMatch.sql}) OR ${nestedArrayValueMatch.sql})`);
+                params.push(...directValueMatch.params, ...nestedArrayValueMatch.params);
+              }
             } else if (usesCaseInsensitiveComparison && typeof opVal === 'string') {
-              conditions.push(`(LOWER(${targetSql}) = LOWER(?))`);
-              params.push(opVal);
+              const valueMatch = getCaseInsensitiveScalarValueMatchExpression(targetSql, opVal);
+              conditions.push(`(${valueMatch.sql})`);
+              params.push(...valueMatch.params);
             } else {
-              const valueMatch = getScalarValueMatchExpression(targetSql, opVal, usesNativePointerStorage);
+              const valueMatch = getScalarValueMatchExpression(targetSql, opVal, nativeScalarStorageType);
               conditions.push(`(${valueMatch.sql})`);
               params.push(...valueMatch.params);
             }
@@ -3379,10 +4189,11 @@ class SQLiteStorageAdapter {
               conditions.push(`((${targetSql} IS NULL OR NOT (${directValueMatch.sql})) AND NOT (${nestedArrayValueMatch.sql}))`);
               params.push(...directValueMatch.params, ...nestedArrayValueMatch.params);
             } else if (usesCaseInsensitiveComparison && typeof opVal === 'string') {
-              conditions.push(`(${targetSql} IS NULL OR LOWER(${targetSql}) != LOWER(?))`);
-              params.push(opVal);
+              const valueMatch = getCaseInsensitiveScalarValueMatchExpression(targetSql, opVal);
+              conditions.push(`(${targetSql} IS NULL OR NOT (${valueMatch.sql}))`);
+              params.push(...valueMatch.params);
             } else {
-              const valueMatch = getScalarValueMatchExpression(targetSql, opVal, usesNativePointerStorage);
+              const valueMatch = getScalarValueMatchExpression(targetSql, opVal, nativeScalarStorageType);
               conditions.push(`(${targetSql} IS NULL OR NOT (${valueMatch.sql}))`);
               params.push(...valueMatch.params);
             }
@@ -3397,9 +4208,15 @@ class SQLiteStorageAdapter {
                 params.push(toSQLiteValue(opVal));
               }
             } else if (shouldUseNestedDotArrayTraversalFallback) {
-              const nestedArrayRangeMatch = getNestedDotArrayTraversalRangeMatchExpression(nestedDotArrayRootSql, dotFieldPath.components, key, '<', opVal);
-              conditions.push(`((${targetSql} < ?) OR ${nestedArrayRangeMatch.sql})`);
-              params.push(toSQLiteValue(opVal), ...nestedArrayRangeMatch.params);
+              const indexedArrayRangeMatch = indexedArrayElementTableName ? getSQLiteArrayIndexRangeMatchExpression(indexedArrayElementTableName, opVal, '<', arrayIndexOuterObjectIdExpression) : null;
+              if (indexedArrayRangeMatch) {
+                conditions.push(indexedArrayRangeMatch.sql);
+                params.push(...indexedArrayRangeMatch.params);
+              } else {
+                const nestedArrayRangeMatch = getNestedDotArrayTraversalRangeMatchExpression(nestedDotArrayRootSql, dotFieldPath.components, key, '<', opVal);
+                conditions.push(`((${targetSql} < ?) OR ${nestedArrayRangeMatch.sql})`);
+                params.push(toSQLiteValue(opVal), ...nestedArrayRangeMatch.params);
+              }
             } else {
               conditions.push(`${targetSql} < ?`);
               params.push(toSQLiteValue(opVal));
@@ -3415,9 +4232,15 @@ class SQLiteStorageAdapter {
                 params.push(toSQLiteValue(opVal));
               }
             } else if (shouldUseNestedDotArrayTraversalFallback) {
-              const nestedArrayRangeMatch = getNestedDotArrayTraversalRangeMatchExpression(nestedDotArrayRootSql, dotFieldPath.components, key, '<=', opVal);
-              conditions.push(`((${targetSql} <= ?) OR ${nestedArrayRangeMatch.sql})`);
-              params.push(toSQLiteValue(opVal), ...nestedArrayRangeMatch.params);
+              const indexedArrayRangeMatch = indexedArrayElementTableName ? getSQLiteArrayIndexRangeMatchExpression(indexedArrayElementTableName, opVal, '<=', arrayIndexOuterObjectIdExpression) : null;
+              if (indexedArrayRangeMatch) {
+                conditions.push(indexedArrayRangeMatch.sql);
+                params.push(...indexedArrayRangeMatch.params);
+              } else {
+                const nestedArrayRangeMatch = getNestedDotArrayTraversalRangeMatchExpression(nestedDotArrayRootSql, dotFieldPath.components, key, '<=', opVal);
+                conditions.push(`((${targetSql} <= ?) OR ${nestedArrayRangeMatch.sql})`);
+                params.push(toSQLiteValue(opVal), ...nestedArrayRangeMatch.params);
+              }
             } else {
               conditions.push(`${targetSql} <= ?`);
               params.push(toSQLiteValue(opVal));
@@ -3433,9 +4256,15 @@ class SQLiteStorageAdapter {
                 params.push(toSQLiteValue(opVal));
               }
             } else if (shouldUseNestedDotArrayTraversalFallback) {
-              const nestedArrayRangeMatch = getNestedDotArrayTraversalRangeMatchExpression(nestedDotArrayRootSql, dotFieldPath.components, key, '>', opVal);
-              conditions.push(`((${targetSql} > ?) OR ${nestedArrayRangeMatch.sql})`);
-              params.push(toSQLiteValue(opVal), ...nestedArrayRangeMatch.params);
+              const indexedArrayRangeMatch = indexedArrayElementTableName ? getSQLiteArrayIndexRangeMatchExpression(indexedArrayElementTableName, opVal, '>', arrayIndexOuterObjectIdExpression) : null;
+              if (indexedArrayRangeMatch) {
+                conditions.push(indexedArrayRangeMatch.sql);
+                params.push(...indexedArrayRangeMatch.params);
+              } else {
+                const nestedArrayRangeMatch = getNestedDotArrayTraversalRangeMatchExpression(nestedDotArrayRootSql, dotFieldPath.components, key, '>', opVal);
+                conditions.push(`((${targetSql} > ?) OR ${nestedArrayRangeMatch.sql})`);
+                params.push(toSQLiteValue(opVal), ...nestedArrayRangeMatch.params);
+              }
             } else {
               conditions.push(`${targetSql} > ?`);
               params.push(toSQLiteValue(opVal));
@@ -3451,9 +4280,15 @@ class SQLiteStorageAdapter {
                 params.push(toSQLiteValue(opVal));
               }
             } else if (shouldUseNestedDotArrayTraversalFallback) {
-              const nestedArrayRangeMatch = getNestedDotArrayTraversalRangeMatchExpression(nestedDotArrayRootSql, dotFieldPath.components, key, '>=', opVal);
-              conditions.push(`((${targetSql} >= ?) OR ${nestedArrayRangeMatch.sql})`);
-              params.push(toSQLiteValue(opVal), ...nestedArrayRangeMatch.params);
+              const indexedArrayRangeMatch = indexedArrayElementTableName ? getSQLiteArrayIndexRangeMatchExpression(indexedArrayElementTableName, opVal, '>=', arrayIndexOuterObjectIdExpression) : null;
+              if (indexedArrayRangeMatch) {
+                conditions.push(indexedArrayRangeMatch.sql);
+                params.push(...indexedArrayRangeMatch.params);
+              } else {
+                const nestedArrayRangeMatch = getNestedDotArrayTraversalRangeMatchExpression(nestedDotArrayRootSql, dotFieldPath.components, key, '>=', opVal);
+                conditions.push(`((${targetSql} >= ?) OR ${nestedArrayRangeMatch.sql})`);
+                params.push(toSQLiteValue(opVal), ...nestedArrayRangeMatch.params);
+              }
             } else {
               conditions.push(`${targetSql} >= ?`);
               params.push(toSQLiteValue(opVal));
@@ -3511,11 +4346,24 @@ class SQLiteStorageAdapter {
               } else if (shouldUseNestedDotArrayTraversalFallback) {
                 const inClauses = [];
                 if (nonNulls.length > 0) {
-                  const directAnyMatch = getTypedValueAnyMatchExpression(targetSql, dotFieldTypeSql, nonNulls);
-                  const nestedArrayAnyMatch = getNestedDotArrayTraversalAnyMatchExpression(nestedDotArrayRootSql, dotFieldPath.components, key, nonNulls);
-                  inClauses.push(`(${directAnyMatch.sql})`);
-                  inClauses.push(nestedArrayAnyMatch.sql);
-                  params.push(...directAnyMatch.params, ...nestedArrayAnyMatch.params);
+                  const indexedAnyMatch = indexedArrayElementTableName ? getSQLiteArrayIndexAnyMatchExpression(indexedArrayElementTableName, nonNulls, comparisonValues => {
+                    const directAnyMatch = getTypedValueAnyMatchExpression(targetSql, dotFieldTypeSql, comparisonValues);
+                    const nestedArrayAnyMatch = getNestedDotArrayTraversalAnyMatchExpression(nestedDotArrayRootSql, dotFieldPath.components, key, comparisonValues);
+                    return {
+                      sql: `((${directAnyMatch.sql}) OR ${nestedArrayAnyMatch.sql})`,
+                      params: [...directAnyMatch.params, ...nestedArrayAnyMatch.params]
+                    };
+                  }, arrayIndexOuterObjectIdExpression) : null;
+                  if (indexedAnyMatch) {
+                    inClauses.push(`(${indexedAnyMatch.sql})`);
+                    params.push(...indexedAnyMatch.params);
+                  } else {
+                    const directAnyMatch = getTypedValueAnyMatchExpression(targetSql, dotFieldTypeSql, nonNulls);
+                    const nestedArrayAnyMatch = getNestedDotArrayTraversalAnyMatchExpression(nestedDotArrayRootSql, dotFieldPath.components, key, nonNulls);
+                    inClauses.push(`(${directAnyMatch.sql})`);
+                    inClauses.push(nestedArrayAnyMatch.sql);
+                    params.push(...directAnyMatch.params, ...nestedArrayAnyMatch.params);
+                  }
                 }
                 if (hasNull) {
                   const nestedArrayExistsMatch = getNestedDotArrayTraversalExistsExpression(nestedDotArrayRootSql, dotFieldPath.components, key);
@@ -3547,7 +4395,7 @@ class SQLiteStorageAdapter {
                 }
               } else {
                 if (nonNulls.length > 0) {
-                  const scalarMatch = getScalarAnyMatchExpression(targetSql, nonNulls, usesNativePointerStorage);
+                  const scalarMatch = usesCaseInsensitiveComparison ? getCaseInsensitiveScalarAnyMatchExpression(targetSql, nonNulls) : getScalarAnyMatchExpression(targetSql, nonNulls, nativeScalarStorageType);
                   if (hasNull) {
                     conditions.push(`(${targetSql} IS NULL OR (${scalarMatch.sql}))`);
                   } else {
@@ -3646,7 +4494,7 @@ class SQLiteStorageAdapter {
                 }
               } else {
                 if (nonNulls.length > 0) {
-                  const scalarMatch = getScalarAnyMatchExpression(targetSql, nonNulls, usesNativePointerStorage);
+                  const scalarMatch = usesCaseInsensitiveComparison ? getCaseInsensitiveScalarAnyMatchExpression(targetSql, nonNulls) : getScalarAnyMatchExpression(targetSql, nonNulls, nativeScalarStorageType);
                   if (hasNull) {
                     conditions.push(`(${targetSql} IS NOT NULL AND NOT (${scalarMatch.sql}))`);
                   } else {
@@ -3717,10 +4565,16 @@ class SQLiteStorageAdapter {
                 params.push(...valueRegexMatch.params);
               }
             } else if (shouldUseNestedDotArrayTraversalFallback) {
-              const directRegexMatch = getSQLiteRegexValueMatchExpression(targetSql, normalizedRegex, regexMatchPlan);
-              const nestedArrayRegexMatch = getNestedDotArrayTraversalRegexMatchExpression(nestedDotArrayRootSql, dotFieldPath.components, key, normalizedRegex);
-              conditions.push(`((${directRegexMatch.sql}) OR ${nestedArrayRegexMatch.sql})`);
-              params.push(...directRegexMatch.params, ...nestedArrayRegexMatch.params);
+              if (indexedArrayElementTableName) {
+                const indexedRegexMatch = getSQLiteArrayIndexRegexMatchExpression(indexedArrayElementTableName, normalizedRegex, arrayIndexOuterObjectIdExpression);
+                conditions.push(indexedRegexMatch.sql);
+                params.push(...indexedRegexMatch.params);
+              } else {
+                const directRegexMatch = getSQLiteRegexValueMatchExpression(targetSql, normalizedRegex, regexMatchPlan);
+                const nestedArrayRegexMatch = getNestedDotArrayTraversalRegexMatchExpression(nestedDotArrayRootSql, dotFieldPath.components, key, normalizedRegex);
+                conditions.push(`((${directRegexMatch.sql}) OR ${nestedArrayRegexMatch.sql})`);
+                params.push(...directRegexMatch.params, ...nestedArrayRegexMatch.params);
+              }
             } else {
               const scalarRegexMatch = getSQLiteRegexValueMatchExpression(targetSql, normalizedRegex, regexMatchPlan);
               conditions.push(scalarRegexMatch.sql);
@@ -3735,13 +4589,23 @@ class SQLiteStorageAdapter {
             const lat = point.latitude;
             const lng = point.longitude;
             const maxDistance = val.$maxDistance;
-            const distanceExpression = `parse_geo_distance(` + `json_extract(${targetSql}, '$.latitude'), ` + `json_extract(${targetSql}, '$.longitude'), ?, ?)`;
+            const distanceExpression = this._getGeoDistanceExpression(`json_extract(${targetSql}, '$.latitude')`, `json_extract(${targetSql}, '$.longitude')`, lat, lng);
             if (maxDistance !== undefined) {
-              conditions.push(`${distanceExpression} <= ?`);
-              params.push(lat, lng, maxDistance);
+              const useSpatialRadiusIndex = shouldUseSQLiteSpatialRadiusIndex(maxDistance);
+              if (useSpatialRadiusIndex) {
+                ensureSpatialIndexForQuery();
+              }
+              if (useSpatialRadiusIndex && spatialIndexTableName) {
+                const spatialRadiusMatch = this._getSpatialPointRadiusMatchExpression(className, spatialIndexTableName, lat, lng, maxDistance);
+                conditions.push(spatialRadiusMatch.sql);
+                params.push(...spatialRadiusMatch.params);
+              } else {
+                conditions.push(`${distanceExpression.sql} <= ?`);
+                params.push(...distanceExpression.params, maxDistance);
+              }
             }
-            orderBys.push(`${distanceExpression} ASC`);
-            orderByParams.push(lat, lng);
+            orderBys.push(`${distanceExpression.sql} ASC`);
+            orderByParams.push(...distanceExpression.params);
           } else if (op === '$maxDistance') {
             if (!val.$nearSphere) {
               throw new _node.default.Error(_node.default.Error.INVALID_JSON, 'bad constraint: $maxDistance');
@@ -3749,8 +4613,32 @@ class SQLiteStorageAdapter {
           } else if (op === '$within') {
             if (opVal.$box) {
               const box = opVal.$box;
-              conditions.push(`parse_within_box(json_extract(${targetSql}, '$.latitude'), json_extract(${targetSql}, '$.longitude'), ?, ?, ?, ?) = 1`);
-              params.push(box[0].latitude, box[0].longitude, box[1].latitude, box[1].longitude);
+              const minLatitude = Math.min(box[0].latitude, box[1].latitude);
+              const maxLatitude = Math.max(box[0].latitude, box[1].latitude);
+              const minLongitude = Math.min(box[0].longitude, box[1].longitude);
+              const maxLongitude = Math.max(box[0].longitude, box[1].longitude);
+              const boxBounds = {
+                minLatitude,
+                maxLatitude,
+                longitudeIntervals: [{
+                  min: minLongitude,
+                  max: maxLongitude
+                }]
+              };
+              const useSpatialBoxIndex = shouldUseSQLiteSpatialBoundsIndex(boxBounds);
+              if (useSpatialBoxIndex) {
+                ensureSpatialIndexForQuery();
+              }
+              if (useSpatialBoxIndex && spatialIndexTableName) {
+                const spatialBoxMatch = this._getSpatialPointBoxMatchExpression(className, spatialIndexTableName, minLatitude, maxLatitude, minLongitude, maxLongitude);
+                conditions.push(spatialBoxMatch.sql);
+                params.push(...spatialBoxMatch.params);
+              } else {
+                // BETWEEN evaluates each JSON coordinate once and avoids a
+                // JavaScript UDF call for every row in a broad box scan.
+                conditions.push(`json_extract(${targetSql}, '$.latitude') BETWEEN ? AND ? AND ` + `json_extract(${targetSql}, '$.longitude') BETWEEN ? AND ?`);
+                params.push(minLatitude, maxLatitude, minLongitude, maxLongitude);
+              }
             } else {
               throw new _node.default.Error(_node.default.Error.INVALID_JSON, 'malformatted $within arg');
             }
@@ -3778,12 +4666,45 @@ class SQLiteStorageAdapter {
               if (isNaN(maxDistanceRad) || maxDistanceRad < 0) {
                 throw new _node.default.Error(_node.default.Error.INVALID_JSON, 'bad $geoWithin value; $centerSphere distance invalid');
               }
-              conditions.push(`parse_geo_distance(json_extract(${targetSql}, '$.latitude'), json_extract(${targetSql}, '$.longitude'), ?, ?) <= ?`);
-              params.push(lat, lng, maxDistanceRad);
+              const useSpatialRadiusIndex = shouldUseSQLiteSpatialRadiusIndex(maxDistanceRad);
+              if (useSpatialRadiusIndex) {
+                ensureSpatialIndexForQuery();
+              }
+              if (useSpatialRadiusIndex && spatialIndexTableName) {
+                const spatialRadiusMatch = this._getSpatialPointRadiusMatchExpression(className, spatialIndexTableName, lat, lng, maxDistanceRad);
+                conditions.push(spatialRadiusMatch.sql);
+                params.push(...spatialRadiusMatch.params);
+              } else {
+                const distanceExpression = this._getGeoDistanceExpression(`json_extract(${targetSql}, '$.latitude')`, `json_extract(${targetSql}, '$.longitude')`, lat, lng);
+                conditions.push(`${distanceExpression.sql} <= ?`);
+                params.push(...distanceExpression.params, maxDistanceRad);
+              }
             } else if (opVal.$polygon) {
               const poly = normalizeGeoWithinPolygonValue(opVal.$polygon);
-              conditions.push(`parse_within_polygon(json_extract(${targetSql}, '$.latitude'), json_extract(${targetSql}, '$.longitude'), ?) = 1`);
-              params.push(JSON.stringify(poly));
+              const polygonInfo = getPolygonSpatialQueryInfo(poly);
+              const polygonBounds = {
+                minLatitude: polygonInfo.minLatitude,
+                maxLatitude: polygonInfo.maxLatitude,
+                longitudeIntervals: [{
+                  min: polygonInfo.minLongitude,
+                  max: polygonInfo.maxLongitude
+                }]
+              };
+              const useSpatialPolygonIndex = shouldUseSQLiteSpatialBoundsIndex(polygonBounds);
+              if (useSpatialPolygonIndex) {
+                ensureSpatialIndexForQuery();
+              }
+              if (useSpatialPolygonIndex && spatialIndexTableName) {
+                const spatialPolygonMatch = this._getSpatialPointPolygonMatchExpression(className, spatialIndexTableName, polygonInfo);
+                conditions.push(spatialPolygonMatch.sql);
+                params.push(...spatialPolygonMatch.params);
+              } else if (this._supportsSQLiteGeopoly) {
+                conditions.push(`geopoly_contains_point(geopoly_blob(?), ` + `json_extract(${targetSql}, '$.longitude'), ` + `json_extract(${targetSql}, '$.latitude')) != 0`);
+                params.push(polygonInfo.geopolyJSON);
+              } else {
+                conditions.push(`parse_within_polygon(json_extract(${targetSql}, '$.latitude'), json_extract(${targetSql}, '$.longitude'), ?) = 1`);
+                params.push(JSON.stringify(poly));
+              }
             }
           } else if (op === '$geoIntersects') {
             if (opVal.$point && schemaFields[key] && schemaFields[key].type === 'Polygon') {
@@ -3792,12 +4713,41 @@ class SQLiteStorageAdapter {
                 throw new _node.default.Error(_node.default.Error.INVALID_JSON, 'bad $geoIntersect value; $point should be GeoPoint');
               }
               _node.default.GeoPoint._validate(point.latitude, point.longitude);
-              conditions.push(`parse_within_polygon(?, ?, ${targetSql}) = 1`);
-              params.push(point.latitude, point.longitude);
+              ensureSpatialIndexForQuery();
+              if (spatialIndexTableName) {
+                const spatialPointMatch = this._getSpatialPolygonPointMatchExpression(className, spatialIndexTableName, point.latitude, point.longitude);
+                conditions.push(spatialPointMatch.sql);
+                params.push(...spatialPointMatch.params);
+              } else {
+                conditions.push(`parse_within_polygon(?, ?, ${targetSql}) = 1`);
+                params.push(point.latitude, point.longitude);
+              }
             } else if (opVal.$polygon) {
               const poly = normalizeGeoWithinPolygonValue(opVal.$polygon);
-              conditions.push(`parse_within_polygon(json_extract(${targetSql}, '$.latitude'), json_extract(${targetSql}, '$.longitude'), ?) = 1`);
-              params.push(JSON.stringify(poly));
+              const polygonInfo = getPolygonSpatialQueryInfo(poly);
+              const polygonBounds = {
+                minLatitude: polygonInfo.minLatitude,
+                maxLatitude: polygonInfo.maxLatitude,
+                longitudeIntervals: [{
+                  min: polygonInfo.minLongitude,
+                  max: polygonInfo.maxLongitude
+                }]
+              };
+              const useSpatialPolygonIndex = shouldUseSQLiteSpatialBoundsIndex(polygonBounds);
+              if (useSpatialPolygonIndex) {
+                ensureSpatialIndexForQuery();
+              }
+              if (useSpatialPolygonIndex && spatialIndexTableName) {
+                const spatialPolygonMatch = this._getSpatialPointPolygonMatchExpression(className, spatialIndexTableName, polygonInfo);
+                conditions.push(spatialPolygonMatch.sql);
+                params.push(...spatialPolygonMatch.params);
+              } else if (this._supportsSQLiteGeopoly) {
+                conditions.push(`geopoly_contains_point(geopoly_blob(?), ` + `json_extract(${targetSql}, '$.longitude'), ` + `json_extract(${targetSql}, '$.latitude')) != 0`);
+                params.push(polygonInfo.geopolyJSON);
+              } else {
+                conditions.push(`parse_within_polygon(json_extract(${targetSql}, '$.latitude'), json_extract(${targetSql}, '$.longitude'), ?) = 1`);
+                params.push(JSON.stringify(poly));
+              }
             }
           } else if (op === '$options') {
             if (!Object.prototype.hasOwnProperty.call(val, '$regex')) {
@@ -3811,7 +4761,7 @@ class SQLiteStorageAdapter {
                 if (!isAllValuesRegexOrNone(opVal)) {
                   throw new _node.default.Error(_node.default.Error.INVALID_JSON, 'All $all values must be of regex type or none: ' + opVal);
                 }
-                if (!isArrayField) {
+                if (!isArrayField && !dotFieldArraySourceSql && !shouldUseNestedDotArrayTraversalFallback) {
                   conditions.push('1 = 0');
                   continue;
                 }
@@ -3821,6 +4771,16 @@ class SQLiteStorageAdapter {
                     const indexedRegexMatch = getSQLiteArrayIndexRegexMatchExpression(indexedArrayElementTableName, normalizedRegex, arrayIndexOuterObjectIdExpression);
                     conditions.push(indexedRegexMatch.sql);
                     params.push(...indexedRegexMatch.params);
+                  } else if (dotFieldArraySourceSql) {
+                    const regexMatchPlan = getRegexMatchPlan(targetSql, normalizedRegex);
+                    const valueRegexMatch = getSQLiteRegexValueMatchExpression(targetSql, normalizedRegex, regexMatchPlan);
+                    conditions.push(`EXISTS (SELECT 1 FROM json_each(${dotFieldArraySourceSql}) WHERE ${valueRegexMatch.sql})`);
+                    params.push(...valueRegexMatch.params);
+                  } else if (shouldUseNestedDotArrayTraversalFallback) {
+                    const directRegexMatch = getSQLiteRegexValueMatchExpression(targetSql, normalizedRegex);
+                    const nestedArrayRegexMatch = getNestedDotArrayTraversalRegexMatchExpression(nestedDotArrayRootSql, dotFieldPath.components, key, normalizedRegex);
+                    conditions.push(`((${directRegexMatch.sql}) OR ${nestedArrayRegexMatch.sql})`);
+                    params.push(...directRegexMatch.params, ...nestedArrayRegexMatch.params);
                   } else {
                     const regexMatchPlan = getRegexMatchPlan('value', normalizedRegex);
                     const valueRegexMatch = getSQLiteRegexValueMatchExpression('value', normalizedRegex, regexMatchPlan);
@@ -3829,21 +4789,30 @@ class SQLiteStorageAdapter {
                   }
                 }
               } else {
-                for (const elem of opVal) {
-                  if (isArrayField) {
-                    const indexedArrayValueMatch = indexedArrayElementTableName ? getSQLiteArrayIndexValueMatchExpression(indexedArrayElementTableName, elem, arrayIndexOuterObjectIdExpression) : null;
-                    if (indexedArrayValueMatch) {
-                      conditions.push(indexedArrayValueMatch.sql);
-                      params.push(...indexedArrayValueMatch.params);
-                    } else {
+                const indexedAllMatch = getSQLiteArrayIndexAllMatchExpression(indexedArrayElementTableName, opVal, arrayIndexOuterObjectIdExpression);
+                if (indexedAllMatch) {
+                  conditions.push(indexedAllMatch.sql);
+                  params.push(...indexedAllMatch.params);
+                } else {
+                  for (const elem of opVal) {
+                    if (isArrayField) {
                       const elementMatch = getArrayElementMatchExpression(targetSql, elem);
                       conditions.push(elementMatch.sql);
                       params.push(...elementMatch.params);
+                    } else if (dotFieldArraySourceSql) {
+                      const valueMatch = getArrayRootDotValueMatchExpression(dotFieldArraySourceSql, targetSql, elem);
+                      conditions.push(valueMatch.sql);
+                      params.push(...valueMatch.params);
+                    } else if (shouldUseNestedDotArrayTraversalFallback) {
+                      const directValueMatch = getScalarValueMatchExpression(targetSql, elem);
+                      const nestedArrayValueMatch = getNestedDotArrayTraversalValueMatchExpression(nestedDotArrayRootSql, dotFieldPath.components, key, elem);
+                      conditions.push(`((${directValueMatch.sql}) OR ${nestedArrayValueMatch.sql})`);
+                      params.push(...directValueMatch.params, ...nestedArrayValueMatch.params);
+                    } else {
+                      const valueMatch = getScalarValueMatchExpression(targetSql, elem, nativeScalarStorageType);
+                      conditions.push(`(${valueMatch.sql})`);
+                      params.push(...valueMatch.params);
                     }
-                  } else {
-                    const valueMatch = getScalarValueMatchExpression(targetSql, elem, usesNativePointerStorage);
-                    conditions.push(`(${valueMatch.sql})`);
-                    params.push(...valueMatch.params);
                   }
                 }
               }
@@ -3852,7 +4821,11 @@ class SQLiteStorageAdapter {
             if (!Array.isArray(opVal)) {
               throw new _node.default.Error(_node.default.Error.INVALID_JSON, 'bad $containedBy: should be an array');
             }
-            if (opVal.length === 0) {
+            if (dotFieldArraySourceSql || shouldUseNestedDotArrayTraversalFallback) {
+              const containedByMatch = getNestedDotTraversalContainedByExpression(quoteColumnName(dotFieldPath.rootFieldName), dotFieldPath.components, key, opVal);
+              conditions.push(containedByMatch.sql);
+              params.push(...containedByMatch.params);
+            } else if (opVal.length === 0) {
               conditions.push(`(${targetSql} IS NULL OR json_array_length(${targetSql}) = 0)`);
             } else {
               if (isArrayField) {
@@ -3861,7 +4834,7 @@ class SQLiteStorageAdapter {
                 conditions.push(`(${targetSql} IS NULL OR NOT EXISTS (SELECT 1 FROM ${eachTableName}(${targetSql}) WHERE NOT (${valueMatch.sql})))`);
                 params.push(...valueMatch.params);
               } else {
-                const scalarMatch = getScalarAnyMatchExpression(targetSql, opVal, usesNativePointerStorage);
+                const scalarMatch = getScalarAnyMatchExpression(targetSql, opVal, nativeScalarStorageType);
                 conditions.push(`(${targetSql} IS NULL OR (${scalarMatch.sql}))`);
                 params.push(...scalarMatch.params);
               }
@@ -3892,15 +4865,22 @@ class SQLiteStorageAdapter {
             params.push(...valueMatch.params);
           }
         } else if (shouldUseNestedDotArrayTraversalFallback) {
-          const directValueMatch = getScalarValueMatchExpression(targetSql, val);
-          const nestedArrayValueMatch = getNestedDotArrayTraversalValueMatchExpression(quoteColumnName(dotFieldPath.rootFieldName), dotFieldPath.components, key, val);
-          conditions.push(`((${directValueMatch.sql}) OR ${nestedArrayValueMatch.sql})`);
-          params.push(...directValueMatch.params, ...nestedArrayValueMatch.params);
+          const indexedArrayValueMatch = indexedArrayElementTableName ? getSQLiteArrayIndexValueMatchExpression(indexedArrayElementTableName, val, arrayIndexOuterObjectIdExpression) : null;
+          if (indexedArrayValueMatch) {
+            conditions.push(indexedArrayValueMatch.sql);
+            params.push(...indexedArrayValueMatch.params);
+          } else {
+            const directValueMatch = getScalarValueMatchExpression(targetSql, val);
+            const nestedArrayValueMatch = getNestedDotArrayTraversalValueMatchExpression(quoteColumnName(dotFieldPath.rootFieldName), dotFieldPath.components, key, val);
+            conditions.push(`((${directValueMatch.sql}) OR ${nestedArrayValueMatch.sql})`);
+            params.push(...directValueMatch.params, ...nestedArrayValueMatch.params);
+          }
         } else if (usesCaseInsensitiveComparison && typeof val === 'string') {
-          conditions.push(`(LOWER(${targetSql}) = LOWER(?))`);
-          params.push(val);
+          const valueMatch = getCaseInsensitiveScalarValueMatchExpression(targetSql, val);
+          conditions.push(`(${valueMatch.sql})`);
+          params.push(...valueMatch.params);
         } else {
-          const valueMatch = getScalarValueMatchExpression(targetSql, val, usesNativePointerStorage);
+          const valueMatch = getScalarValueMatchExpression(targetSql, val, nativeScalarStorageType);
           conditions.push(`(${valueMatch.sql})`);
           params.push(...valueMatch.params);
         }
@@ -3932,6 +4912,21 @@ class SQLiteStorageAdapter {
     const equalityFieldNames = new Set();
     const setCandidates = [];
     const schemaFields = schema && schema.fields || {};
+    const addSetCandidate = (fieldName, path, comparisonValues, buildReplacement) => {
+      const normalizedFieldName = this._normalizeIndexFieldPath(fieldName);
+      const fieldSchema = schemaFields[normalizedFieldName];
+      if (normalizedFieldName.indexOf('.') >= 0 || !fieldSchema || fieldSchema.type !== 'String' && fieldSchema.type !== 'Number' && fieldSchema.type !== 'Boolean' && fieldSchema.type !== 'Pointer' && fieldSchema.type !== 'Date') {
+        return;
+      }
+      const uniqueValues = getSQLiteOrderedSetValues(comparisonValues, fieldSchema.type);
+      if (uniqueValues) {
+        setCandidates.push({
+          fieldName: normalizedFieldName,
+          path,
+          replacements: uniqueValues.map(buildReplacement)
+        });
+      }
+    };
     const visitConjunctiveQuery = (queryPart, path) => {
       for (const fieldName in queryPart || {}) {
         if (!Object.prototype.hasOwnProperty.call(queryPart, fieldName)) {
@@ -3944,13 +4939,65 @@ class SQLiteStorageAdapter {
           }
           continue;
         }
+        if (fieldName === '$or' && Array.isArray(value)) {
+          const comparisonValues = [];
+          let candidateFieldName = null;
+          let isSimpleEqualitySet = value.length > 0;
+          for (const branch of value) {
+            if (!branch || typeof branch !== 'object' || Array.isArray(branch)) {
+              isSimpleEqualitySet = false;
+              break;
+            }
+            let branchFieldName = null;
+            for (const branchKey in branch) {
+              if (!Object.prototype.hasOwnProperty.call(branch, branchKey)) {
+                continue;
+              }
+              if (branchFieldName !== null) {
+                isSimpleEqualitySet = false;
+                break;
+              }
+              branchFieldName = branchKey;
+            }
+            if (!isSimpleEqualitySet || !branchFieldName || branchFieldName.startsWith('$') || candidateFieldName !== null && candidateFieldName !== branchFieldName) {
+              isSimpleEqualitySet = false;
+              break;
+            }
+            let comparisonValue = branch[branchFieldName];
+            if (isQueryOperatorObject(comparisonValue)) {
+              let operatorName = null;
+              for (const name in comparisonValue) {
+                if (!Object.prototype.hasOwnProperty.call(comparisonValue, name)) {
+                  continue;
+                }
+                if (operatorName !== null) {
+                  isSimpleEqualitySet = false;
+                  break;
+                }
+                operatorName = name;
+              }
+              if (!isSimpleEqualitySet || operatorName !== '$eq') {
+                isSimpleEqualitySet = false;
+                break;
+              }
+              comparisonValue = comparisonValue.$eq;
+            }
+            candidateFieldName = branchFieldName;
+            comparisonValues.push(comparisonValue);
+          }
+          if (isSimpleEqualitySet && candidateFieldName) {
+            addSetCandidate(candidateFieldName, [...path, fieldName], comparisonValues, comparisonValue => [{
+              [candidateFieldName]: comparisonValue
+            }]);
+          }
+          continue;
+        }
         // A predicate below OR/NOR is not guaranteed for every returned row, so
         // it cannot provide an equality prefix for every UNION branch.
         if (fieldName.startsWith('$')) {
           continue;
         }
         const normalizedFieldName = this._normalizeIndexFieldPath(fieldName);
-        const fieldSchema = schemaFields[normalizedFieldName];
         if (!isQueryOperatorObject(value)) {
           equalityFieldNames.add(normalizedFieldName);
           continue;
@@ -3960,35 +5007,10 @@ class SQLiteStorageAdapter {
           equalityFieldNames.add(normalizedFieldName);
           continue;
         }
-        if (operatorNames.length !== 1 || operatorNames[0] !== '$in' || normalizedFieldName.indexOf('.') >= 0 || !Array.isArray(value.$in)) {
+        if (operatorNames.length !== 1 || operatorNames[0] !== '$in' || !Array.isArray(value.$in)) {
           continue;
         }
-        if (!fieldSchema || fieldSchema.type !== 'String' && fieldSchema.type !== 'Number' && fieldSchema.type !== 'Boolean') {
-          continue;
-        }
-        const uniqueValues = [];
-        const seenValues = new Set();
-        let allValuesCanBranch = true;
-        let comparisonValueType = null;
-        for (const comparisonValue of value.$in) {
-          if (!isSQLitePrimitiveSetComparisonValue(comparisonValue) || comparisonValueType && comparisonValueType !== typeof comparisonValue) {
-            allValuesCanBranch = false;
-            break;
-          }
-          comparisonValueType = typeof comparisonValue;
-          const valueKey = `${typeof comparisonValue}:${String(comparisonValue)}`;
-          if (!seenValues.has(valueKey)) {
-            seenValues.add(valueKey);
-            uniqueValues.push(comparisonValue);
-          }
-        }
-        if (allValuesCanBranch && uniqueValues.length > 1 && uniqueValues.length <= sqliteOrderedSetUnionBranchLimit) {
-          setCandidates.push({
-            fieldName: normalizedFieldName,
-            path: [...path, fieldName],
-            values: uniqueValues
-          });
-        }
+        addSetCandidate(fieldName, [...path, fieldName], value.$in, comparisonValue => comparisonValue);
       }
     };
     visitConjunctiveQuery(query, []);
@@ -4028,7 +5050,7 @@ class SQLiteStorageAdapter {
           }
         }
         if (includesCandidate && hasCompleteEqualityPrefix) {
-          return candidate.values.map(value => replaceSQLiteQueryValueAtPath(query, candidate.path, value));
+          return candidate.replacements.map(replacement => replaceSQLiteQueryValueAtPath(query, candidate.path, replacement));
         }
       }
     }
@@ -4049,7 +5071,7 @@ class SQLiteStorageAdapter {
     const db = transactionalSession || this._db;
     const textSearch = parseTextSearch(query);
     const effectiveQuery = textSearch ? textSearch.remainingQuery : query;
-    const where = this._buildWhereClause(className, schema, effectiveQuery, Boolean(caseInsensitive));
+    const where = this._buildWhereClause(className, schema, effectiveQuery, Boolean(caseInsensitive), false, false, canCreateSQLiteQueryArtifacts(transactionalSession, this._db));
     const orderedSetUnionQueries = textSearch || caseInsensitive ? null : this._getOrderedSetUnionQueries(className, schema, effectiveQuery, sort, limit, db);
     if (!(await this.classExists(className, db))) {
       return [];
@@ -4058,6 +5080,7 @@ class SQLiteStorageAdapter {
     const queryParams = [...where.params];
     let selectSql = '*';
     let includeTextScore = false;
+    const selectedStorageFieldNames = new Set();
     if (keys && keys.length > 0) {
       const selectedCols = [];
       for (const key of keys) {
@@ -4072,11 +5095,13 @@ class SQLiteStorageAdapter {
           }
           if (selectedKey.indexOf('.') >= 0) {
             selectedCols.push(`${transformDotField(selectedKey)} as "${selectedKey.replace(/"/g, '""')}"`);
+            selectedStorageFieldNames.add(selectedKey);
           } else if (selectedKey === '$score') {
             includeTextScore = true;
           } else {
             validateFieldName(selectedKey);
             selectedCols.push(quoteColumnName(selectedKey));
+            selectedStorageFieldNames.add(normalizeStorageFieldName(selectedKey));
           }
         }
       }
@@ -4089,7 +5114,25 @@ class SQLiteStorageAdapter {
     }
     let sql;
     let textScoreSql = null;
-    const usesOrderedSetUnion = Boolean(orderedSetUnionQueries && selectSql === '*' && where.orderBys.length === 0);
+    let orderedSetUnionSelectSql = selectSql;
+    let orderedSetUnionAddedSortField = null;
+    let canUseOrderedSetUnionProjection = selectSql === '*';
+    if (orderedSetUnionQueries && selectSql !== '*') {
+      for (const sortKey in sort || {}) {
+        if (!Object.prototype.hasOwnProperty.call(sort, sortKey)) {
+          continue;
+        }
+        const normalizedSortKey = normalizeStorageFieldName(sortKey);
+        if (normalizedSortKey.indexOf('.') < 0) {
+          canUseOrderedSetUnionProjection = true;
+          if (!selectedStorageFieldNames.has(normalizedSortKey)) {
+            orderedSetUnionSelectSql += `, ${quoteColumnName(normalizedSortKey)}`;
+            orderedSetUnionAddedSortField = normalizedSortKey;
+          }
+        }
+      }
+    }
+    const usesOrderedSetUnion = Boolean(orderedSetUnionQueries && canUseOrderedSetUnionProjection && where.orderBys.length === 0);
     if (textSearch) {
       await this._ensureFTS5Index(className, textSearch.fieldName, Boolean(textSearch.diacriticSensitive), db);
       const ftsTableName = this._quotedFTSTableName(className, textSearch.fieldName, Boolean(textSearch.diacriticSensitive));
@@ -4107,8 +5150,8 @@ class SQLiteStorageAdapter {
       const unionSelects = [];
       queryParams.length = 0;
       for (const branchQuery of orderedSetUnionQueries) {
-        const branchWhere = this._buildWhereClause(className, schema, branchQuery, Boolean(caseInsensitive), false, true);
-        unionSelects.push(`SELECT ${selectSql} FROM ${tableName}${branchWhere.sql ? ` WHERE ${branchWhere.sql}` : ''}`);
+        const branchWhere = this._buildWhereClause(className, schema, branchQuery, Boolean(caseInsensitive), false, true, canCreateSQLiteQueryArtifacts(transactionalSession, this._db));
+        unionSelects.push(`SELECT ${orderedSetUnionSelectSql} FROM ${tableName}${branchWhere.sql ? ` WHERE ${branchWhere.sql}` : ''}`);
         queryParams.push(...branchWhere.params);
       }
       // Each branch fixes one scalar set value, so SQLite can merge already
@@ -4171,7 +5214,15 @@ class SQLiteStorageAdapter {
       sql += ` OFFSET ${parseInt(skip, 10)}`;
     }
     const rows = this._prepare(sql, db).all(...queryParams, ...where.orderByParams);
-    return rows.map(row => this._sqliteRowToParseObject(className, row, schema));
+    const objects = [];
+    for (const row of rows) {
+      const object = this._sqliteRowToParseObject(className, row, schema);
+      if (orderedSetUnionAddedSortField) {
+        delete object[orderedSetUnionAddedSortField];
+      }
+      objects.push(object);
+    }
+    return objects;
   }
   async count(className, schema, query, transactionalSession) {
     if (shouldYieldBeforeTopLevelSQLiteOperation(transactionalSession)) {
@@ -4182,7 +5233,7 @@ class SQLiteStorageAdapter {
       return 0;
     }
     const tableName = this._tableName(className);
-    const where = this._buildWhereClause(className, schema, query);
+    const where = this._buildWhereClause(className, schema, query, false, false, false, canCreateSQLiteQueryArtifacts(transactionalSession, this._db));
     let sql = `SELECT COUNT(*) as count FROM ${tableName}`;
     if (where.sql) {
       sql += ` WHERE ${where.sql}`;
@@ -4206,8 +5257,31 @@ class SQLiteStorageAdapter {
       return [];
     }
     const tableName = this._tableName(className);
-    const where = this._buildWhereClause(className, schema, query);
+    const where = this._buildWhereClause(className, schema, query, false, false, false, canCreateSQLiteQueryArtifacts(transactionalSession, this._db));
     const fieldSchema = (schema.fields || {})[rootFieldName];
+    const indexedArrayElementTableName = this._getQuotedIndexedArrayElementTableName(className, schema.fields || {}, fieldName, db);
+    if (indexedArrayElementTableName) {
+      const indexedValueTypes = fieldSchema && fieldSchema.type === 'Array' && fieldName.indexOf('.') === -1 ? getSQLiteArrayIndexDistinctValueTypes(fieldSchema) : null;
+      let sql = `SELECT DISTINCT ` + `${indexedArrayElementTableName}.${quoteColumnName(arrayIndexValueTypeColumn)} AS valueType, ` + `${indexedArrayElementTableName}.${quoteColumnName(arrayIndexValueColumn)} AS value ` + `FROM ${indexedArrayElementTableName}`;
+      const indexedParams = [];
+      if (where.sql) {
+        sql += ` INNER JOIN (` + `SELECT ${quoteColumnName('objectId')} FROM ${tableName} WHERE ${where.sql}` + `) AS __distinct_base ON ` + `__distinct_base.${quoteColumnName('objectId')} = ` + `${indexedArrayElementTableName}.${quoteColumnName('objectId')}`;
+        indexedParams.push(...where.params);
+      }
+      if (indexedValueTypes) {
+        const valueTypePlaceholders = indexedValueTypes.map(() => '?').join(', ');
+        sql += ` WHERE ${indexedArrayElementTableName}.${quoteColumnName(arrayIndexValueTypeColumn)} IN (${valueTypePlaceholders})`;
+        indexedParams.push(...indexedValueTypes);
+      } else {
+        sql += ` WHERE ${indexedArrayElementTableName}.${quoteColumnName(arrayIndexValueTypeColumn)} != 'null'`;
+      }
+      const rows = this._prepare(sql, db).all(...indexedParams);
+      const values = [];
+      for (const row of rows) {
+        values.push(sqliteArrayIndexDistinctValueToParseValue(row.valueType, row.value));
+      }
+      return values;
+    }
     if (fieldSchema && fieldSchema.type === 'Array' && fieldName.indexOf('.') === -1) {
       let sql = `SELECT DISTINCT json_each.value as val ` + `FROM ${tableName} JOIN json_each(${quoteColumnName(fieldName)})`;
       if (where.sql) {
@@ -4218,6 +5292,20 @@ class SQLiteStorageAdapter {
       const rows = this._prepare(sql, db).all(...where.params);
       return rows.map(row => parseJSONValue(row.val));
     }
+    const multikeyFieldInfo = this._getArrayElementIndexFieldInfo(schema.fields || {}, fieldName);
+    if (multikeyFieldInfo && multikeyFieldInfo.nestedPathComponents) {
+      const terminalRows = getNestedDotTraversalRowsExpression(`base.${quoteColumnName(multikeyFieldInfo.rootFieldName)}`, multikeyFieldInfo.nestedPathComponents, fieldName, {
+        requireArrayTraversal: false,
+        expandTerminalArrays: true,
+        seedFromSql: ` FROM ${tableName} AS base${where.sql ? ` WHERE ${where.sql}` : ''}`
+      });
+      const rows = this._prepare(`SELECT DISTINCT ${terminalRows.valueExpression} AS val, ` + `${terminalRows.typeExpression} AS valueType ` + `FROM ${terminalRows.sql} AS __dot_terminal ` + `WHERE ${terminalRows.typeExpression} IS NOT NULL ` + `AND ${terminalRows.typeExpression} != 'null'`, db).all(...where.params);
+      const values = [];
+      for (const row of rows) {
+        values.push(sqliteArrayIndexDistinctValueToParseValue(row.valueType, row.val));
+      }
+      return values;
+    }
     const targetSql = fieldName.indexOf('.') >= 0 ? transformDotField(fieldName) : quoteColumnName(fieldName);
     let sql = `SELECT DISTINCT ${targetSql} as val FROM ${tableName}`;
     if (where.sql) {
@@ -4227,11 +5315,18 @@ class SQLiteStorageAdapter {
     }
     const rows = this._prepare(sql, db).all(...where.params);
     if (fieldSchema && fieldSchema.type === 'Pointer') {
-      return rows.filter(row => row.val !== null && row.val !== undefined).map(row => ({
-        __type: 'Pointer',
-        className: fieldSchema.targetClass,
-        objectId: row.val
-      }));
+      const pointerValues = [];
+      for (const row of rows) {
+        if (row.val === null || row.val === undefined) {
+          continue;
+        }
+        pointerValues.push({
+          __type: 'Pointer',
+          className: fieldSchema.targetClass,
+          objectId: row.val
+        });
+      }
+      return pointerValues;
     }
     const valueType = rootFieldName === 'createdAt' || rootFieldName === 'updatedAt' ? {
       type: 'Date'
@@ -4315,10 +5410,28 @@ class SQLiteStorageAdapter {
         }
       }
     }
+    const sql = `SELECT ${selectParts.join(', ')} FROM ${this._tableName(className)}`;
     return {
       className,
       schema: nativeSchema,
-      sql: `SELECT ${selectParts.join(', ')} FROM ${this._tableName(className)}`,
+      sql,
+      nativeBaseSql: sql,
+      params
+    };
+  }
+  _getNativeAggregateOrderedSetUnionContext(className, schema, branchQueries) {
+    const baseContext = this._getNativeAggregateContext(className, schema);
+    const unionSelects = [];
+    const params = [];
+    for (const branchQuery of branchQueries) {
+      const branchWhere = this._buildWhereClause(className, schema, branchQuery, false, false, true);
+      unionSelects.push(`${baseContext.sql}${branchWhere.sql ? ` WHERE ${branchWhere.sql}` : ''}`);
+      params.push(...baseContext.params, ...branchWhere.params);
+    }
+    return {
+      ...baseContext,
+      sql: `SELECT * FROM (${unionSelects.join(' UNION ALL ')})`,
+      nativeBaseSql: null,
       params
     };
   }
@@ -4350,6 +5463,9 @@ class SQLiteStorageAdapter {
     }
     if (typeof value === 'string') {
       return value.includes('$') ? value : `${targetClass}$${value}`;
+    }
+    if (isPointerValue(value)) {
+      return `${value.className}$${value.objectId}`;
     }
     if (isPlainObject(value)) {
       const output = {};
@@ -4626,10 +5742,16 @@ class SQLiteStorageAdapter {
     }
     if (isPlainObject(expression)) {
       if (expression.$multiply) {
-        const parts = expression.$multiply.map(item => this._compileAggregateExpression(context, item));
+        const sqlParts = [];
+        const params = [];
+        for (const item of expression.$multiply) {
+          const compiled = this._compileAggregateExpression(context, item);
+          sqlParts.push(`CAST(${compiled.sql} AS REAL)`);
+          params.push(...compiled.params);
+        }
         return {
-          sql: parts.map(item => `CAST(${item.sql} AS REAL)`).join(' * '),
-          params: parts.flatMap(item => item.params),
+          sql: sqlParts.join(' * '),
+          params,
           fieldType: {
             type: 'Number'
           }
@@ -4755,6 +5877,19 @@ class SQLiteStorageAdapter {
     const expr = transformed.$expr;
     if (expr !== undefined) {
       delete transformed.$expr;
+    }
+    if (expr === undefined && !rawValues && !rawFieldNames && context.nativeBaseSql === context.sql) {
+      const baseWhere = this._buildWhereClause(context.className, schema, matchStage);
+      if (baseWhere.orderBys.length === 0) {
+        // Filter physical columns before pointers become Mongo-style
+        // Class$objectId projections, keeping the initial aggregate match on
+        // the same compound indexes as an ordinary Parse query.
+        return {
+          ...context,
+          sql: `${context.sql}${baseWhere.sql ? ` WHERE ${baseWhere.sql}` : ''}`,
+          params: [...context.params, ...baseWhere.params]
+        };
+      }
     }
     const where = this._buildWhereClause(context.className, context.schema, transformed, false, true);
     const conditions = [];
@@ -4999,15 +6134,26 @@ class SQLiteStorageAdapter {
       const dir = sortStage[key] > 0 ? 'ASC' : 'DESC';
       sortParts.push(transformedKey.indexOf('.') >= 0 ? `${transformDotField(transformedKey)} ${dir}` : `${quoteColumnName(transformedKey)} ${dir}`);
     }
+    const sql = `SELECT * FROM (${context.sql}) AS "__aggregate_sort"` + (sortParts.length ? ` ORDER BY ${sortParts.join(', ')}` : '');
     return {
       ...context,
-      sql: `SELECT * FROM (${context.sql}) AS "__aggregate_sort"` + (sortParts.length ? ` ORDER BY ${sortParts.join(', ')}` : '')
+      sql,
+      aggregateLimitAppendSql: sql
     };
   }
   _applyAggregateLimitStage(context, limitValue) {
+    const limitSql = `LIMIT ${parseInt(limitValue, 10)}`;
+    if (context.aggregateLimitAppendSql === context.sql) {
+      return {
+        ...context,
+        sql: `${context.sql} ${limitSql}`,
+        aggregateLimitAppendSql: null
+      };
+    }
     return {
       ...context,
-      sql: `SELECT * FROM (${context.sql}) AS "__aggregate_limit" LIMIT ${parseInt(limitValue, 10)}`
+      sql: `SELECT * FROM (${context.sql}) AS "__aggregate_limit" ${limitSql}`,
+      aggregateLimitAppendSql: null
     };
   }
   _applyAggregateSkipStage(context, skipValue) {
@@ -5090,7 +6236,13 @@ class SQLiteStorageAdapter {
         }
       }
     };
-    const currentFields = Object.keys(context.schema.fields).filter(field => field !== lookupStage.as).map(field => quoteColumnName(field)).join(', ');
+    const currentFieldExpressions = [];
+    for (const fieldName in context.schema.fields) {
+      if (Object.prototype.hasOwnProperty.call(context.schema.fields, fieldName) && fieldName !== lookupStage.as) {
+        currentFieldExpressions.push(quoteColumnName(fieldName));
+      }
+    }
+    const currentFields = currentFieldExpressions.join(', ');
     return {
       ...context,
       schema: nextSchema,
@@ -5213,10 +6365,17 @@ class SQLiteStorageAdapter {
     if (rawValues) {
       pipeline = _bson.EJSON.deserialize(pipeline);
     }
-    let context = this._getNativeAggregateContext(className, schema);
-    for (const stage of pipeline) {
+    let initialOrderedSetUnionQueries = null;
+    if (!rawValues && !rawFieldNames && pipeline.length >= 3 && pipeline[0] && pipeline[0].$match && pipeline[1] && pipeline[1].$sort && pipeline[2] && pipeline[2].$limit !== undefined) {
+      initialOrderedSetUnionQueries = this._getOrderedSetUnionQueries(className, schema, pipeline[0].$match, pipeline[1].$sort, pipeline[2].$limit);
+    }
+    let context = initialOrderedSetUnionQueries ? this._getNativeAggregateOrderedSetUnionContext(className, schema, initialOrderedSetUnionQueries) : this._getNativeAggregateContext(className, schema);
+    for (let stageIndex = 0; stageIndex < pipeline.length; stageIndex += 1) {
+      const stage = pipeline[stageIndex];
       if (stage.$match) {
-        context = this._applyAggregateMatchStage(context, stage.$match, schema, rawValues, rawFieldNames);
+        if (stageIndex !== 0 || !initialOrderedSetUnionQueries) {
+          context = this._applyAggregateMatchStage(context, stage.$match, schema, rawValues, rawFieldNames);
+        }
       } else if (stage.$project) {
         context = this._applyAggregateProjectStage(context, stage.$project, schema, rawValues, rawFieldNames);
       } else if (stage.$addFields) {
@@ -5255,7 +6414,7 @@ class SQLiteStorageAdapter {
       return;
     }
     const tableName = this._tableName(className);
-    const where = this._buildWhereClause(className, schema, query);
+    const where = this._buildWhereClause(className, schema, query, false, false, false, canCreateSQLiteQueryArtifacts(transactionalSession, this._db));
     let sql = `DELETE FROM ${tableName}`;
     if (where.sql) {
       sql += ` WHERE ${where.sql}`;
@@ -5321,7 +6480,7 @@ class SQLiteStorageAdapter {
     if (!existing || existing.length === 0) {
       return [];
     }
-    const where = this._buildWhereClause(className, schema, query);
+    const where = this._buildWhereClause(className, schema, query, false, false, false, canCreateSQLiteQueryArtifacts(transactionalSession, this._db));
     const setClauses = [];
     const params = [];
     const nestedFieldUpdates = new Map();
@@ -5712,22 +6871,41 @@ class SQLiteStorageAdapter {
       });
     }
     const tableName = this._tableName(className);
-    const idxName = indexName || `parse_default_${fieldNames.sort().join('_')}`;
-    const safeIdxName = `"${idxName.replace(/"/g, '""')}"`;
+    const idxName = indexName || `parse_default_${[...fieldNames].sort().join('_')}`;
+    const physicalIndexName = this._physicalIndexName(className, idxName);
+    const safeIdxName = `"${physicalIndexName.replace(/"/g, '""')}"`;
+    const descending = Number(options.indexType) < 0;
+    const sparse = options.sparse !== undefined ? Boolean(options.sparse) : true;
+    const expectedKeys = [];
+    const fieldExpressions = [];
     const colExprs = fieldNames.map(fieldName => {
       const fieldExpression = this._buildIndexFieldExpression(fieldName).expression;
+      fieldExpressions.push(fieldExpression);
+      const normalizedFieldName = this._normalizeIndexFieldPath(fieldName);
+      expectedKeys.push({
+        columnName: normalizedFieldName.indexOf('.') < 0 ? normalizedFieldName : null,
+        collation: caseInsensitive ? 'NOCASE' : 'BINARY',
+        descending
+      });
 
       // Parse asks for these username/email helper indexes so lowered `LIKE 'foo%'`
       // can seek with SQLite's NOCASE collation instead of walking the whole table.
       if (caseInsensitive) {
-        return `${fieldExpression} COLLATE NOCASE`;
+        return `${fieldExpression} COLLATE NOCASE ${descending ? 'DESC' : 'ASC'}`;
       } else {
-        return fieldExpression;
+        return `${fieldExpression} ${descending ? 'DESC' : 'ASC'}`;
       }
     });
+    const sparseWhere = sparse ? this._getSparseIndexWhereClause(className, fieldNames, fieldExpressions) : null;
+    this._dropLegacyUnscopedIndexForClass(className, idxName, options.conn);
     let sql = `CREATE INDEX IF NOT EXISTS ${safeIdxName} ON ${tableName} (${colExprs.join(', ')})`;
     if (options.ttl) {
       sql = `CREATE INDEX IF NOT EXISTS ${safeIdxName} ON ${tableName} ("_expiresAt")`;
+    } else {
+      this._dropSQLiteIndexIfKeyShapeChanged(physicalIndexName, expectedKeys, sparseWhere, options.conn);
+      if (sparseWhere) {
+        sql += ` WHERE ${sparseWhere}`;
+      }
     }
     try {
       this._prepare(sql, options.conn).run();
@@ -5749,8 +6927,10 @@ class SQLiteStorageAdapter {
     }
     const tableName = this._tableName(className);
     const idxName = `unique_${fieldNames.join('_')}`;
-    const safeIdxName = `"${idxName.replace(/"/g, '""')}"`;
+    const physicalIndexName = this._physicalIndexName(className, idxName);
+    const safeIdxName = `"${physicalIndexName.replace(/"/g, '""')}"`;
     const colExprs = fieldNames.map(fieldName => this._buildIndexFieldExpression(fieldName).expression);
+    this._dropLegacyUnscopedIndexForClass(className, idxName);
     const sql = `CREATE UNIQUE INDEX IF NOT EXISTS ${safeIdxName} ON ${tableName} (${colExprs.join(', ')})`;
     try {
       this._prepare(sql).run();
@@ -5772,8 +6952,10 @@ class SQLiteStorageAdapter {
       });
     }
     const indexName = `_User_unique_authData_${provider}_id`;
-    const safeIdxName = `"${indexName.replace(/"/g, '""')}"`;
+    const physicalIndexName = this._physicalIndexName('_User', indexName);
+    const safeIdxName = `"${physicalIndexName.replace(/"/g, '""')}"`;
     const tableName = this._tableName('_User');
+    this._dropLegacyUnscopedIndexForClass('_User', indexName);
     const sql = `CREATE UNIQUE INDEX IF NOT EXISTS ${safeIdxName} ON ${tableName} (json_extract("authData", '$."${provider}".id')) WHERE json_extract("authData", '$."${provider}".id') IS NOT NULL`;
     try {
       this._prepare(sql).run();
@@ -5862,27 +7044,66 @@ class SQLiteStorageAdapter {
       if (index.skipDatabaseCreation || indexFieldNames.length === 0 || isTextIndexDefinition(key)) {
         continue;
       }
-      const indexFieldExpressions = indexFieldNames.map(fieldName => this._buildIndexFieldExpression(fieldName));
-      if (indexFieldExpressions.some(({
-        requiredColumns
-      }) => requiredColumns.some(columnName => !columns.has(columnName)))) {
+      const sparseFieldExpressions = [];
+      const arrayIndexFieldNames = [];
+      const spatialIndexFieldNames = [];
+      const expectedKeys = [];
+      const cols = [];
+      let hasMissingColumn = false;
+      for (let fieldIndex = 0; fieldIndex < indexFieldNames.length; fieldIndex += 1) {
+        const fieldName = indexFieldNames[fieldIndex];
+        const fieldExpression = this._buildIndexFieldExpression(fieldName);
+        sparseFieldExpressions.push(fieldExpression.expression);
+        for (const requiredColumn of fieldExpression.requiredColumns) {
+          if (!columns.has(requiredColumn)) {
+            hasMissingColumn = true;
+            break;
+          }
+        }
+        if (this._getArrayElementIndexFieldInfo(schemaFields, fieldName)) {
+          arrayIndexFieldNames.push(fieldName);
+        }
+        const normalizedFieldName = this._normalizeIndexFieldPath(fieldName);
+        const normalizedFieldSchema = schemaFields[normalizedFieldName];
+        if (normalizedFieldName.indexOf('.') < 0 && normalizedFieldSchema && (normalizedFieldSchema.type === 'GeoPoint' || normalizedFieldSchema.type === 'Polygon')) {
+          spatialIndexFieldNames.push(normalizedFieldName);
+        }
+        const descending = Number(key[fieldName]) < 0;
+        expectedKeys.push({
+          columnName: normalizedFieldName.indexOf('.') < 0 ? normalizedFieldName : null,
+          collation: 'BINARY',
+          descending
+        });
+        cols.push(`${fieldExpression.expression} ${descending ? 'DESC' : 'ASC'}`);
+      }
+      if (hasMissingColumn) {
         continue;
       }
-      const idxName = `"${index.name.replace(/"/g, '""')}"`;
-      const cols = indexFieldExpressions.map(({
-        expression
-      }) => expression);
-      let sql = `CREATE ${index.unique ? 'UNIQUE ' : ''}INDEX IF NOT EXISTS ${idxName} ON ${tableName} (${cols.join(', ')})`;
-      if (index.sparse) {
-        sql += ` WHERE ${cols.map(expression => `${expression} IS NOT NULL`).join(' AND ')}`;
+      const sparseWhere = index.sparse ? this._getSparseIndexWhereClause(className, indexFieldNames, sparseFieldExpressions) : null;
+      const physicalIndexName = this._physicalIndexName(className, index.name);
+      const quotedPhysicalIndexName = `"${physicalIndexName.replace(/"/g, '""')}"`;
+      this._dropLegacyUnscopedIndexForClass(className, index.name, conn);
+      if (!index.unique && (arrayIndexFieldNames.length > 0 || spatialIndexFieldNames.length > 0 && spatialIndexFieldNames.length === indexFieldNames.length)) {
+        // Membership and spatial queries use dedicated shadow indexes, never
+        // the raw JSON value. Retaining that physical index only adds writes.
+        this._prepare(`DROP INDEX IF EXISTS ${quotedPhysicalIndexName}`, conn).run();
+      } else {
+        this._dropSQLiteIndexIfKeyShapeChanged(physicalIndexName, expectedKeys, sparseWhere, conn);
+        let sql = `CREATE ${index.unique ? 'UNIQUE ' : ''}INDEX IF NOT EXISTS ` + `${quotedPhysicalIndexName} ON ${tableName} (${cols.join(', ')})`;
+        if (sparseWhere) {
+          sql += ` WHERE ${sparseWhere}`;
+        }
+        try {
+          this._prepare(sql, conn).run();
+        } catch (err) {
+          throw this._transformDuplicateKeyError(err, className);
+        }
       }
-      try {
-        this._prepare(sql, conn).run();
-      } catch (err) {
-        throw this._transformDuplicateKeyError(err, className);
-      }
-      for (const fieldName of indexFieldNames) {
+      for (const fieldName of arrayIndexFieldNames) {
         await this._ensureArrayElementIndex(className, schemaFields, fieldName, conn);
+      }
+      for (const fieldName of spatialIndexFieldNames) {
+        this._ensureSpatialIndex(className, fieldName, schemaFields[fieldName].type, conn);
       }
     }
 
@@ -5907,33 +7128,48 @@ class SQLiteStorageAdapter {
       },
       unique: true
     }];
+    const visibleIndexNames = new Set(['_id_']);
+    const storedSchema = this._getStoredSchemaObject(className, connection);
+    const storedIndexes = storedSchema && storedSchema.schema && storedSchema.schema.indexes || {};
     const rows = this._prepare(`PRAGMA index_list("${rawName.replace(/"/g, '""')}")`, connection).all();
     for (const row of rows) {
-      if (!row.name || String(row.name).startsWith('sqlite_autoindex_') || String(row.name).startsWith(sqliteArrayCompoundBaseIndexPrefix)) {
+      if (!row.name || String(row.name).startsWith('sqlite_autoindex_') || String(row.name).startsWith(sqliteArrayCompoundBaseIndexPrefix) || String(row.name).startsWith(sqliteSpatialIdIndexPrefix)) {
         continue;
       }
-      const indexRows = this._prepare(`PRAGMA index_info("${String(row.name).replace(/"/g, '""')}")`, connection).all();
+      const logicalIndexName = this._logicalIndexNameFromPhysical(className, String(row.name)) || String(row.name);
+      const storedIndex = storedIndexes[logicalIndexName];
+      if (storedIndex) {
+        indexes.push({
+          name: logicalIndexName,
+          key: cloneIndexDefinition(storedIndex),
+          unique: Boolean(row.unique)
+        });
+        visibleIndexNames.add(logicalIndexName);
+        continue;
+      }
+      const indexRows = this._prepare(`PRAGMA index_xinfo("${String(row.name).replace(/"/g, '""')}")`, connection).all();
       const key = {};
+      let indexedFieldCount = 0;
       for (const indexRow of indexRows) {
-        if (!indexRow.name) {
+        if (Number(indexRow.key) !== 1 || !indexRow.name) {
           continue;
         }
         const fieldName = indexRow.name === 'objectId' ? '_id' : indexRow.name;
-        key[fieldName] = 1;
+        key[fieldName] = indexRow.desc ? -1 : 1;
+        indexedFieldCount += 1;
       }
-      if (Object.keys(key).length === 0) {
+      if (indexedFieldCount === 0) {
         continue;
       }
       indexes.push({
-        name: row.name,
+        name: logicalIndexName,
         key,
         unique: Boolean(row.unique)
       });
+      visibleIndexNames.add(logicalIndexName);
     }
-    const storedSchema = this._getStoredSchemaObject(className);
-    const storedIndexes = storedSchema && storedSchema.schema && storedSchema.schema.indexes || {};
     for (const name of Object.keys(storedIndexes)) {
-      if (indexes.some(index => index.name === name)) {
+      if (visibleIndexNames.has(name)) {
         continue;
       }
       indexes.push({
@@ -5941,6 +7177,7 @@ class SQLiteStorageAdapter {
         key: cloneIndexDefinition(storedIndexes[name]),
         unique: false
       });
+      visibleIndexNames.add(name);
     }
     return indexes;
   }
@@ -5985,7 +7222,9 @@ class SQLiteStorageAdapter {
       if (indexName === '_id_') {
         continue;
       }
-      this._prepare(`DROP INDEX IF EXISTS "${String(indexName).replace(/"/g, '""')}"`, conn).run();
+      const physicalIndexName = this._physicalIndexName(className, String(indexName));
+      this._prepare(`DROP INDEX IF EXISTS "${physicalIndexName.replace(/"/g, '""')}"`, conn).run();
+      this._dropLegacyUnscopedIndexForClass(className, String(indexName), conn);
       this._prepare(`DROP INDEX IF EXISTS "${this._arrayCompoundBaseIndexName(className, String(indexName)).replace(/"/g, '""')}"`, conn).run();
     }
     for (const fieldName of droppedArrayIndexFieldNames) {

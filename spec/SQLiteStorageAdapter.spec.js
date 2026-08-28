@@ -44,6 +44,25 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
         triggerNames.includes(row.name)
     );
   };
+  const getSpatialIndexArtifactsForField = (currentAdapter, className, fieldName) => {
+    const rawTableName = currentAdapter._rawSpatialIndexTableName(className, fieldName);
+    const allRows = currentAdapter._db
+      .prepare("SELECT type, name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'")
+      .all();
+
+    return allRows.filter(
+      row => row.name === rawTableName || row.name.startsWith(`${rawTableName}_`)
+    );
+  };
+  const getSpatialQueryPlan = (currentAdapter, className, schema, query) => {
+    const where = currentAdapter._buildWhereClause(className, schema, query);
+    const plan = currentAdapter._db
+      .prepare(
+        `EXPLAIN QUERY PLAN SELECT * FROM ${currentAdapter._tableName(className)} WHERE ${where.sql}`
+      )
+      .all(...where.params);
+    return { where, plan };
+  };
 
   beforeEach(async () => {
     adapter = new SQLiteStorageAdapter({
@@ -387,6 +406,7 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
       },
     };
     await adapter.createClass('LocationClass', schema);
+    expect(getSpatialIndexArtifactsForField(adapter, 'LocationClass', 'location')).toEqual([]);
 
     await adapter.createObject('LocationClass', schema, {
       objectId: 'p1',
@@ -406,6 +426,353 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
 
     expect(res.length).toBe(1);
     expect(res[0].objectId).toBe('p1');
+    expect(getSpatialIndexArtifactsForField(adapter, 'LocationClass', 'location').length).toBeGreaterThan(
+      0
+    );
+
+    const radiusPlan = getSpatialQueryPlan(adapter, 'LocationClass', schema, {
+      location: {
+        $nearSphere: { __type: 'GeoPoint', latitude: 37.77, longitude: -122.41 },
+        $maxDistance: 0.1,
+      },
+    });
+    expect(radiusPlan.where.sql).toContain('SELECT __spatial.id');
+    expect(radiusPlan.where.sql).toContain('parse_geo_distance');
+    expect(radiusPlan.plan.some(row => row.detail.includes('VIRTUAL TABLE INDEX'))).toBe(true);
+
+    const boxQuery = {
+      location: {
+        $within: {
+          $box: [
+            { __type: 'GeoPoint', latitude: 37, longitude: -123 },
+            { __type: 'GeoPoint', latitude: 38, longitude: -122 },
+          ],
+        },
+      },
+    };
+    expect((await adapter.find('LocationClass', schema, boxQuery)).map(row => row.objectId)).toEqual([
+      'p1',
+    ]);
+    expect(
+      getSpatialQueryPlan(adapter, 'LocationClass', schema, boxQuery).plan.some(row =>
+        row.detail.includes('VIRTUAL TABLE INDEX')
+      )
+    ).toBe(true);
+    const broadBoxWhere = adapter._buildWhereClause('LocationClass', schema, {
+      location: {
+        $within: {
+          $box: [
+            { __type: 'GeoPoint', latitude: -80, longitude: -170 },
+            { __type: 'GeoPoint', latitude: 80, longitude: 170 },
+          ],
+        },
+      },
+    });
+    expect(broadBoxWhere.sql).not.toContain('SELECT __spatial.id');
+    expect(broadBoxWhere.sql).not.toContain('parse_within_box');
+    expect(broadBoxWhere.sql).toContain('BETWEEN ? AND ?');
+
+    const polygonQuery = {
+      location: {
+        $geoWithin: {
+          $polygon: {
+            __type: 'Polygon',
+            coordinates: [
+              [37, -123],
+              [37, -122],
+              [38, -122],
+              [38, -123],
+            ],
+          },
+        },
+      },
+    };
+    expect(
+      (await adapter.find('LocationClass', schema, polygonQuery)).map(row => row.objectId)
+    ).toEqual(['p1']);
+    const polygonPlan = getSpatialQueryPlan(adapter, 'LocationClass', schema, polygonQuery);
+    expect(polygonPlan.where.sql).toContain('geopoly_contains_point');
+    expect(polygonPlan.plan.some(row => row.detail.includes('VIRTUAL TABLE INDEX'))).toBe(true);
+
+    const unboundedNearWhere = adapter._buildWhereClause('LocationClass', schema, {
+      location: {
+        $nearSphere: { __type: 'GeoPoint', latitude: 37.77, longitude: -122.41 },
+      },
+    });
+    expect(unboundedNearWhere.orderBys[0]).toContain('parse_geo_distance');
+    const broadRadiusWhere = adapter._buildWhereClause('LocationClass', schema, {
+      location: {
+        $nearSphere: { __type: 'GeoPoint', latitude: 37.77, longitude: -122.41 },
+        $maxDistance: 3.14,
+      },
+    });
+    expect(broadRadiusWhere.sql).not.toContain('SELECT __spatial.id');
+    expect(broadRadiusWhere.sql).toContain('parse_geo_distance');
+
+    await adapter.updateObjectsByQuery(
+      'LocationClass',
+      schema,
+      { objectId: 'p1' },
+      {
+        location: { __type: 'GeoPoint', latitude: 34.0522, longitude: -118.2437 },
+      }
+    );
+    expect(await adapter.find('LocationClass', schema, boxQuery)).toEqual([]);
+    const spatialTableName = adapter._quotedSpatialIndexTableName('LocationClass', 'location');
+    expect(adapter._db.prepare(`SELECT COUNT(*) AS count FROM ${spatialTableName}`).get().count).toBe(
+      2
+    );
+  });
+
+  it('keeps geo queries working when native spatial extensions are unavailable', async () => {
+    const schema = {
+      className: 'PortableLocationClass',
+      fields: {
+        objectId: { type: 'String' },
+        location: { type: 'GeoPoint' },
+      },
+    };
+    adapter._supportsSQLiteRTree = false;
+    adapter._supportsSQLiteGeopoly = false;
+    await adapter.createClass('PortableLocationClass', schema);
+    await adapter.createIndexes('PortableLocationClass', [
+      {
+        name: 'location_2dsphere',
+        key: { location: '2dsphere' },
+        unique: false,
+        sparse: false,
+        skipDatabaseCreation: false,
+      },
+    ]);
+    await adapter.createObject('PortableLocationClass', schema, {
+      objectId: 'inside',
+      location: { __type: 'GeoPoint', latitude: 13.7563, longitude: 100.5018 },
+    });
+    await adapter.createObject('PortableLocationClass', schema, {
+      objectId: 'outside',
+      location: { __type: 'GeoPoint', latitude: 40.7128, longitude: -74.006 },
+    });
+
+    const nearRows = await adapter.find('PortableLocationClass', schema, {
+      location: {
+        $nearSphere: { __type: 'GeoPoint', latitude: 13.75, longitude: 100.5 },
+        $maxDistance: 0.01,
+      },
+    });
+    const polygonRows = await adapter.find('PortableLocationClass', schema, {
+      location: {
+        $geoWithin: {
+          $polygon: {
+            __type: 'Polygon',
+            coordinates: [
+              [13, 100],
+              [13, 101],
+              [14, 101],
+              [14, 100],
+            ],
+          },
+        },
+      },
+    });
+
+    expect(nearRows.map(row => row.objectId)).toEqual(['inside']);
+    expect(polygonRows.map(row => row.objectId)).toEqual(['inside']);
+    expect(getSpatialIndexArtifactsForField(adapter, 'PortableLocationClass', 'location')).toEqual(
+      []
+    );
+    expect(adapter._getTableColumns('PortableLocationClass')).not.toContain('_spatialId');
+  });
+
+  it('uses RTree for GeoPoints without requiring GEOPOLY', async () => {
+    const schema = {
+      className: 'RTreeOnlyLocationClass',
+      fields: {
+        objectId: { type: 'String' },
+        location: { type: 'GeoPoint' },
+      },
+    };
+    adapter._supportsSQLiteRTree = true;
+    adapter._supportsSQLiteGeopoly = false;
+    await adapter.createClass('RTreeOnlyLocationClass', schema);
+    await adapter.createObject('RTreeOnlyLocationClass', schema, {
+      objectId: 'inside',
+      location: { __type: 'GeoPoint', latitude: 13.7563, longitude: 100.5018 },
+    });
+
+    const query = {
+      location: {
+        $nearSphere: { __type: 'GeoPoint', latitude: 13.75, longitude: 100.5 },
+        $maxDistance: 0.01,
+      },
+    };
+    expect((await adapter.find('RTreeOnlyLocationClass', schema, query)).map(row => row.objectId)).toEqual([
+      'inside',
+    ]);
+    expect(
+      getSpatialQueryPlan(adapter, 'RTreeOnlyLocationClass', schema, query).plan.some(row =>
+        row.detail.includes('VIRTUAL TABLE INDEX')
+      )
+    ).toBeTrue();
+  });
+
+  it('backfills and rebuilds trigger-maintained GeoPoint indexes', async () => {
+    const schema = {
+      className: 'GeoBackfillClass',
+      fields: {
+        objectId: { type: 'String' },
+        location: { type: 'GeoPoint' },
+        obsolete: { type: 'String' },
+      },
+    };
+    await adapter.createClass('GeoBackfillClass', schema);
+    adapter._dropSpatialIndexArtifactsForField('GeoBackfillClass', 'location');
+    adapter._db
+      .prepare(
+        `INSERT INTO ${adapter._tableName('GeoBackfillClass')} ("objectId", "location") VALUES (?, ?)`
+      )
+      .run('raw-point', JSON.stringify({ latitude: 13.7563, longitude: 100.5018 }));
+
+    await adapter.createIndexes('GeoBackfillClass', [
+      {
+        name: 'location_2d',
+        key: { location: '2d' },
+        unique: false,
+        sparse: false,
+        skipDatabaseCreation: false,
+      },
+    ]);
+    let spatialTableName = adapter._quotedSpatialIndexTableName(
+      'GeoBackfillClass',
+      'location'
+    );
+    expect(adapter._db.prepare(`SELECT COUNT(*) AS count FROM ${spatialTableName}`).get().count).toBe(
+      1
+    );
+
+    await adapter.deleteFields('GeoBackfillClass', schema, ['obsolete']);
+    expect(
+      (
+        await adapter.find('GeoBackfillClass', schema, {
+          location: {
+            $within: {
+              $box: [
+                { __type: 'GeoPoint', latitude: 13, longitude: 100 },
+                { __type: 'GeoPoint', latitude: 14, longitude: 101 },
+              ],
+            },
+          },
+        })
+      ).map(row => row.objectId)
+    ).toEqual(['raw-point']);
+    spatialTableName = adapter._quotedSpatialIndexTableName('GeoBackfillClass', 'location');
+    expect(adapter._db.prepare(`SELECT COUNT(*) AS count FROM ${spatialTableName}`).get().count).toBe(
+      1
+    );
+
+    await adapter.deleteFields('GeoBackfillClass', schema, ['location']);
+    expect(getSpatialIndexArtifactsForField(adapter, 'GeoBackfillClass', 'location')).toEqual([]);
+    expect(adapter._getTableColumns('GeoBackfillClass')).not.toContain('_spatialId');
+  });
+
+  it('keeps spatial index rows attached to their objects across VACUUM', async () => {
+    const schema = {
+      className: 'GeoVacuumClass',
+      fields: {
+        objectId: { type: 'String' },
+        location: { type: 'GeoPoint' },
+      },
+    };
+    await adapter.createClass('GeoVacuumClass', schema);
+    await adapter.createObject('GeoVacuumClass', schema, {
+      objectId: 'deleted-first',
+      location: { __type: 'GeoPoint', latitude: -30, longitude: -30 },
+    });
+    await adapter.createObject('GeoVacuumClass', schema, {
+      objectId: 'target',
+      location: { __type: 'GeoPoint', latitude: 13.7563, longitude: 100.5018 },
+    });
+    await adapter.createObject('GeoVacuumClass', schema, {
+      objectId: 'other',
+      location: { __type: 'GeoPoint', latitude: 40.7128, longitude: -74.006 },
+    });
+
+    const targetQuery = {
+      location: {
+        $nearSphere: { __type: 'GeoPoint', latitude: 13.7563, longitude: 100.5018 },
+        $maxDistance: 0.01,
+      },
+    };
+    expect((await adapter.find('GeoVacuumClass', schema, targetQuery)).map(row => row.objectId)).toEqual([
+      'target',
+    ]);
+
+    await adapter.deleteObjectsByQuery('GeoVacuumClass', schema, {
+      objectId: 'deleted-first',
+    });
+    // R*Tree ownership must not depend on SQLite's mutable implementation rowid.
+    adapter._db
+      .prepare(`UPDATE ${adapter._tableName('GeoVacuumClass')} SET rowid = rowid + 100`)
+      .run();
+    adapter._db.exec('VACUUM');
+
+    const results = await adapter.find('GeoVacuumClass', schema, targetQuery);
+    expect(results.map(row => row.objectId)).toEqual(['target']);
+    expect(results[0]._spatialId).toBeUndefined();
+    expect(
+      getSpatialQueryPlan(adapter, 'GeoVacuumClass', schema, targetQuery).plan.some(row =>
+        row.detail.includes('__psa_spatialid__')
+      )
+    ).toBeTrue();
+    expect(
+      (await adapter.getIndexes('GeoVacuumClass')).some(index =>
+        index.name.startsWith('__psa_spatialid__')
+      )
+    ).toBeFalse();
+
+    await adapter.createObject('GeoVacuumClass', schema, {
+      objectId: 'inserted-after-vacuum',
+      location: { __type: 'GeoPoint', latitude: 13.75, longitude: 100.5 },
+    });
+    expect(
+      (await adapter.find('GeoVacuumClass', schema, targetQuery)).map(row => row.objectId).sort()
+    ).toEqual(['inserted-after-vacuum', 'target']);
+  });
+
+  it('does not build lazy spatial artifacts through a separate transaction connection', async () => {
+    const schema = {
+      className: 'GeoTransactionClass',
+      fields: {
+        objectId: { type: 'String' },
+        location: { type: 'GeoPoint' },
+      },
+    };
+    await adapter.createClass('GeoTransactionClass', schema);
+    await adapter.createObject('GeoTransactionClass', schema, {
+      objectId: 'point',
+      location: { __type: 'GeoPoint', latitude: 13.7563, longitude: 100.5018 },
+    });
+    const query = {
+      location: {
+        $nearSphere: { __type: 'GeoPoint', latitude: 13.7563, longitude: 100.5018 },
+        $maxDistance: 0.01,
+      },
+    };
+    spyOn(adapter, '_ensureSpatialIndex').and.callThrough();
+
+    const transaction = await adapter.createTransactionalSession();
+    const transactionResults = await adapter.find(
+      'GeoTransactionClass',
+      schema,
+      query,
+      {},
+      transaction
+    );
+    expect(transactionResults.map(row => row.objectId)).toEqual(['point']);
+    expect(adapter._ensureSpatialIndex).not.toHaveBeenCalled();
+    await adapter.commitTransactionalSession(transaction);
+
+    await adapter.find('GeoTransactionClass', schema, query);
+    expect(adapter._ensureSpatialIndex).toHaveBeenCalled();
   });
 
   it('normalizes polygon values for storage and equality queries', async () => {
@@ -507,6 +874,20 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
     });
 
     expect(results.map(result => result.objectId).sort()).toEqual(['poly1', 'poly2']);
+    const polygonPlan = getSpatialQueryPlan(adapter, 'PolygonIntersectClass', schema, {
+      boundary: {
+        $geoIntersects: {
+          $point: {
+            __type: 'GeoPoint',
+            latitude: 0.5,
+            longitude: 0.5,
+          },
+        },
+      },
+    });
+    expect(polygonPlan.where.sql).toContain('geopoly_contains_point');
+    expect(polygonPlan.where.sql).not.toContain('parse_within_polygon');
+    expect(polygonPlan.plan.some(row => row.detail.includes('VIRTUAL TABLE INDEX'))).toBe(true);
   });
 
   it('supports idempotency index and uniqueness', async () => {
@@ -525,6 +906,35 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
     await expectAsync(
       adapter.createObject('UniqueClass', schema, { objectId: 'u2', code: 'A1' })
     ).toBeRejected();
+  });
+
+  it('identifies authData duplicates through class-scoped physical index names', async () => {
+    const schema = {
+      className: '_User',
+      fields: {
+        objectId: { type: 'String' },
+        authData: { type: 'Object' },
+      },
+    };
+    await adapter.createClass('_User', schema);
+    await adapter.ensureAuthDataUniqueness('custom_provider');
+    await adapter.createObject('_User', schema, {
+      objectId: 'auth-user-1',
+      authData: { custom_provider: { id: 'duplicate-id' } },
+    });
+
+    let duplicateError;
+    try {
+      await adapter.createObject('_User', schema, {
+        objectId: 'auth-user-2',
+        authData: { custom_provider: { id: 'duplicate-id' } },
+      });
+    } catch (error) {
+      duplicateError = error;
+    }
+
+    expect(duplicateError.code).toBe(Parse.Error.DUPLICATE_VALUE);
+    expect(duplicateError.userInfo).toEqual({ duplicated_field: '_auth_data_custom_provider' });
   });
 
   it('creates expression indexes for dotted array/object paths using the query expression', async () => {
@@ -644,6 +1054,50 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
         )
       )[0].objectId
     ).toBe('activeRequest');
+
+    const orderedOrQuery = {
+      $or: [{ status: 'active' }, { status: { $eq: 'held' } }],
+    };
+    const orderedOrBranches = adapter._getOrderedSetUnionQueries(
+      'IndexedScalarInClass',
+      schema,
+      orderedOrQuery,
+      { authoredOn: -1 },
+      25
+    );
+    expect(orderedOrBranches.length).toBe(2);
+    expect(orderedOrBranches[0]).toEqual({ $or: [{ status: 'active' }] });
+    expect(orderedOrBranches[1]).toEqual({ $or: [{ status: 'held' }] });
+
+    spyOn(adapter._db, 'prepare').and.callThrough();
+    await adapter.find('IndexedScalarInClass', schema, orderedOrQuery, {
+      sort: { authoredOn: -1 },
+      limit: 25,
+    });
+    expect(
+      adapter._db.prepare.calls
+        .allArgs()
+        .some(args => typeof args[0] === 'string' && args[0].includes('UNION ALL'))
+    ).toBeTrue();
+
+    adapter._db.prepare.calls.reset();
+    const projectedResults = await adapter.find(
+      'IndexedScalarInClass',
+      schema,
+      { status: { $in: ['active', 'held'] } },
+      {
+        keys: ['objectId'],
+        sort: { authoredOn: -1 },
+        limit: 25,
+      }
+    );
+    expect(
+      adapter._db.prepare.calls
+        .allArgs()
+        .some(args => typeof args[0] === 'string' && args[0].includes('UNION ALL'))
+    ).toBeTrue();
+    expect(projectedResults[0].objectId).toBe('activeRequest');
+    expect(projectedResults.every(result => result.authoredOn === undefined)).toBeTrue();
   });
 
   it('uses pointer compound indexes for top-level pointer equality', async () => {
@@ -711,6 +1165,313 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
         )
       ).map(result => result.objectId)
     ).toEqual(['patientRequest']);
+  });
+
+  it('merges ordered Pointer and Date set scans through scalar compound indexes', async () => {
+    const cases = [
+      {
+        className: 'IndexedOrderedPointerSetClass',
+        fieldName: 'subject',
+        indexFieldName: '_p_subject',
+        fieldSchema: { type: 'Pointer', targetClass: 'ClientInfo' },
+        values: ['patient1', 'patient2', 'patient3'].map(objectId => ({
+          __type: 'Pointer',
+          className: 'ClientInfo',
+          objectId,
+        })),
+      },
+      {
+        className: 'IndexedOrderedDateSetClass',
+        fieldName: 'scheduledAt',
+        indexFieldName: 'scheduledAt',
+        fieldSchema: { type: 'Date' },
+        values: ['2026-01-01', '2026-01-02', '2026-01-03'].map(day => ({
+          __type: 'Date',
+          iso: `${day}T00:00:00.000Z`,
+        })),
+      },
+    ];
+
+    for (const testCase of cases) {
+      const schema = {
+        className: testCase.className,
+        fields: {
+          objectId: { type: 'String' },
+          [testCase.fieldName]: testCase.fieldSchema,
+          authoredOn: { type: 'Number' },
+        },
+      };
+      const indexName = `${testCase.fieldName}_authoredOn`;
+      await adapter.createClass(testCase.className, schema);
+      await adapter.createIndex(
+        testCase.className,
+        { [testCase.indexFieldName]: 1, authoredOn: -1 },
+        { name: indexName }
+      );
+      await adapter.createObject(testCase.className, schema, {
+        objectId: `${testCase.fieldName}First`,
+        [testCase.fieldName]: testCase.values[0],
+        authoredOn: 10,
+      });
+      await adapter.createObject(testCase.className, schema, {
+        objectId: `${testCase.fieldName}Second`,
+        [testCase.fieldName]: testCase.values[1],
+        authoredOn: 20,
+      });
+      await adapter.createObject(testCase.className, schema, {
+        objectId: `${testCase.fieldName}Excluded`,
+        [testCase.fieldName]: testCase.values[2],
+        authoredOn: 30,
+      });
+
+      const query = {
+        [testCase.fieldName]: { $in: [testCase.values[0], testCase.values[1]] },
+      };
+      const branches = adapter._getOrderedSetUnionQueries(
+        testCase.className,
+        schema,
+        query,
+        { authoredOn: -1 },
+        2
+      );
+      expect(branches.length).toBe(2);
+
+      const branchSelects = [];
+      const branchParams = [];
+      for (const branch of branches) {
+        const branchWhere = adapter._buildWhereClause(testCase.className, schema, branch);
+        branchSelects.push(
+          `SELECT * FROM ${adapter._tableName(testCase.className)} WHERE ${branchWhere.sql}`
+        );
+        branchParams.push(...branchWhere.params);
+      }
+      const unionSql =
+        `SELECT * FROM (${branchSelects.join(' UNION ALL ')}) ` +
+        `ORDER BY "authoredOn" DESC LIMIT 2`;
+      const planDetails = adapter
+        ._prepare(`EXPLAIN QUERY PLAN ${unionSql}`)
+        .all(...branchParams)
+        .map(row => row.detail)
+        .join('\n');
+      expect(planDetails).toContain('MERGE (UNION ALL)');
+      expect(planDetails).toContain(indexName);
+
+      const results = await adapter.find(testCase.className, schema, query, {
+        sort: { authoredOn: -1 },
+        limit: 2,
+      });
+      expect(results.map(result => result.objectId)).toEqual([
+        `${testCase.fieldName}Second`,
+        `${testCase.fieldName}First`,
+      ]);
+    }
+  });
+
+  it('preserves mixed directions in scalar compound indexes and repairs stale definitions', async () => {
+    const className = 'MixedDirectionIndexClass';
+    const indexName = 'status_authoredOn_mixed';
+    const schema = {
+      className,
+      fields: {
+        objectId: { type: 'String' },
+        status: { type: 'String' },
+        authoredOn: { type: 'Number' },
+      },
+    };
+    await adapter.createClass(className, schema);
+    adapter._db.exec(
+      `CREATE INDEX "${indexName}" ON ${adapter._tableName(className)} ("status", "authoredOn")`
+    );
+    await adapter.createIndex(
+      className,
+      { status: 1, authoredOn: -1 },
+      { name: indexName }
+    );
+    await adapter.createObject(className, schema, {
+      objectId: 'activeOlder',
+      status: 'active',
+      authoredOn: 10,
+    });
+    await adapter.createObject(className, schema, {
+      objectId: 'activeNewer',
+      status: 'active',
+      authoredOn: 20,
+    });
+    await adapter.createObject(className, schema, {
+      objectId: 'heldNewest',
+      status: 'held',
+      authoredOn: 30,
+    });
+
+    const queryPlan = adapter
+      ._prepare(
+        `EXPLAIN QUERY PLAN SELECT "objectId" FROM ${adapter._tableName(className)} ` +
+          'ORDER BY "status" ASC, "authoredOn" DESC'
+      )
+      .all();
+    const physicalIndexName = adapter._physicalIndexName(className, indexName);
+    const indexParts = adapter
+      ._prepare(`PRAGMA index_xinfo("${physicalIndexName}")`)
+      .all()
+      .filter(indexPart => Number(indexPart.key) === 1);
+    const visibleIndex = (await adapter.getIndexes(className)).find(
+      index => index.name === indexName
+    );
+
+    expect(indexParts.map(indexPart => Boolean(indexPart.desc))).toEqual([false, true]);
+    expect(visibleIndex.key).toEqual({ status: 1, authoredOn: -1 });
+    expect(
+      queryPlan.some(row => typeof row.detail === 'string' && row.detail.includes(indexName))
+    ).toBeTrue();
+    expect(
+      queryPlan.some(
+        row => typeof row.detail === 'string' && row.detail.includes('USE TEMP B-TREE')
+      )
+    ).toBeFalse();
+    expect(
+      (
+        await adapter.find(className, schema, {}, { sort: { status: 1, authoredOn: -1 } })
+      ).map(result => result.objectId)
+    ).toEqual(['activeNewer', 'activeOlder', 'heldNewest']);
+  });
+
+  it('uses Mongo-compatible sparse indexes for exists queries including explicit null', async () => {
+    const className = 'SparseExistsIndexClass';
+    const indexName = 'optional_sparse';
+    const schema = {
+      className,
+      fields: {
+        objectId: { type: 'String' },
+        optional: { type: 'String' },
+      },
+    };
+    await adapter.createClass(className, schema);
+    await adapter.createIndex(className, { optional: 1 }, { name: indexName, sparse: true });
+    await adapter.createObject(className, schema, { objectId: 'missingOptional' });
+    await adapter.createObject(className, schema, {
+      objectId: 'nullOptional',
+      optional: null,
+    });
+    await adapter.createObject(className, schema, {
+      objectId: 'valueOptional',
+      optional: 'value',
+    });
+
+    const where = adapter._buildWhereClause(className, schema, {
+      optional: { $exists: true },
+    });
+    const queryPlan = adapter
+      ._prepare(
+        `EXPLAIN QUERY PLAN SELECT "objectId" FROM ${adapter._tableName(className)} WHERE ${where.sql}`
+      )
+      .all(...where.params);
+    const indexDefinition = adapter
+      ._prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?")
+      .get(adapter._physicalIndexName(className, indexName));
+    const results = await adapter.find(className, schema, {
+      optional: { $exists: true },
+    });
+
+    expect(where.sql).toContain('instr(COALESCE("_nullFields"');
+    expect(indexDefinition.sql).toContain(' OR ');
+    expect(indexDefinition.sql).toContain('instr(COALESCE("_nullFields"');
+    expect(
+      queryPlan.some(row => typeof row.detail === 'string' && row.detail.includes(indexName))
+    ).toBeTrue();
+    expect(results.map(result => result.objectId).sort()).toEqual([
+      'nullOptional',
+      'valueOptional',
+    ]);
+  });
+
+  it('uses normal indexes for top-level Date equality and set lookups', async () => {
+    const className = 'IndexedDateEqualityClass';
+    const schema = {
+      className,
+      fields: {
+        objectId: { type: 'String' },
+        happenedAt: { type: 'Date' },
+      },
+    };
+    await adapter.createClass(className, schema);
+    await adapter.createIndex(className, { happenedAt: 1 }, { name: 'indexed_happenedAt' });
+    const insert = adapter._prepare(
+      `INSERT INTO ${adapter._tableName(className)} ("objectId", "happenedAt") VALUES (?, ?)`
+    );
+    const baseTime = Date.parse('2026-08-01T00:00:00.000Z');
+    adapter._db.transaction(() => {
+      for (let index = 0; index < 2000; index += 1) {
+        insert.run(`date${index}`, new Date(baseTime + index * 1000).toISOString());
+      }
+    })();
+    adapter._db.exec('ANALYZE');
+
+    const targetDate = {
+      __type: 'Date',
+      iso: new Date(baseTime + 1999 * 1000).toISOString(),
+    };
+    const queryShapes = [
+      { happenedAt: targetDate },
+      { happenedAt: { $in: [targetDate, { __type: 'Date', iso: new Date(baseTime).toISOString() }] } },
+    ];
+    for (const query of queryShapes) {
+      const where = adapter._buildWhereClause(className, schema, query);
+      const queryPlan = adapter
+        ._prepare(
+          `EXPLAIN QUERY PLAN SELECT "objectId" FROM ${adapter._tableName(className)} WHERE ${where.sql}`
+        )
+        .all(...where.params);
+      expect(where.sql).not.toContain('json_valid');
+      expect(
+        queryPlan.some(
+          row => typeof row.detail === 'string' && row.detail.includes('indexed_happenedAt')
+        )
+      ).toBeTrue();
+    }
+    expect(
+      (await adapter.find(className, schema, { happenedAt: targetDate })).map(
+        result => result.objectId
+      )
+    ).toEqual(['date1999']);
+  });
+
+  it('uses normal indexes for top-level File equality', async () => {
+    const className = 'IndexedFileEqualityClass';
+    const schema = {
+      className,
+      fields: {
+        objectId: { type: 'String' },
+        attachment: { type: 'File' },
+      },
+    };
+    const attachment = {
+      __type: 'File',
+      name: 'report.pdf',
+      url: 'https://example.test/report.pdf',
+    };
+    await adapter.createClass(className, schema);
+    await adapter.createIndex(className, { attachment: 1 }, { name: 'indexed_attachment' });
+    await adapter.createObject(className, schema, {
+      objectId: 'file1',
+      attachment,
+    });
+
+    const where = adapter._buildWhereClause(className, schema, { attachment });
+    const queryPlan = adapter
+      ._prepare(
+        `EXPLAIN QUERY PLAN SELECT "objectId" FROM ${adapter._tableName(className)} WHERE ${where.sql}`
+      )
+      .all(...where.params);
+    expect(where.sql).toContain('"attachment" = ?');
+    expect(where.sql).not.toContain('json_valid');
+    expect(
+      queryPlan.some(
+        row => typeof row.detail === 'string' && row.detail.includes('indexed_attachment')
+      )
+    ).toBeTrue();
+    expect(
+      (await adapter.find(className, schema, { attachment })).map(result => result.objectId)
+    ).toEqual(['file1']);
   });
 
   it('rejects storage timestamp aliases from ordered set union planning', async () => {
@@ -953,6 +1714,46 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
     ).toBeDefined();
   });
 
+  it('scopes physical scalar indexes to their class while preserving logical names', async () => {
+    const firstClassName = 'FirstScalarIndexClass';
+    const secondClassName = 'SecondScalarIndexClass';
+    const indexName = 'shared_status';
+    const createSchema = className => ({
+      className,
+      fields: {
+        objectId: { type: 'String' },
+        status: { type: 'String' },
+      },
+    });
+    await adapter.createClass(firstClassName, createSchema(firstClassName));
+    await adapter.createClass(secondClassName, createSchema(secondClassName));
+    await adapter.createIndex(firstClassName, { status: 1 }, { name: indexName });
+    await adapter.createIndex(secondClassName, { status: 1 }, { name: indexName });
+
+    const firstPhysicalIndexName = adapter._physicalIndexName(firstClassName, indexName);
+    const secondPhysicalIndexName = adapter._physicalIndexName(secondClassName, indexName);
+    expect(firstPhysicalIndexName).not.toBe(secondPhysicalIndexName);
+    expect(
+      adapter
+        ._prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?")
+        .get(firstPhysicalIndexName)
+    ).toBeDefined();
+    expect(
+      adapter
+        ._prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?")
+        .get(secondPhysicalIndexName)
+    ).toBeDefined();
+    expect((await adapter.getIndexes(firstClassName)).some(index => index.name === indexName)).toBeTrue();
+    expect((await adapter.getIndexes(secondClassName)).some(index => index.name === indexName)).toBeTrue();
+
+    await adapter.dropIndexes(firstClassName, [indexName]);
+    expect(
+      adapter
+        ._prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?")
+        .get(secondPhysicalIndexName)
+    ).toBeDefined();
+  });
+
   it('skips array compound helpers with missing base columns', async () => {
     const className = 'MissingArrayHelperBaseClass';
     const schema = {
@@ -978,6 +1779,103 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
         ._prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?")
         .get(adapter._arrayCompoundBaseIndexName(className, indexName))
     ).toBeUndefined();
+  });
+
+  it('uses hidden multikey indexes for dotted paths through arrays below Object fields', async () => {
+    const className = 'IndexedNestedObjectArrayClass';
+    const fieldName = 'code.coding.code';
+    const schema = {
+      className,
+      fields: {
+        objectId: { type: 'String' },
+        code: { type: 'Object' },
+      },
+    };
+    await adapter.createClass(className, schema);
+    await adapter.createIndex(className, { [fieldName]: 1 }, { name: 'indexed_nested_code' });
+    await adapter.createObject(className, schema, {
+      objectId: 'scalar-code',
+      code: { coding: { code: '29463-7' } },
+    });
+    await adapter.createObject(className, schema, {
+      objectId: 'array-code',
+      code: { coding: [{ code: '29463-7' }, { code: '8302-2' }] },
+    });
+    await adapter.createObject(className, schema, {
+      objectId: 'other-code',
+      code: { coding: [{ code: '8867-4' }] },
+    });
+
+    const where = adapter._buildWhereClause(className, schema, { [fieldName]: '29463-7' });
+    const queryPlan = adapter
+      ._prepare(
+        `EXPLAIN QUERY PLAN SELECT "objectId" FROM ${adapter._tableName(className)} WHERE ${where.sql}`
+      )
+      .all(...where.params);
+    const rawArrayIndexTableName = adapter._rawArrayElementIndexTableName(className, fieldName);
+    const { lookupIndex } = adapter._getArrayElementIndexArtifactNames(rawArrayIndexTableName);
+
+    expect(where.sql).toContain(adapter._quotedArrayElementIndexTableName(className, fieldName));
+    expect(where.sql).not.toContain('WITH RECURSIVE');
+    expect(queryPlan.map(row => row.detail).join('\n')).toContain(lookupIndex.slice(1, -1));
+    expect(
+      (await adapter.find(className, schema, { [fieldName]: '29463-7' }))
+        .map(result => result.objectId)
+        .sort()
+    ).toEqual(['array-code', 'scalar-code']);
+
+    const allWhere = adapter._buildWhereClause(className, schema, {
+      [fieldName]: { $all: ['29463-7', '8302-2'] },
+    });
+    expect(allWhere.sql).toContain(adapter._quotedArrayElementIndexTableName(className, fieldName));
+    expect(allWhere.sql).not.toContain('WITH RECURSIVE');
+    expect(
+      (
+        await adapter.find(className, schema, {
+          [fieldName]: { $all: ['29463-7', '8302-2'] },
+        })
+      ).map(result => result.objectId)
+    ).toEqual(['array-code']);
+    expect(
+      (
+        await adapter.find(className, schema, {
+          [fieldName]: {
+            $all: [{ $regex: '^29463' }, { $regex: '^8302' }],
+          },
+        })
+      ).map(result => result.objectId)
+    ).toEqual(['array-code']);
+    expect(
+      (
+        await adapter.find(className, schema, {
+          [fieldName]: { $containedBy: ['29463-7', '8302-2'] },
+        })
+      )
+        .map(result => result.objectId)
+        .sort()
+    ).toEqual(['array-code', 'scalar-code']);
+    expect((await adapter.distinct(className, schema, {}, fieldName)).sort()).toEqual([
+      '29463-7',
+      '8302-2',
+      '8867-4',
+    ]);
+
+    await adapter.updateObjectsByQuery(
+      className,
+      schema,
+      { objectId: 'array-code' },
+      { code: { coding: [{ code: '39156-5' }] } }
+    );
+    expect(
+      (await adapter.find(className, schema, { [fieldName]: '29463-7' })).map(
+        result => result.objectId
+      )
+    ).toEqual(['scalar-code']);
+    expect(
+      (await adapter.find(className, schema, { [fieldName]: '39156-5' })).map(
+        result => result.objectId
+      )
+    ).toEqual(['array-code']);
   });
 
 
@@ -1020,6 +1918,127 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
       )
     ).toBeTrue();
     expect(results.map(result => result.objectId)).toEqual(['arrayEq1']);
+  });
+
+  it('keeps large indexed $all queries below SQLite expression-depth limits', async () => {
+    const className = 'LargeIndexedArrayAllClass';
+    const schema = {
+      className,
+      fields: {
+        objectId: { type: 'String' },
+        tags: { type: 'Array', contents: { type: 'String' } },
+      },
+    };
+    const requiredTags = [];
+    for (let index = 0; index < 1200; index += 1) {
+      requiredTags.push(`tag-${index}`);
+    }
+    await adapter.createClass(className, schema);
+    await adapter.createIndex(className, { tags: 1 }, { name: 'indexed_large_all_tags' });
+    await adapter.createObject(className, schema, {
+      objectId: 'all-tags',
+      tags: requiredTags,
+    });
+    await adapter.createObject(className, schema, {
+      objectId: 'partial-tags',
+      tags: requiredTags.slice(0, requiredTags.length - 1),
+    });
+
+    const where = adapter._buildWhereClause(className, schema, {
+      tags: { $all: requiredTags },
+    });
+    expect(where.sql).toContain('HAVING COUNT(*) = ?');
+    expect(where.sql).not.toContain('WITH RECURSIVE');
+    expect(
+      (await adapter.find(className, schema, { tags: { $all: requiredTags } })).map(
+        result => result.objectId
+      )
+    ).toEqual(['all-tags']);
+  });
+
+  it('uses hidden array-element indexes for unfiltered typed-array distinct values', async () => {
+    const className = 'IndexedArrayDistinctClass';
+    const schema = {
+      className,
+      fields: {
+        objectId: { type: 'String' },
+        tags: { type: 'Array', contents: { type: 'String' } },
+      },
+    };
+    await adapter.createClass(className, schema);
+    await adapter.createIndex(className, { tags: 1 }, { name: 'indexed_distinct_tags' });
+    await adapter.createObject(className, schema, {
+      objectId: 'distinct1',
+      tags: ['alpha', 'beta'],
+    });
+    await adapter.createObject(className, schema, {
+      objectId: 'distinct2',
+      tags: ['beta', 'gamma'],
+    });
+
+    spyOn(adapter._db, 'prepare').and.callThrough();
+    const values = await adapter.distinct(className, schema, {}, 'tags');
+    const preparedSql = adapter._db.prepare.calls.allArgs().map(args => args[0]);
+    const arrayIndexTableName = adapter._rawArrayElementIndexTableName(className, 'tags');
+
+    expect(values.sort()).toEqual(['alpha', 'beta', 'gamma']);
+    expect(
+      preparedSql.some(
+        sql => typeof sql === 'string' && sql.includes(arrayIndexTableName)
+      )
+    ).toBeTrue();
+    expect(
+      preparedSql.some(sql => typeof sql === 'string' && sql.includes('JOIN json_each'))
+    ).toBeFalse();
+  });
+
+  it('rebuilds shadow rows when upgrading legacy array-index triggers', async () => {
+    const className = 'LegacyArrayIndexTriggerClass';
+    const fieldName = 'tags';
+    const schema = {
+      className,
+      fields: {
+        objectId: { type: 'String' },
+        tags: { type: 'Array', contents: { type: 'String' } },
+      },
+    };
+    await adapter.createClass(className, schema);
+    await adapter.createObject(className, schema, {
+      objectId: 'existing-row',
+      tags: ['current-value'],
+    });
+    const rawArrayIndexTableName = adapter._rawArrayElementIndexTableName(className, fieldName);
+    const arrayIndexTableName = adapter._quotedArrayElementIndexTableName(className, fieldName);
+    const legacyTriggers = adapter._getArrayElementIndexArtifactNames(rawArrayIndexTableName, 1);
+    adapter._db.exec(
+      `CREATE TABLE ${arrayIndexTableName} (` +
+        '"objectId" TEXT NOT NULL, "valueType" TEXT NOT NULL, "value")'
+    );
+    adapter._db.exec(
+      `INSERT INTO ${arrayIndexTableName}("objectId", "valueType", "value") ` +
+        `VALUES ('stale-row', 'text', 'stale-value')`
+    );
+    adapter._db.exec(
+      `CREATE TRIGGER ${legacyTriggers.insertTrigger} AFTER INSERT ON ${adapter._tableName(
+        className
+      )} BEGIN SELECT 1; END`
+    );
+
+    await adapter.createIndex(className, { tags: 1 }, { name: 'indexed_legacy_tags' });
+
+    expect(
+      adapter
+        ._prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' AND name = ?")
+        .get(legacyTriggers.insertTrigger.slice(1, -1))
+    ).toBeUndefined();
+    expect(
+      adapter._prepare(`SELECT "objectId" FROM ${arrayIndexTableName} ORDER BY "objectId"`).all()
+    ).toEqual([{ objectId: 'existing-row' }]);
+    expect(
+      (await adapter.find(className, schema, { tags: 'current-value' })).map(
+        result => result.objectId
+      )
+    ).toEqual(['existing-row']);
   });
 
   it('uses hidden array-element indexes for dotted paths under Array roots', async () => {
@@ -1478,6 +2497,254 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
         row => typeof row.detail === 'string' && row.detail.includes('case_insensitive_username')
       )
     ).toBeTrue();
+  });
+
+  it('uses the Parse case-insensitive helper index for equality and set lookups', async () => {
+    const className = 'IndexedCaseInsensitiveEqualityClass';
+    const schema = {
+      className,
+      fields: {
+        objectId: { type: 'String' },
+        username: { type: 'String' },
+      },
+    };
+    await adapter.createClass(className, schema);
+    adapter._db.exec(
+      `CREATE INDEX "case_insensitive_username_equality" ON ${adapter._tableName(className)} (LOWER("username"))`
+    );
+    await adapter.ensureIndex(
+      className,
+      schema,
+      ['username'],
+      'case_insensitive_username_equality',
+      true
+    );
+    await adapter.createObject(className, schema, {
+      objectId: 'anna',
+      username: 'Anna',
+    });
+
+    const queryShapes = [
+      { username: 'ANNA' },
+      { username: { $eq: 'ANNA' } },
+      { username: { $in: ['ANNA', 'OTHER'] } },
+    ];
+    for (const query of queryShapes) {
+      const where = adapter._buildWhereClause(className, schema, query, true);
+      const queryPlan = adapter
+        ._prepare(
+          `EXPLAIN QUERY PLAN SELECT "objectId" FROM ${adapter._tableName(className)} WHERE ${where.sql}`
+        )
+        .all(...where.params);
+      expect(where.sql).toContain('COLLATE NOCASE');
+      expect(where.sql).not.toContain('LOWER(');
+      expect(
+        queryPlan.some(
+          row =>
+            typeof row.detail === 'string' &&
+            row.detail.includes('case_insensitive_username_equality')
+        )
+      ).toBeTrue();
+      expect(
+        (await adapter.find(className, schema, query, { caseInsensitive: true })).map(
+          result => result.objectId
+        )
+      ).toEqual(['anna']);
+    }
+    const rebuiltIndexParts = adapter
+      ._prepare(
+        `PRAGMA index_xinfo("${adapter._physicalIndexName(
+          className,
+          'case_insensitive_username_equality'
+        )}")`
+      )
+      .all()
+      .filter(indexPart => Number(indexPart.key) === 1);
+    expect(rebuiltIndexParts[0].name).toBe('username');
+    expect(String(rebuiltIndexParts[0].coll).toUpperCase()).toBe('NOCASE');
+  });
+
+  it('uses normal indexes for whole top-level Object equality and set lookups', async () => {
+    const className = 'IndexedObjectEqualityClass';
+    const schema = {
+      className,
+      fields: {
+        objectId: { type: 'String' },
+        payload: { type: 'Object' },
+      },
+    };
+    const indexedPayload = { kind: 'vital', weight: 72.5 };
+    await adapter.createClass(className, schema);
+    await adapter.createIndex(className, { payload: 1 }, { name: 'indexed_payload' });
+    await adapter.createObject(className, schema, {
+      objectId: 'matchingObject',
+      payload: indexedPayload,
+    });
+    await adapter.createObject(className, schema, {
+      objectId: 'differentOrder',
+      payload: { weight: 72.5, kind: 'vital' },
+    });
+
+    const queryShapes = [
+      { payload: indexedPayload },
+      { payload: { $eq: indexedPayload } },
+      { payload: { $in: [indexedPayload, { kind: 'other' }] } },
+    ];
+    for (const query of queryShapes) {
+      const where = adapter._buildWhereClause(className, schema, query);
+      const queryPlan = adapter
+        ._prepare(
+          `EXPLAIN QUERY PLAN SELECT "objectId" FROM ${adapter._tableName(className)} WHERE ${where.sql}`
+        )
+        .all(...where.params);
+
+      expect(where.sql).not.toContain('jsonb("payload")');
+      expect(
+        queryPlan.some(
+          row => typeof row.detail === 'string' && row.detail.includes('indexed_payload')
+        )
+      ).toBeTrue();
+      expect((await adapter.find(className, schema, query)).map(result => result.objectId)).toEqual([
+        'matchingObject',
+      ]);
+    }
+  });
+
+  it('pushes initial aggregate Pointer matches into compound-index scans', async () => {
+    const className = 'IndexedAggregatePointerClass';
+    const schema = {
+      className,
+      fields: {
+        objectId: { type: 'String' },
+        subject: { type: 'Pointer', targetClass: 'Patient' },
+        status: { type: 'String' },
+        authoredOn: { type: 'Date' },
+      },
+    };
+    const matchingSubject = {
+      __type: 'Pointer',
+      className: 'Patient',
+      objectId: 'patientA',
+    };
+    await adapter.createClass(className, schema);
+    await adapter.createIndex(
+      className,
+      { subject: 1, status: 1, authoredOn: -1 },
+      { name: 'indexed_subject_status_authoredOn' }
+    );
+    await adapter.createObject(className, schema, {
+      objectId: 'matchingAggregatePointer',
+      subject: matchingSubject,
+      status: 'active',
+      authoredOn: { __type: 'Date', iso: '2026-01-02T00:00:00.000Z' },
+    });
+    await adapter.createObject(className, schema, {
+      objectId: 'otherAggregatePointer',
+      subject: { __type: 'Pointer', className: 'Patient', objectId: 'patientB' },
+      status: 'active',
+      authoredOn: { __type: 'Date', iso: '2026-01-03T00:00:00.000Z' },
+    });
+
+    const match = { subject: matchingSubject, status: 'active' };
+    let context = adapter._getNativeAggregateContext(className, schema);
+    context = adapter._applyAggregateMatchStage(context, match, schema, false, false);
+    context = adapter._applyAggregateSortStage(context, { authoredOn: -1 }, false);
+    const queryPlan = adapter
+      ._prepare(`EXPLAIN QUERY PLAN ${context.sql}`)
+      .all(...context.params);
+    const results = await adapter.aggregate(className, schema, [
+      { $match: match },
+      { $sort: { authoredOn: -1 } },
+    ]);
+
+    expect(context.sql).toContain('WHERE ("subject" = ?)');
+    expect(
+      queryPlan.some(
+        row =>
+          typeof row.detail === 'string' &&
+          row.detail.includes('indexed_subject_status_authoredOn')
+      )
+    ).toBeTrue();
+    expect(
+      queryPlan.some(
+        row => typeof row.detail === 'string' && row.detail.includes('USE TEMP B-TREE')
+      )
+    ).toBeFalse();
+    expect(results.map(result => result.objectId)).toEqual(['matchingAggregatePointer']);
+  });
+
+  it('merges initial aggregate scalar-set scans without a temporary sort', async () => {
+    const className = 'IndexedAggregateSetClass';
+    const schema = {
+      className,
+      fields: {
+        objectId: { type: 'String' },
+        status: { type: 'String' },
+        authoredOn: { type: 'Date' },
+      },
+    };
+    await adapter.createClass(className, schema);
+    await adapter.createIndex(
+      className,
+      { status: 1, authoredOn: -1 },
+      { name: 'indexed_aggregate_status_authoredOn' }
+    );
+    await adapter.createObject(className, schema, {
+      objectId: 'activeAggregateSet',
+      status: 'active',
+      authoredOn: { __type: 'Date', iso: '2026-01-03T00:00:00.000Z' },
+    });
+    await adapter.createObject(className, schema, {
+      objectId: 'heldAggregateSet',
+      status: 'held',
+      authoredOn: { __type: 'Date', iso: '2026-01-02T00:00:00.000Z' },
+    });
+    await adapter.createObject(className, schema, {
+      objectId: 'doneAggregateSet',
+      status: 'done',
+      authoredOn: { __type: 'Date', iso: '2026-01-04T00:00:00.000Z' },
+    });
+
+    const match = { status: { $in: ['active', 'held'] } };
+    const sort = { authoredOn: -1 };
+    const unionQueries = adapter._getOrderedSetUnionQueries(
+      className,
+      schema,
+      match,
+      sort,
+      2
+    );
+    let context = adapter._getNativeAggregateOrderedSetUnionContext(
+      className,
+      schema,
+      unionQueries
+    );
+    context = adapter._applyAggregateSortStage(context, sort, false);
+    context = adapter._applyAggregateLimitStage(context, 2);
+    const queryPlan = adapter
+      ._prepare(`EXPLAIN QUERY PLAN ${context.sql}`)
+      .all(...context.params);
+    const results = await adapter.aggregate(className, schema, [
+      { $match: match },
+      { $sort: sort },
+      { $limit: 2 },
+    ]);
+
+    expect(context.sql).toContain('UNION ALL');
+    expect(
+      queryPlan.some(
+        row => typeof row.detail === 'string' && row.detail.includes('MERGE (UNION ALL)')
+      )
+    ).toBeTrue();
+    expect(
+      queryPlan.some(
+        row => typeof row.detail === 'string' && row.detail.includes('USE TEMP B-TREE')
+      )
+    ).toBeFalse();
+    expect(results.map(result => result.objectId)).toEqual([
+      'activeAggregateSet',
+      'heldAggregateSet',
+    ]);
   });
 
   it('uses the Parse case-insensitive helper index as a prefix prefilter for more complex anchored regex', async () => {
@@ -2957,6 +4224,27 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
         sql => typeof sql === 'string' && (sql.includes('sqlite_master') || sql.includes('PRAGMA table_info'))
       )
     ).toBeFalse();
+  });
+
+  it('uses cached schema metadata while building indexed Array predicates', async () => {
+    const className = 'CachedArrayIndexSchemaClass';
+    const schema = {
+      className,
+      fields: {
+        objectId: { type: 'String' },
+        tags: { type: 'Array', contents: { type: 'String' } },
+      },
+    };
+    await adapter.createClass(className, schema);
+    await adapter.createIndex(className, { tags: 1 }, { name: 'tags_1' });
+    spyOn(adapter, '_getStoredSchemaObject').and.callThrough();
+
+    const where = adapter._buildWhereClause(className, schema, {
+      tags: { $in: ['active', 'held'] },
+    });
+
+    expect(where.sql).toContain(adapter._quotedArrayElementIndexTableName(className, 'tags'));
+    expect(adapter._getStoredSchemaObject).not.toHaveBeenCalled();
   });
 
   it('treats positive UTC offset keys as object members instead of array indexes', async () => {
