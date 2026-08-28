@@ -28,6 +28,14 @@ const applySQLiteQueryOptions = (options, searchParams) => {
   if (cacheSizeKb !== null) {
     options.cacheSizeKb = cacheSizeKb;
   }
+  const executionMode = searchParams.get('executionMode');
+  if (executionMode === 'direct' || executionMode === 'worker') {
+    options.executionMode = executionMode;
+  }
+  const executionProvider = searchParams.get('executionProvider');
+  if (executionProvider === 'better-sqlite3' || executionProvider === 'node:sqlite') {
+    options.executionProvider = executionProvider;
+  }
 };
 const normalizeFileSQLiteURI = uri => {
   if (uri === 'file::memory:' || uri.startsWith('file::memory:?')) {

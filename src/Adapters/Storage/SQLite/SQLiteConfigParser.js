@@ -30,6 +30,16 @@ const applySQLiteQueryOptions = (options: Object, searchParams: URLSearchParams)
   if (cacheSizeKb !== null) {
     options.cacheSizeKb = cacheSizeKb;
   }
+
+  const executionMode = searchParams.get('executionMode');
+  if (executionMode === 'direct' || executionMode === 'worker') {
+    options.executionMode = executionMode;
+  }
+
+  const executionProvider = searchParams.get('executionProvider');
+  if (executionProvider === 'better-sqlite3' || executionProvider === 'node:sqlite') {
+    options.executionProvider = executionProvider;
+  }
 };
 
 const normalizeFileSQLiteURI = (uri: string): string => {

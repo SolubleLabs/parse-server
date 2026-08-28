@@ -2,6 +2,7 @@
 import { StorageAdapter } from '../StorageAdapter';
 import type { SchemaType, QueryType, QueryOptions } from '../StorageAdapter';
 import { createClient } from './SQLiteClient';
+import type { SQLiteSyncExecutionProvider } from './SQLiteClient';
 import { getDatabaseOptionsFromURI } from './SQLiteConfigParser';
 import PostgresStorageAdapter from '../Postgres/PostgresStorageAdapter';
 import RestQuery from '../../../RestQuery';
@@ -216,7 +217,7 @@ const partitionFlattenedConstraintValues = (
 };
 
 const temporarySQLiteDirectories = new Set();
-let sharedMemorySQLiteDatabase;
+const sharedMemorySQLiteDatabases = new Map();
 const unsafeRestQuery = RestQuery && RestQuery._UnsafeRestQuery;
 const originalUnsafeRestQueryHandleInclude =
   unsafeRestQuery && unsafeRestQuery.prototype ? unsafeRestQuery.prototype.handleInclude : null;
@@ -351,18 +352,21 @@ const createTemporarySQLiteDatabasePath = () => {
   };
 };
 
-const getSharedMemorySQLiteDatabasePath = () => {
+const getSharedMemorySQLiteDatabasePath = (providerKey: any) => {
+  let sharedMemorySQLiteDatabase = sharedMemorySQLiteDatabases.get(providerKey);
   if (!sharedMemorySQLiteDatabase) {
     sharedMemorySQLiteDatabase = {
       ...createTemporarySQLiteDatabasePath(),
       refCount: 0,
     };
+    sharedMemorySQLiteDatabases.set(providerKey, sharedMemorySQLiteDatabase);
   }
   sharedMemorySQLiteDatabase.refCount += 1;
   return sharedMemorySQLiteDatabase;
 };
 
-const releaseSharedMemorySQLiteDatabasePath = () => {
+const releaseSharedMemorySQLiteDatabasePath = (providerKey: any) => {
+  const sharedMemorySQLiteDatabase = sharedMemorySQLiteDatabases.get(providerKey);
   if (!sharedMemorySQLiteDatabase) {
     return;
   }
@@ -378,7 +382,7 @@ const releaseSharedMemorySQLiteDatabasePath = () => {
   } catch {
     /* */
   }
-  sharedMemorySQLiteDatabase = null;
+  sharedMemorySQLiteDatabases.delete(providerKey);
 };
 
 const isJoinTableClass = className =>
@@ -2754,15 +2758,30 @@ const getScalarAnyMatchExpression = (
   return getSQLiteAnyMatchExpression(targetSql, comparisonValues, getScalarValueMatchExpression);
 };
 
-const validateRegexPattern = (pattern: string, flags: string): { pattern: string, flags: string } => {
+const validateRegexPattern = (
+  pattern: string,
+  flags: string,
+  deferSanitizedLog: boolean
+): { pattern: string, flags: string } => {
   try {
     const normalizedRegex = normalizeRegexPattern(pattern, flags);
     new RegExp(normalizedRegex.pattern, normalizedRegex.flags);
     return normalizedRegex;
   } catch (error) {
+    const detailedMessage = `Invalid regular expression: ${error.message}`;
+    if (deferSanitizedLog) {
+      const parseError = new Parse.Error(
+        Parse.Error.INTERNAL_SERVER_ERROR,
+        'An internal server error occurred'
+      );
+      // Worker loggers are isolated from the host's configured logger. The RPC
+      // facade removes this metadata after emitting the diagnostic in the host.
+      parseError._sqliteSanitizedLogMessage = detailedMessage;
+      throw parseError;
+    }
     throw createSanitizedError(
       Parse.Error.INTERNAL_SERVER_ERROR,
-      `Invalid regular expression: ${error.message}`,
+      detailedMessage,
       undefined,
       'An internal server error occurred'
     );
@@ -3229,15 +3248,86 @@ export class SQLiteStorageAdapter implements StorageAdapter {
   _temporaryDirectory: ?string;
   _usesSharedMemoryDatabase: boolean;
   _lastWriteSequence: number;
+  _executionProvider: SQLiteSyncExecutionProvider;
+  _sharedMemoryDatabaseKey: any;
+  _runsInDedicatedWorker: boolean;
+  disableIndexFieldValidation: boolean;
 
   constructor(options: any = {}) {
     applySQLiteHandleIncludePatch();
-    this._uri = options.uri || 'sqlite://:memory:';
+    const uri = options.uri || 'sqlite://:memory:';
+    const uriDatabaseOptions = getDatabaseOptionsFromURI(uri);
+    const executionMode =
+      options.executionMode ||
+      options.databaseOptions?.executionMode ||
+      uriDatabaseOptions.executionMode ||
+      'direct';
+    if (executionMode === 'worker') {
+      // Keep worker_threads out of direct/provider-only runtimes unless this
+      // explicitly Node-only execution mode is selected.
+      const { createWorkerStorageAdapter } = require('./SQLiteWorkerStorageAdapter');
+      const databaseOptions = options.databaseOptions || {};
+      const executionProvider =
+        options.executionProvider ||
+        databaseOptions.executionProvider ||
+        uriDatabaseOptions.executionProvider ||
+        'better-sqlite3';
+      let workerOptions = options;
+      let sharedMemoryDatabaseKey = null;
+      if (uriDatabaseOptions.filename === ':memory:') {
+        sharedMemoryDatabaseKey = `worker:${String(executionProvider)}`;
+        const temporaryDatabase = getSharedMemorySQLiteDatabasePath(sharedMemoryDatabaseKey);
+        const resolvedDatabaseOptions = {
+          ...uriDatabaseOptions,
+          ...databaseOptions,
+        };
+        delete resolvedDatabaseOptions.filename;
+        delete resolvedDatabaseOptions.executionMode;
+        delete resolvedDatabaseOptions.executionProvider;
+        workerOptions = {
+          ...options,
+          uri: `sqlite://${temporaryDatabase.filename}`,
+          executionProvider,
+          databaseOptions: resolvedDatabaseOptions,
+        };
+      }
+      const releaseWorkerResources = () => {
+        if (sharedMemoryDatabaseKey !== null) {
+          releaseSharedMemorySQLiteDatabasePath(sharedMemoryDatabaseKey);
+        }
+        releaseSQLiteHandleIncludePatch();
+      };
+      try {
+        return createWorkerStorageAdapter(
+          workerOptions,
+          uri,
+          SQLiteStorageAdapter.prototype,
+          releaseWorkerResources,
+          message => logger.error('Duplicate key error:', message),
+          message => logger.error('Sanitized error:', message)
+        );
+      } catch (error) {
+        releaseWorkerResources();
+        throw error;
+      }
+    }
+    if (executionMode !== 'direct') {
+      releaseSQLiteHandleIncludePatch();
+      throw new Error(`Unsupported SQLite execution mode: ${executionMode}`);
+    }
+    this._uri = uri;
     this._collectionPrefix = options.collectionPrefix || '';
     this.canSortOnJoinTables = true;
     const databaseOptions = options.databaseOptions || {};
+    this._executionProvider =
+      options.executionProvider ||
+      databaseOptions.executionProvider ||
+      uriDatabaseOptions.executionProvider;
+    this._sharedMemoryDatabaseKey = this._executionProvider || 'better-sqlite3';
+    this._runsInDedicatedWorker = options._runsInDedicatedWorker === true;
     this.schemaCacheTtl = databaseOptions.schemaCacheTtl ?? null;
     this.enableSchemaHooks = !!databaseOptions.enableSchemaHooks;
+    this.disableIndexFieldValidation = !!databaseOptions.disableIndexFieldValidation;
     this._onSchemaChange = () => {};
     this._stmtCache = new Map();
     this._existingClasses = new Set();
@@ -3251,35 +3341,56 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     this._lastWriteSequence = 0;
     this._isShutDown = false;
 
-    const dbOptions = getDatabaseOptionsFromURI(this._uri);
+    const dbOptions = uriDatabaseOptions;
     Object.assign(dbOptions, databaseOptions);
     if (dbOptions.cacheSizeKb == null && options.cacheSizeKb != null) {
       dbOptions.cacheSizeKb = options.cacheSizeKb;
     }
     if (dbOptions.filename === ':memory:') {
-      const temporaryDatabase = getSharedMemorySQLiteDatabasePath();
+      const temporaryDatabase = getSharedMemorySQLiteDatabasePath(this._sharedMemoryDatabaseKey);
       dbOptions.filename = temporaryDatabase.filename;
       this._usesSharedMemoryDatabase = true;
     }
     this._dbOptions = dbOptions;
-    this._db = createClient(dbOptions);
-    this._supportsSQLiteRTree = false;
-    this._supportsSQLiteGeopoly = false;
     try {
-      const sqliteCapabilities = this._db
-        .prepare(
-          "SELECT sqlite_compileoption_used('ENABLE_RTREE') AS rtree, " +
-            "sqlite_compileoption_used('ENABLE_GEOPOLY') AS geopoly"
-        )
-        .get();
-      this._supportsSQLiteRTree = Boolean(sqliteCapabilities && sqliteCapabilities.rtree);
-      this._supportsSQLiteGeopoly = Boolean(sqliteCapabilities && sqliteCapabilities.geopoly);
-    } catch {
-      // Some embedded builds omit compile-option diagnostics. Geo queries stay
-      // correct through their scan path instead of making adapter startup fail.
+      this._db = createClient(dbOptions, this._executionProvider);
+      this._supportsSQLiteRTree = false;
+      this._supportsSQLiteGeopoly = false;
+      try {
+        const sqliteCapabilities = this._db
+          .prepare(
+            "SELECT sqlite_compileoption_used('ENABLE_RTREE') AS rtree, " +
+              "sqlite_compileoption_used('ENABLE_GEOPOLY') AS geopoly"
+          )
+          .get();
+        this._supportsSQLiteRTree = Boolean(sqliteCapabilities && sqliteCapabilities.rtree);
+        this._supportsSQLiteGeopoly = Boolean(sqliteCapabilities && sqliteCapabilities.geopoly);
+      } catch {
+        // Some embedded builds omit compile-option diagnostics. Geo queries stay
+        // correct through their scan path instead of making adapter startup fail.
+      }
+      this._initSchemaTable();
+    } catch (error) {
+      try {
+        this._db?.close();
+      } catch {
+        /* */
+      }
+      if (this._usesSharedMemoryDatabase) {
+        releaseSharedMemorySQLiteDatabasePath(this._sharedMemoryDatabaseKey);
+        this._usesSharedMemoryDatabase = false;
+      }
+      releaseSQLiteHandleIncludePatch();
+      throw error;
     }
-    this._initSchemaTable();
     this.database = this._buildLegacyDatabaseCompat();
+  }
+
+  _shouldYieldBeforeTopLevelOperation(transactionalSession?: any): boolean {
+    return (
+      !this._runsInDedicatedWorker &&
+      shouldYieldBeforeTopLevelSQLiteOperation(transactionalSession)
+    );
   }
 
   _prepare(sql: string, dbOverride?: any): any {
@@ -3354,7 +3465,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
       this._temporaryDirectory = null;
     }
     if (this._usesSharedMemoryDatabase) {
-      releaseSharedMemorySQLiteDatabasePath();
+      releaseSharedMemorySQLiteDatabasePath(this._sharedMemoryDatabaseKey);
       this._usesSharedMemoryDatabase = false;
     }
     releaseSQLiteHandleIncludePatch();
@@ -5397,9 +5508,9 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     if (!isUniqueConstraintError(err)) {
       return err;
     }
-    logger.error(
-      'Duplicate key error:',
-      buildDuplicateKeyLogMessage(this._collectionPrefix + className, err)
+    const duplicateKeyLogMessage = buildDuplicateKeyLogMessage(
+      this._collectionPrefix + className,
+      err
     );
     const duplicatedField = getDuplicatedFieldFromUniqueConstraint(className, err);
     const parseError = new Parse.Error(
@@ -5407,6 +5518,13 @@ export class SQLiteStorageAdapter implements StorageAdapter {
       'A duplicate value for a field with unique values was provided'
     );
     parseError.underlyingError = err;
+    if (this._runsInDedicatedWorker) {
+      // The host process owns Parse Server's configured logger and test spies.
+      // Carry this diagnostic with the error instead of logging it twice.
+      parseError._sqliteDuplicateKeyLogMessage = duplicateKeyLogMessage;
+    } else {
+      logger.error('Duplicate key error:', duplicateKeyLogMessage);
+    }
     if (duplicatedField) {
       parseError.userInfo = { duplicated_field: duplicatedField };
     }
@@ -5594,7 +5712,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     // `better-sqlite3` completes adapter work synchronously in-process. A
     // single top-level hop keeps request scheduling closer to Mongo/Postgres,
     // which avoids SQLite-only timing skew in triggers and background tasks.
-    if (shouldYieldBeforeTopLevelSQLiteOperation(transactionalSession)) {
+    if (this._shouldYieldBeforeTopLevelOperation(transactionalSession)) {
       await waitForNextEventLoopTurn();
     }
     const db = transactionalSession || this._db;
@@ -5634,7 +5752,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
 
     const stmtSql = `INSERT INTO ${this._tableName(className)} (${cols.join(', ')}) VALUES (${placeholders.join(', ')})`;
     try {
-      if (shouldYieldBeforeTopLevelSQLiteOperation(transactionalSession)) {
+      if (this._shouldYieldBeforeTopLevelOperation(transactionalSession)) {
         await waitForNextEventLoopTurn();
       }
       this._prepare(stmtSql, transactionalSession).run(...values);
@@ -6700,7 +6818,11 @@ export class SQLiteStorageAdapter implements StorageAdapter {
               }
             }
           } else if (op === '$regex') {
-            const normalizedRegex = validateRegexPattern(opVal, val.$options || '');
+            const normalizedRegex = validateRegexPattern(
+              opVal,
+              val.$options || '',
+              this._runsInDedicatedWorker
+            );
             const regexMatchPlan = getRegexMatchPlan(
               isArrayField ? 'value' : targetSql,
               normalizedRegex,
@@ -7035,7 +7157,11 @@ export class SQLiteStorageAdapter implements StorageAdapter {
                   continue;
                 }
                 for (const elem of opVal) {
-                  const normalizedRegex = validateRegexPattern(elem.$regex, elem.$options || '');
+                  const normalizedRegex = validateRegexPattern(
+                    elem.$regex,
+                    elem.$options || '',
+                    this._runsInDedicatedWorker
+                  );
                   if (indexedArrayElementTableName) {
                     const indexedRegexMatch = getSQLiteArrayIndexRegexMatchExpression(
                       indexedArrayElementTableName,
@@ -7466,7 +7592,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     transactionalSession?: any
   ): Promise<Array<any>> {
     // See `createObject()` for why top-level adapter entrypoints yield once.
-    if (shouldYieldBeforeTopLevelSQLiteOperation(transactionalSession)) {
+    if (this._shouldYieldBeforeTopLevelOperation(transactionalSession)) {
       await waitForNextEventLoopTurn();
     }
     schema = normalizeSQLiteSchema(className, schema);
@@ -7679,7 +7805,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     query: QueryType,
     transactionalSession?: any
   ): Promise<number> {
-    if (shouldYieldBeforeTopLevelSQLiteOperation(transactionalSession)) {
+    if (this._shouldYieldBeforeTopLevelOperation(transactionalSession)) {
       await waitForNextEventLoopTurn();
     }
     const db =
@@ -7714,7 +7840,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     fieldName: string,
     transactionalSession?: any
   ): Promise<any> {
-    if (shouldYieldBeforeTopLevelSQLiteOperation(transactionalSession)) {
+    if (this._shouldYieldBeforeTopLevelOperation(transactionalSession)) {
       await waitForNextEventLoopTurn();
     }
     const db =
@@ -9114,7 +9240,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     query: QueryType,
     transactionalSession: ?any
   ): Promise<void> {
-    if (shouldYieldBeforeTopLevelSQLiteOperation(transactionalSession)) {
+    if (this._shouldYieldBeforeTopLevelOperation(transactionalSession)) {
       await waitForNextEventLoopTurn();
     }
     const db = transactionalSession || this._db;
@@ -9138,7 +9264,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     if (where.sql) {
       sql += ` WHERE ${where.sql}`;
     }
-    if (shouldYieldBeforeTopLevelSQLiteOperation(transactionalSession)) {
+    if (this._shouldYieldBeforeTopLevelOperation(transactionalSession)) {
       await waitForNextEventLoopTurn();
     }
     const result = this._prepare(sql, transactionalSession).run(...where.params);
@@ -9154,7 +9280,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     update: any,
     transactionalSession: ?any
   ): Promise<any> {
-    if (shouldYieldBeforeTopLevelSQLiteOperation(transactionalSession)) {
+    if (this._shouldYieldBeforeTopLevelOperation(transactionalSession)) {
       await waitForNextEventLoopTurn();
     }
     const db = transactionalSession || this._db;
@@ -9524,7 +9650,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
       }
       params.push(...where.params);
       try {
-        if (shouldYieldBeforeTopLevelSQLiteOperation(transactionalSession)) {
+        if (this._shouldYieldBeforeTopLevelOperation(transactionalSession)) {
           await waitForNextEventLoopTurn();
         }
         const result = this._prepare(sql, transactionalSession).run(...params);
@@ -10357,7 +10483,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
   }
 
   async createTransactionalSession(): Promise<any> {
-    const txDb = createClient(this._dbOptions);
+    const txDb = createClient(this._dbOptions, this._executionProvider);
     txDb.exec('BEGIN IMMEDIATE');
     return txDb;
   }

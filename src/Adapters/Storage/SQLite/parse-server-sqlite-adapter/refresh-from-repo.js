@@ -8,13 +8,20 @@ const sourceDir = path.join(repoRoot, "lib/Adapters/Storage/SQLite");
 const targetDir = __dirname;
 
 const fileHeaders = {
-  "SQLiteClient.js": `// Standalone package copy of the built SQLite client helpers.\n\n`,
+  "SQLiteClient.js":
+    `// Standalone package copy of the built SQLite client helpers.\n` +
+    `/* eslint-disable indent -- Babel emits extra blocks around switch lexical declarations. */\n\n`,
   "SQLiteConfigParser.js": `// Standalone package copy of the built SQLite URI parser.\n\n`,
   "SQLiteStorageAdapter.js":
     `// Standalone package copy of the built SQLite adapter.\n` +
-    `// The only functional edits here retarget Parse Server internals to the host app.\n\n`,
+    `// The only functional edits here retarget Parse Server internals to the host app.\n` +
+    `/* eslint-disable no-cond-assign, unused-imports/no-unused-vars -- Babel output. */\n\n`,
+  "SQLiteStorageAdapterWorker.js":
+    `// Standalone package copy of the built SQLite worker runtime.\n\n`,
   "SQLiteUtils.js":
     `// Standalone package copy of the built SQLite adapter utility helpers.\n\n`,
+  "SQLiteWorkerStorageAdapter.js":
+    `// Standalone package copy of the built SQLite worker facade.\n\n`,
 };
 
 const importRewrite = {
@@ -69,7 +76,7 @@ const utilsCompatReplace =
   "}\n";
 
 function stripSourceMap(content) {
-  return content.replace(/\n\/\/# sourceMappingURL=.*$/s, "");
+  return `${content.replace(/\n\/\/# sourceMappingURL=.*$/s, "").trimEnd()}\n`;
 }
 
 function withHeader(filename, content) {
@@ -107,4 +114,5 @@ for (const filename of Object.keys(fileHeaders)) {
   fs.writeFileSync(targetFile, content);
 }
 
+// eslint-disable-next-line no-console
 console.log(`Refreshed standalone package files in ${targetDir}`);

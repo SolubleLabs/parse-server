@@ -117,6 +117,21 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
     expect(getDatabaseOptionsFromURI('file::memory:?cache=shared').filename).toBe(':memory:');
   });
 
+  it('parses supported sqlite execution options without accepting arbitrary providers', () => {
+    expect(
+      getDatabaseOptionsFromURI(
+        'sqlite://:memory:?executionMode=worker&executionProvider=node%3Asqlite'
+      )
+    ).toEqual({
+      filename: ':memory:',
+      executionMode: 'worker',
+      executionProvider: 'node:sqlite',
+    });
+    expect(
+      getDatabaseOptionsFromURI('sqlite://:memory:?executionProvider=../../untrusted-module')
+    ).toEqual({ filename: ':memory:' });
+  });
+
   it('creates class and inserts objects', async () => {
     const schema = {
       className: 'TestClass',
@@ -140,6 +155,131 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
     expect(results.length).toBe(1);
     expect(results[0].name).toBe('Alice');
     expect(results[0].age).toBe(30);
+  });
+
+  it('runs adapter operations and transaction sessions through a worker', async () => {
+    const workerAdapter = new SQLiteStorageAdapter({
+      uri: 'sqlite://:memory:',
+      executionMode: 'worker',
+      databaseOptions: { enableSchemaHooks: true },
+    });
+    const schema = {
+      className: 'WorkerClass',
+      fields: {
+        objectId: { type: 'String' },
+        value: { type: 'Number' },
+      },
+    };
+    let schemaChanges = 0;
+    workerAdapter.watch(() => {
+      schemaChanges += 1;
+    });
+
+    try {
+      await workerAdapter.createClass('WorkerClass', schema);
+      workerAdapter.disableIndexFieldValidation = true;
+      await workerAdapter.setIndexesWithSchemaFormat(
+        'WorkerClass',
+        { missing_1: { missing: 1 } },
+        {},
+        schema.fields
+      );
+      const transaction = await workerAdapter.createTransactionalSession();
+      await workerAdapter.createObject(
+        'WorkerClass',
+        schema,
+        { objectId: 'committed', value: 1 },
+        transaction
+      );
+
+      // Non-transaction work can arrive while a transaction owns the write
+      // connection, but it must wait without blocking the eventual commit.
+      const queuedFind = workerAdapter.find('WorkerClass', schema, {});
+      await workerAdapter.commitTransactionalSession(transaction);
+      const committedRows = await queuedFind;
+
+      const abortedTransaction = await workerAdapter.createTransactionalSession();
+      await workerAdapter.createObject(
+        'WorkerClass',
+        schema,
+        { objectId: 'aborted', value: 2 },
+        abortedTransaction
+      );
+      await workerAdapter.abortTransactionalSession(abortedTransaction);
+      const rowsAfterAbort = await workerAdapter.find('WorkerClass', schema, {});
+
+      expect(committedRows.map(row => row.objectId)).toEqual(['committed']);
+      expect(rowsAfterAbort.map(row => row.objectId)).toEqual(['committed']);
+      expect(schemaChanges).toBeGreaterThan(0);
+      expect(workerAdapter instanceof SQLiteStorageAdapter).toBe(true);
+    } finally {
+      await workerAdapter.handleShutdown();
+    }
+  });
+
+  it('supports pluggable synchronous sqlite client providers', async () => {
+    let createClientCalls = 0;
+    const providerAdapter = new SQLiteStorageAdapter({
+      uri: 'sqlite://:memory:',
+      executionProvider: {
+        createClient: options => {
+          createClientCalls += 1;
+          return createClient(options);
+        },
+      },
+    });
+    const schema = {
+      className: 'ProviderClass',
+      fields: {
+        objectId: { type: 'String' },
+      },
+    };
+
+    try {
+      await providerAdapter.createClass('ProviderClass', schema);
+      await providerAdapter.createObject('ProviderClass', schema, { objectId: 'provided' });
+      const rows = await providerAdapter.find('ProviderClass', schema, {});
+      expect(rows.map(row => row.objectId)).toEqual(['provided']);
+      expect(createClientCalls).toBe(1);
+    } finally {
+      await providerAdapter.handleShutdown();
+    }
+  });
+
+  it('rejects incomplete synchronous sqlite client providers at startup', () => {
+    expect(
+      () =>
+        new SQLiteStorageAdapter({
+          uri: 'sqlite://:memory:',
+          executionProvider: { createClient: () => ({}) },
+        })
+    ).toThrowError(/must implement prepare/);
+  });
+
+  it('runs through the node sqlite synchronous provider', async () => {
+    const nodeSQLiteAdapter = new SQLiteStorageAdapter({
+      uri: 'sqlite://:memory:',
+      executionProvider: 'node:sqlite',
+    });
+    const schema = {
+      className: 'NodeSQLiteClass',
+      fields: {
+        objectId: { type: 'String' },
+        value: { type: 'String' },
+      },
+    };
+
+    try {
+      await nodeSQLiteAdapter.createClass('NodeSQLiteClass', schema);
+      await nodeSQLiteAdapter.createObject('NodeSQLiteClass', schema, {
+        objectId: 'node-sqlite',
+        value: 'works',
+      });
+      const rows = await nodeSQLiteAdapter.find('NodeSQLiteClass', schema, { value: 'works' });
+      expect(rows.map(row => row.objectId)).toEqual(['node-sqlite']);
+    } finally {
+      await nodeSQLiteAdapter.handleShutdown();
+    }
   });
 
   it('handles large primitive $in queries without hitting sqlite expression limits', async () => {

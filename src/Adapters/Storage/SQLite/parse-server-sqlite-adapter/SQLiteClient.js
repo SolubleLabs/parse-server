@@ -1,10 +1,10 @@
 "use strict";
 
 // Standalone package copy of the built SQLite client helpers.
+/* eslint-disable indent -- Babel emits extra blocks around switch lexical declarations. */
 
 const fs = require('fs');
 const path = require('path');
-const Database = require('better-sqlite3');
 const {
   canonicalJSONStringify,
   isNumericArrayIndexComponent,
@@ -160,7 +160,7 @@ const applyDynamicPathMutation = (rootContainer, pathComponents, operation, rawV
       return rootContainer;
   }
 };
-function createClient(options) {
+const createBetterSQLiteDatabase = options => {
   const filename = options.filename || ':memory:';
   const dbOptions = {
     fileMustExist: options.fileMustExist || false,
@@ -172,18 +172,84 @@ function createClient(options) {
     // Linux bundled runs can lose the right caller frame for `bindings()`. Hand the addon path in directly.
     dbOptions.nativeBinding = nativeBindingPath;
   }
+  const BetterSQLiteDatabase = require('better-sqlite3');
+  return new BetterSQLiteDatabase(filename, dbOptions);
+};
+const createNodeSQLiteDatabase = options => {
+  const filename = options.filename || ':memory:';
+  if (options.fileMustExist && filename !== ':memory:' && !fs.existsSync(filename)) {
+    const error = new Error(`SQLite database file does not exist: ${filename}`);
+    error.code = 'SQLITE_CANTOPEN';
+    throw error;
+  }
+  const {
+    DatabaseSync
+  } = require('node:sqlite');
+  return new DatabaseSync(filename);
+};
+const resolveCustomProviderFactory = provider => {
+  const loadedProvider = typeof provider === 'string' ? require(provider) : provider;
+  const normalizedProvider = loadedProvider?.default || loadedProvider;
+  if (typeof normalizedProvider === 'function') {
+    return normalizedProvider;
+  }
+  if (typeof normalizedProvider?.createClient === 'function') {
+    return options => normalizedProvider.createClient(options);
+  }
+  throw new TypeError('SQLite execution provider must export a function or createClient(options)');
+};
+const validateSQLiteSyncClient = db => {
+  for (const method of ['prepare', 'exec', 'function', 'close']) {
+    if (typeof db?.[method] !== 'function') {
+      throw new TypeError(`SQLite synchronous provider client must implement ${method}()`);
+    }
+  }
+  return db;
+};
+const createSQLiteDatabase = (options, executionProvider) => {
+  let db;
+  switch (executionProvider) {
+    case undefined:
+    case null:
+    case 'better-sqlite3':
+      db = createBetterSQLiteDatabase(options);
+      break;
+    case 'node:sqlite':
+      db = createNodeSQLiteDatabase(options);
+      break;
+    default:
+      {
+        db = resolveCustomProviderFactory(executionProvider)(options);
+        if (db && typeof db.then === 'function') {
+          throw new TypeError('The direct SQLite engine requires a synchronous provider; use an async executor for Promise-based clients');
+        }
+        break;
+      }
+  }
+  return validateSQLiteSyncClient(db);
+};
+const applyPragma = (db, pragma) => {
+  if (typeof db.pragma === 'function') {
+    db.pragma(pragma);
+  } else {
+    db.exec(`PRAGMA ${pragma}`);
+  }
+};
+function createClient(options, executionProvider) {
+  const filename = options.filename || ':memory:';
   const cacheSizeKb = getSQLiteCacheSizeKb(options);
-  const db = new Database(filename, dbOptions);
+  const db = createSQLiteDatabase(options, executionProvider);
 
   // Performance Pragmas
   if (filename !== ':memory:' && !filename.includes('mode=memory')) {
-    db.pragma('journal_mode = WAL');
+    applyPragma(db, 'journal_mode = WAL');
   }
-  db.pragma('synchronous = NORMAL');
-  db.pragma('temp_store = MEMORY');
+  applyPragma(db, 'synchronous = NORMAL');
+  applyPragma(db, 'temp_store = MEMORY');
   // Keep the default cache modest for small Parse installs; callers can raise it.
-  db.pragma(`cache_size = -${cacheSizeKb}`);
-  db.pragma('foreign_keys = ON');
+  applyPragma(db, `cache_size = -${cacheSizeKb}`);
+  applyPragma(db, 'foreign_keys = ON');
+  applyPragma(db, `busy_timeout = ${options.timeout ?? 5000}`);
   // Reuse compiled regexes for a query's repeated row-level UDF calls.
   const maxCompiledRegexCacheSize = 256;
   const compiledRegexCache = new Map();
