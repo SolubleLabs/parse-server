@@ -4,6 +4,7 @@ const {
   getDatabaseOptionsFromURI,
 } = require('../lib/Adapters/Storage/SQLite/SQLiteConfigParser');
 const Parse = require('parse/node');
+const MongoTransform = require('../lib/Adapters/Storage/Mongo/MongoTransform');
 const itIfNodeSQLiteAvailable = (() => {
   try {
     require.resolve('node:sqlite');
@@ -2116,6 +2117,92 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
       )
     ).toBeTrue();
     expect(results.map(result => result.objectId)).toEqual(['arrayEq1']);
+  });
+
+  it('uses and rebuilds hidden array indexes for ACL permission fields', async () => {
+    const className = 'IndexedACLPermissionsClass';
+    const schema = {
+      className,
+      fields: { objectId: { type: 'String' } },
+    };
+    const indexName = 'read_permissions_1';
+    await adapter.createClass(className, schema);
+    await adapter.createObject(className, schema, {
+      objectId: 'allowed',
+      _rperm: ['role:clinician', 'user-1'],
+      _wperm: ['user-1'],
+    });
+    await adapter.createObject(className, schema, {
+      objectId: 'denied',
+      _rperm: ['role:billing'],
+      _wperm: [],
+    });
+
+    await adapter.createIndex(className, { _rperm: 1 }, { name: indexName });
+
+    const where = adapter._buildWhereClause(className, schema, {
+      _rperm: 'role:clinician',
+    });
+    const rawArrayIndexTableName = adapter._rawArrayElementIndexTableName(className, '_rperm');
+    expect(where.sql).toContain(adapter._quotedArrayElementIndexTableName(className, '_rperm'));
+    expect(
+      (await adapter.find(className, schema, { _rperm: 'role:clinician' })).map(
+        result => result.objectId
+      )
+    ).toEqual(['allowed']);
+
+    adapter._dropArrayElementIndexArtifactsForField(className, '_rperm', schema.fields);
+    expect(getArrayIndexArtifactsForField(adapter, className, '_rperm')).toEqual([]);
+    await adapter.createIndexes(className, [{ name: indexName, key: { _rperm: 1 } }]);
+
+    expect(
+      adapter
+        ._prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?")
+        .get(rawArrayIndexTableName)
+    ).toBeDefined();
+    expect(
+      (await adapter.find(className, schema, { _rperm: 'role:clinician' })).map(
+        result => result.objectId
+      )
+    ).toEqual(['allowed']);
+  });
+
+  it('rehydrates hidden ACL arrays for Mongo-compatible backup round trips', async () => {
+    const className = 'ACLBackupRoundTripClass';
+    const schema = {
+      className,
+      fields: { objectId: { type: 'String' } },
+    };
+    await adapter.createClass(className, schema);
+    await adapter.createObject(className, schema, {
+      objectId: 'acl-backup-row',
+      _rperm: ['*', 'role:clinician'],
+      _wperm: ['role:clinician'],
+    });
+    const rawRow = adapter
+      ._prepare(`SELECT * FROM ${adapter._tableName(className)} WHERE "objectId" = ?`)
+      .get('acl-backup-row');
+
+    const rehydrated = adapter._sqliteRowToParseObject(className, rawRow, schema);
+    expect(rehydrated._rperm).toEqual(['*', 'role:clinician']);
+    expect(rehydrated._wperm).toEqual(['role:clinician']);
+
+    const mongoRow = MongoTransform.parseObjectToMongoObjectForCreate(
+      className,
+      rehydrated,
+      schema
+    );
+    expect(mongoRow._acl).toEqual({
+      '*': { r: true },
+      'role:clinician': { r: true, w: true },
+    });
+    const roundTripped = MongoTransform.mongoObjectToParseObject(
+      className,
+      { ...mongoRow },
+      schema
+    );
+    expect(roundTripped._rperm).toEqual(['*', 'role:clinician']);
+    expect(roundTripped._wperm).toEqual(['role:clinician']);
   });
 
   it('keeps large indexed $all queries below SQLite expression-depth limits', async () => {

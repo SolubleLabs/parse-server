@@ -1968,3 +1968,11 @@
 - Property updates now enter the regular FIFO directly. Transaction-affine operations retain priority until COMMIT/ROLLBACK, then older regular work runs before the property update and later regular work runs after it.
 - Removed the third queue, sequence counter, and head comparisons; the corrected scheduler is smaller and retains O(1) enqueue/dequeue behavior.
 - Validation: a red regression proves index validation is unchanged for an older parked call and changed for a later call; build, lint, generated-package refresh, diff checks, and 110/110 adapter specs are green.
+
+## 2026-09-14
+
+### Hidden ACL Storage Arrays
+- `_rperm` and `_wperm` remain absent from Parse's public schema, but SQLite storage now resolves both consistently as implicit `Array<String>` fields for decoding, index validation, array-shadow creation, and index restoration.
+- Red regressions reproduced the two real failures: raw ACL rows decoded as JSON strings and declared `_rperm` indexes used scalar storage instead of the trigger-maintained member index. The backup regression also reproduced Mongo export failing when it called `forEach` on the string value.
+- Added coverage for hidden ACL index creation, indexed membership, artifact rebuild from stored public schema, raw-row rehydration, and Mongo-compatible export/import transformation.
+- Validation: build and lint green; 112/112 SQLite adapter specs and 35/35 Parse ACL specs green; generated standalone package refreshed and passed isolated ACL index/query/rehydration smoke testing.

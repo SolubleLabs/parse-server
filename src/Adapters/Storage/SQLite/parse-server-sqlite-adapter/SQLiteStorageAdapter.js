@@ -108,6 +108,13 @@ const sqliteOrderedSetUnionBranchLimit = 16;
 // couple of object-shaped Parse primitives into lookupable text keys too.
 const sqliteIndexedArrayScalarTypeNames = Object.freeze(['text', 'integer', 'real', 'true', 'false', 'null']);
 const sqliteIndexedArrayScalarTypeNameSQL = sqliteIndexedArrayScalarTypeNames.map(typeName => `'${typeName}'`).join(', ');
+const hiddenSQLiteACLFieldNames = new Set(['_rperm', '_wperm']);
+const implicitSQLiteACLFieldSchema = Object.freeze({
+  type: 'Array',
+  contents: Object.freeze({
+    type: 'String'
+  })
+});
 const implicitSQLiteUserColumnFields = Object.freeze({
   _hashed_password: {
     type: 'String'
@@ -142,6 +149,17 @@ const implicitSQLiteUserColumnFields = Object.freeze({
 });
 const hiddenUserSchemaFields = new Set(['_hashed_password', '_password_history', '_email_verify_token_expires_at', '_email_verify_token', '_account_lockout_expires_at', '_failed_login_count', '_perishable_token', '_perishable_token_expires_at', '_password_changed_at']);
 const userDateLikeStringFields = new Set(['_email_verify_token_expires_at', '_account_lockout_expires_at', '_perishable_token_expires_at', '_password_changed_at']);
+
+/** Resolve fields that exist in SQLite storage but are intentionally absent from Parse's public schema. */
+const getSQLiteStorageFieldSchema = (schemaFields, fieldName) => {
+  if (hiddenSQLiteACLFieldNames.has(fieldName)) {
+    return implicitSQLiteACLFieldSchema;
+  }
+  if (!schemaFields || !Object.prototype.hasOwnProperty.call(schemaFields, fieldName)) {
+    return undefined;
+  }
+  return schemaFields[fieldName];
+};
 const isAdapterInternalColumn = fieldName => fieldName === nullFieldTrackerColumn || fieldName === writeSequenceColumn || fieldName === spatialIdColumn;
 const getAuthDataProviderFieldName = fieldName => {
   if (typeof fieldName !== 'string' || !fieldName.startsWith(authDataFieldPrefix)) {
@@ -436,8 +454,9 @@ const toParseSchema = schema => {
   if (schema.className === '_User') {
     delete fields._hashed_password;
   }
-  delete fields._wperm;
-  delete fields._rperm;
+  for (const fieldName of hiddenSQLiteACLFieldNames) {
+    delete fields[fieldName];
+  }
   delete fields[nullFieldTrackerColumn];
   delete fields[writeSequenceColumn];
   let clps = defaultCLPS;
@@ -501,18 +520,14 @@ const toSQLiteSchema = schema => {
   }
   schema.fields = schema.fields || {};
   if (!isJoinTableClass(schema.className)) {
-    schema.fields._wperm = {
-      type: 'Array',
-      contents: {
-        type: 'String'
-      }
-    };
-    schema.fields._rperm = {
-      type: 'Array',
-      contents: {
-        type: 'String'
-      }
-    };
+    for (const fieldName of hiddenSQLiteACLFieldNames) {
+      schema.fields[fieldName] = {
+        type: implicitSQLiteACLFieldSchema.type,
+        contents: {
+          ...implicitSQLiteACLFieldSchema.contents
+        }
+      };
+    }
   }
   if (schema.className === '_User') {
     for (const fieldName in implicitSQLiteUserColumnFields) {
@@ -1044,7 +1059,7 @@ const buildArrayRootDotFieldPath = (fieldName, eachTableAlias = 'json_each') => 
     ...buildJsonPathTraversalExpressions(`${eachTableAlias}.value`, components, fieldName)
   };
 };
-const doesSQLiteFieldExistInSchema = (schemaFields, fieldName) => defaultSchemaIndexFields.has(fieldName) || fieldName === '_rperm' || fieldName === '_wperm' || Object.prototype.hasOwnProperty.call(schemaFields, fieldName);
+const doesSQLiteFieldExistInSchema = (schemaFields, fieldName) => defaultSchemaIndexFields.has(fieldName) || getSQLiteStorageFieldSchema(schemaFields, fieldName) !== undefined;
 const handleDotFields = object => {
   Object.keys(object).forEach(fieldName => {
     if (fieldName.indexOf('.') > -1) {
@@ -2605,7 +2620,7 @@ class SQLiteStorageAdapter {
   _getArrayElementIndexFieldInfo(schemaFields, fieldName) {
     const normalizedFieldName = this._normalizeIndexFieldPath(fieldName);
     if (normalizedFieldName.indexOf('.') < 0) {
-      const field = schemaFields && schemaFields[normalizedFieldName];
+      const field = getSQLiteStorageFieldSchema(schemaFields, normalizedFieldName);
       if (!field || field.type !== 'Array') {
         return null;
       }
@@ -2621,7 +2636,7 @@ class SQLiteStorageAdapter {
       rootFieldName,
       components
     } = getDotFieldPathParts(normalizedFieldName);
-    const rootField = schemaFields && schemaFields[rootFieldName];
+    const rootField = getSQLiteStorageFieldSchema(schemaFields, rootFieldName);
     if (!rootField || rootField.type !== 'Array' && rootField.type !== 'Object' || components.length === 0 || components.some(isNumericArrayIndexComponent)) {
       return null;
     }
@@ -3740,9 +3755,9 @@ class SQLiteStorageAdapter {
     const normalizedFieldName = this._normalizeIndexFieldPath(fieldName);
     if (normalizedFieldName.indexOf('.') >= 0) {
       const [rootFieldName] = normalizedFieldName.split('.');
-      return Object.prototype.hasOwnProperty.call(fields || {}, rootFieldName);
+      return getSQLiteStorageFieldSchema(fields, rootFieldName) !== undefined;
     }
-    return Object.prototype.hasOwnProperty.call(fields || {}, normalizedFieldName);
+    return doesSQLiteFieldExistInSchema(fields || {}, normalizedFieldName);
   }
   _buildSchemaIndexesObject(indexes) {
     return indexes.reduce((output, index) => {
@@ -3893,7 +3908,7 @@ class SQLiteStorageAdapter {
           continue;
         }
       }
-      let fieldSchema = fields[key];
+      let fieldSchema = getSQLiteStorageFieldSchema(fields, key);
       if (key === 'authData' && (!fieldSchema || fieldSchema.type !== 'Object')) {
         fieldSchema = {
           type: 'Object'
@@ -4106,8 +4121,9 @@ class SQLiteStorageAdapter {
         }
       }
       const dotFieldPath = isDotNotation ? buildDotFieldPath(key) : null;
+      const dotFieldRootSchema = dotFieldPath ? getSQLiteStorageFieldSchema(schemaFields, dotFieldPath.rootFieldName) : null;
       const dotFieldRootExists = dotFieldPath && doesSQLiteFieldExistInSchema(schemaFields, dotFieldPath.rootFieldName);
-      const dotFieldUsesRootArrayTraversal = dotFieldPath && dotFieldRootExists && schemaFields[dotFieldPath.rootFieldName] && schemaFields[dotFieldPath.rootFieldName].type === 'Array' && dotFieldPath.components.length > 0 && !isNumericArrayIndexComponent(dotFieldPath.components[0]);
+      const dotFieldUsesRootArrayTraversal = dotFieldPath && dotFieldRootExists && dotFieldRootSchema && dotFieldRootSchema.type === 'Array' && dotFieldPath.components.length > 0 && !isNumericArrayIndexComponent(dotFieldPath.components[0]);
       const dotFieldArrayPath = dotFieldUsesRootArrayTraversal ? buildArrayRootDotFieldPath(key) : null;
       const hasNestedDotPathComponents = dotFieldPath && dotFieldPath.components.length > 0;
       const hasExplicitNumericDotPathSegment = dotFieldPath && dotFieldPath.components.some(isNumericArrayIndexComponent);
@@ -4137,8 +4153,9 @@ class SQLiteStorageAdapter {
         dotFieldTypeSql = dotFieldPath.typeExpression;
       }
       const usesCaseInsensitiveComparison = caseInsensitive && !authDataProvider && !isDotNotation && (normalizedKey === 'username' || normalizedKey === 'email');
-      const isArrayField = normalizedKey === '_rperm' || normalizedKey === '_wperm' || schemaFields[normalizedKey] && schemaFields[normalizedKey].type === 'Array';
-      const nativeScalarStorageType = !authDataProvider && !isDotNotation && schemaFields[normalizedKey] && (schemaFields[normalizedKey].type === 'Pointer' || schemaFields[normalizedKey].type === 'Date' || schemaFields[normalizedKey].type === 'File' || schemaFields[normalizedKey].type === 'Object') ? schemaFields[normalizedKey].type : null;
+      const normalizedFieldSchema = getSQLiteStorageFieldSchema(schemaFields, normalizedKey);
+      const isArrayField = normalizedFieldSchema && normalizedFieldSchema.type === 'Array';
+      const nativeScalarStorageType = !authDataProvider && !isDotNotation && normalizedFieldSchema && (normalizedFieldSchema.type === 'Pointer' || normalizedFieldSchema.type === 'Date' || normalizedFieldSchema.type === 'File' || normalizedFieldSchema.type === 'Object') ? normalizedFieldSchema.type : null;
       const explicitNullFieldMatch = shouldTrackExplicitNullFields(className) && !authDataProvider && !isDotNotation ? getExplicitNullFieldMatchExpression(normalizedKey) : null;
       /** Bare text columns can keep index-friendly LIKE/GLOB/=`...` lowering without CAST(... AS TEXT). */
       const canUseLoweredRegexRawTextTarget = !authDataProvider && !isDotNotation && !isArrayField && targetSql !== 'NULL' && isLowerableRegexTextColumn(schemaFields, normalizedKey);
