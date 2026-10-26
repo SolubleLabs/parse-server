@@ -1976,3 +1976,12 @@
 - Red regressions reproduced the two real failures: raw ACL rows decoded as JSON strings and declared `_rperm` indexes used scalar storage instead of the trigger-maintained member index. The backup regression also reproduced Mongo export failing when it called `forEach` on the string value.
 - Added coverage for hidden ACL index creation, indexed membership, artifact rebuild from stored public schema, raw-row rehydration, and Mongo-compatible export/import transformation.
 - Validation: build and lint green; 112/112 SQLite adapter specs and 35/35 Parse ACL specs green; generated standalone package refreshed and passed isolated ACL index/query/rehydration smoke testing.
+
+## 2026-10-26
+
+### Native Bytes BLOB Storage
+- Top-level Parse `Bytes` fields now use native SQLite `BLOB` columns. Create, update, equality, set queries, distinct, indexes, worker transport, backup reads, and aggregate reads return the normal Parse `{ __type: 'Bytes', base64 }` value.
+- Bytes nested inside Object or Array fields remain JSON because they are part of the parent JSON value. No compatibility decoder or migration for the unused earlier TEXT shape was added.
+- Aggregate JSON containers encode BLOB fields only at the JSON boundary. Literal group keys also carry their repeated SQL parameters in the real placeholder order.
+- Five-round 20,000-row median with 256-byte values: BLOB insert 26.67 ms versus JSON TEXT 46.99 ms, indexed lookup 11.54 versus 34.56 ms, read/rehydrate 13.65 versus 19.26 ms, and stored payload bytes 5.12 MB versus 7.48 MB.
+- Validation: build, lint, and diff checks green; 114/114 adapter specs, 61/61 schema specs, and 88/88 executed Parse Object specs green. Both better-sqlite3 and node:sqlite paths pass, and the generated package passes isolated direct and worker BLOB/index/aggregate smoke tests.

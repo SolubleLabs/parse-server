@@ -187,8 +187,10 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
       fields: {
         objectId: { type: 'String' },
         value: { type: 'Number' },
+        payload: { type: 'Bytes' },
       },
     };
+    const payload = { __type: 'Bytes', base64: 'd29ya2Vy' };
     let schemaChanges = 0;
     workerAdapter.watch(() => {
       schemaChanges += 1;
@@ -207,7 +209,7 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
       await workerAdapter.createObject(
         'WorkerClass',
         schema,
-        { objectId: 'committed', value: 1 },
+        { objectId: 'committed', value: 1, payload },
         transaction
       );
 
@@ -228,6 +230,7 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
       const rowsAfterAbort = await workerAdapter.find('WorkerClass', schema, {});
 
       expect(committedRows.map(row => row.objectId)).toEqual(['committed']);
+      expect(committedRows[0].payload).toEqual(payload);
       expect(rowsAfterAbort.map(row => row.objectId)).toEqual(['committed']);
       expect(schemaChanges).toBeGreaterThan(0);
       expect(workerAdapter instanceof SQLiteStorageAdapter).toBe(true);
@@ -325,17 +328,25 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
       fields: {
         objectId: { type: 'String' },
         value: { type: 'String' },
+        payload: { type: 'Bytes' },
       },
     };
+    const payload = { __type: 'Bytes', base64: 'bm9kZS1zcWxpdGU=' };
 
     try {
       await nodeSQLiteAdapter.createClass('NodeSQLiteClass', schema);
       await nodeSQLiteAdapter.createObject('NodeSQLiteClass', schema, {
         objectId: 'node-sqlite',
         value: 'works',
+        payload,
       });
       const rows = await nodeSQLiteAdapter.find('NodeSQLiteClass', schema, { value: 'works' });
       expect(rows.map(row => row.objectId)).toEqual(['node-sqlite']);
+      expect(rows[0].payload).toEqual(payload);
+      const groupedRows = await nodeSQLiteAdapter.aggregate('NodeSQLiteClass', schema, [
+        { $group: { _id: { payload: '$payload' }, count: { $sum: 1 } } },
+      ]);
+      expect(groupedRows[0].objectId).toEqual({ payload });
     } finally {
       await nodeSQLiteAdapter.handleShutdown();
     }
@@ -1671,6 +1682,193 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
     expect(
       (await adapter.find(className, schema, { attachment })).map(result => result.objectId)
     ).toEqual(['file1']);
+  });
+
+  it('stores and indexes top-level Bytes as native SQLite blobs', async () => {
+    const className = 'IndexedBytesClass';
+    const schema = {
+      className,
+      fields: {
+        objectId: { type: 'String' },
+        payload: { type: 'Bytes' },
+        metadata: { type: 'Object' },
+      },
+    };
+    const firstPayload = { __type: 'Bytes', base64: 'AAECA/8=' };
+    const secondPayload = { __type: 'Bytes', base64: 'c2Vjb25k' };
+    const updatedPayload = { __type: 'Bytes', base64: 'dXBkYXRlZA==' };
+    await adapter.createClass(className, schema);
+    await adapter.createIndex(className, { payload: 1 }, { name: 'indexed_payload' });
+    await adapter.createObject(className, schema, {
+      objectId: 'first',
+      payload: firstPayload,
+      metadata: { nestedPayload: firstPayload },
+    });
+    await adapter.createObject(className, schema, {
+      objectId: 'second',
+      payload: secondPayload,
+    });
+
+    const payloadColumn = adapter
+      ._prepare(`PRAGMA table_info(${adapter._tableName(className)})`)
+      .all()
+      .find(column => column.name === 'payload');
+    const rawFirstRow = adapter
+      ._prepare(
+        `SELECT typeof("payload") AS storageType, hex("payload") AS payloadHex, ` +
+          `typeof("metadata") AS metadataStorageType FROM ${adapter._tableName(className)} ` +
+          `WHERE "objectId" = ?`
+      )
+      .get('first');
+    const where = adapter._buildWhereClause(className, schema, { payload: firstPayload });
+    const queryPlan = adapter
+      ._prepare(
+        `EXPLAIN QUERY PLAN SELECT "objectId" FROM ${adapter._tableName(className)} WHERE ${where.sql}`
+      )
+      .all(...where.params);
+
+    expect(payloadColumn.type).toBe('BLOB');
+    expect(rawFirstRow).toEqual({
+      storageType: 'blob',
+      payloadHex: '00010203FF',
+      metadataStorageType: 'text',
+    });
+    expect(where.sql).toContain('"payload" = ?');
+    expect(where.sql).not.toContain('json_valid');
+    expect(Buffer.isBuffer(where.params[0])).toBeTrue();
+    expect(
+      queryPlan.some(
+        row => typeof row.detail === 'string' && row.detail.includes('indexed_payload')
+      )
+    ).toBeTrue();
+    expect(
+      (await adapter.find(className, schema, { payload: firstPayload })).map(row => row.objectId)
+    ).toEqual(['first']);
+    expect(
+      (
+        await adapter.find(className, schema, {
+          payload: { $in: [firstPayload, updatedPayload] },
+        })
+      ).map(row => row.objectId)
+    ).toEqual(['first']);
+    expect(
+      (
+        await adapter.find(className, schema, {
+          payload: { $nin: [firstPayload] },
+        })
+      ).map(row => row.objectId)
+    ).toEqual(['second']);
+    expect((await adapter.distinct(className, schema, {}, 'payload')).sort((left, right) =>
+      left.base64.localeCompare(right.base64)
+    )).toEqual([firstPayload, secondPayload].sort((left, right) =>
+      left.base64.localeCompare(right.base64)
+    ));
+
+    const firstRow = (await adapter.find(className, schema, { objectId: 'first' }))[0];
+    expect(firstRow.payload).toEqual(firstPayload);
+    expect(firstRow.metadata).toEqual({ nestedPayload: firstPayload });
+
+    await adapter.updateObjectsByQuery(
+      className,
+      schema,
+      { objectId: 'first' },
+      { payload: updatedPayload }
+    );
+    const updatedRawRow = adapter
+      ._prepare(
+        `SELECT typeof("payload") AS storageType, hex("payload") AS payloadHex ` +
+          `FROM ${adapter._tableName(className)} WHERE "objectId" = ?`
+      )
+      .get('first');
+    expect(updatedRawRow).toEqual({
+      storageType: 'blob',
+      payloadHex: '75706461746564',
+    });
+    expect((await adapter.find(className, schema, { objectId: 'first' }))[0].payload).toEqual(
+      updatedPayload
+    );
+  });
+
+  it('rehydrates native Bytes blobs through raw backup and aggregate paths', async () => {
+    const sourceClassName = 'BytesAggregateSource';
+    const targetClassName = 'BytesAggregateTarget';
+    const sourceSchema = {
+      className: sourceClassName,
+      fields: {
+        objectId: { type: 'String' },
+        link: { type: 'String' },
+        payload: { type: 'Bytes' },
+      },
+    };
+    const targetSchema = {
+      className: targetClassName,
+      fields: {
+        objectId: { type: 'String' },
+        link: { type: 'String' },
+        payload: { type: 'Bytes' },
+      },
+    };
+    const sourcePayload = { __type: 'Bytes', base64: 'c291cmNl' };
+    const targetPayload = { __type: 'Bytes', base64: 'dGFyZ2V0' };
+    await adapter.createClass(sourceClassName, sourceSchema);
+    await adapter.createClass(targetClassName, targetSchema);
+    await adapter.createObject(sourceClassName, sourceSchema, {
+      objectId: 'source',
+      link: 'shared',
+      payload: sourcePayload,
+    });
+    await adapter.createObject(targetClassName, targetSchema, {
+      objectId: 'target',
+      link: 'shared',
+      payload: targetPayload,
+    });
+
+    const rawCollection = await adapter._adaptiveCollection(sourceClassName);
+    const rawRows = await rawCollection.find({});
+    expect(rawRows[0].payload).toEqual(sourcePayload);
+
+    const projectedRows = await adapter.aggregate(sourceClassName, sourceSchema, [
+      { $project: { payload: 1 } },
+    ]);
+    expect(projectedRows[0].payload).toEqual(sourcePayload);
+
+    const projectedAndMatchedRows = await adapter.aggregate(sourceClassName, sourceSchema, [
+      { $project: { payload: 1 } },
+      { $match: { payload: sourcePayload } },
+    ]);
+    expect(projectedAndMatchedRows[0].payload).toEqual(sourcePayload);
+
+    const groupedRows = await adapter.aggregate(sourceClassName, sourceSchema, [
+      { $group: { _id: { payload: '$payload' }, count: { $sum: 1 } } },
+    ]);
+    expect(groupedRows[0].objectId).toEqual({ payload: sourcePayload });
+
+    const literalGroupedRows = await adapter.aggregate(sourceClassName, sourceSchema, [
+      { $group: { _id: { payload: sourcePayload }, count: { $sum: 1 } } },
+    ]);
+    expect(literalGroupedRows[0].objectId).toEqual({ payload: sourcePayload });
+
+    const scalarLiteralGroupedRows = await adapter.aggregate(sourceClassName, sourceSchema, [
+      { $group: { _id: sourcePayload, count: { $sum: 1 } } },
+    ]);
+    expect(scalarLiteralGroupedRows[0].objectId).toEqual(sourcePayload);
+
+    const literalRows = await adapter.aggregate(sourceClassName, sourceSchema, [
+      { $addFields: { copiedPayload: sourcePayload } },
+    ]);
+    expect(literalRows[0].copiedPayload).toEqual(sourcePayload);
+
+    const lookupRows = await adapter.aggregate(sourceClassName, sourceSchema, [
+      {
+        $lookup: {
+          from: targetClassName,
+          localField: 'link',
+          foreignField: 'link',
+          as: 'matches',
+        },
+      },
+    ]);
+    expect(lookupRows[0].matches[0].payload).toEqual(targetPayload);
   });
 
   it('rejects storage timestamp aliases from ordered set union planning', async () => {

@@ -631,11 +631,12 @@ const parseTypeToSQLiteType = (type: any) => {
     case 'File':
     case 'Pointer':
     case 'GeoPoint':
-    case 'Bytes':
     case 'Polygon':
     case 'Array':
     case 'Relation':
       return 'TEXT';
+    case 'Bytes':
+      return 'BLOB';
     case 'Boolean':
     case 'Number':
       return typeName === 'Boolean' ? 'INTEGER' : 'REAL';
@@ -644,9 +645,40 @@ const parseTypeToSQLiteType = (type: any) => {
   }
 };
 
+const isParseBytesValue = (value: any): boolean =>
+  value &&
+  typeof value === 'object' &&
+  !Array.isArray(value) &&
+  value.__type === 'Bytes' &&
+  typeof value.base64 === 'string';
+
+const isSQLiteBlobValue = (value: any): boolean =>
+  Buffer.isBuffer(value) || value instanceof Uint8Array;
+
+const parseBytesValueToSQLiteBlob = (value: any): Buffer =>
+  Buffer.from(value.base64, 'base64');
+
+const sqliteBlobToParseBytesValue = (value: any): any => {
+  const bytes = Buffer.isBuffer(value)
+    ? value
+    : Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+  return {
+    __type: 'Bytes',
+    base64: bytes.toString('base64'),
+  };
+};
+
+/** SQLite JSON builders reject BLOB values, so aggregate containers wrap Bytes at that boundary. */
+const getSQLiteBytesJSONExpression = (expression: string): string =>
+  `CASE WHEN ${expression} IS NULL THEN NULL ELSE ` +
+  `json_object('__type', 'Bytes', 'base64', parse_bytes_base64(${expression})) END`;
+
 const inferFieldType = (key: string, value: any) => {
   if (key === 'authData') {
     return { type: 'Object' };
+  }
+  if (isSQLiteBlobValue(value)) {
+    return { type: 'Bytes' };
   }
   if (value && typeof value === 'object') {
     if (value.__type === 'Pointer') {
@@ -657,6 +689,9 @@ const inferFieldType = (key: string, value: any) => {
     }
     if (value.__type === 'File') {
       return { type: 'File' };
+    }
+    if (value.__type === 'Bytes') {
+      return { type: 'Bytes' };
     }
     if (value.__type === 'GeoPoint') {
       return { type: 'GeoPoint' };
@@ -848,6 +883,10 @@ const toSQLiteValue = (value: any) => {
   return value;
 };
 
+/** Top-level Bytes use SQLite's native binary storage; nested Bytes stay inside JSON containers. */
+const toSQLiteStorageValue = (value: any) =>
+  isParseBytesValue(value) ? parseBytesValueToSQLiteBlob(value) : toSQLiteValue(value);
+
 const shouldTrackCoercedNullStorageValue = (value: any, sqliteValue: any): boolean => {
   if (sqliteValue !== null) {
     return false;
@@ -1028,7 +1067,6 @@ const sqliteValueToParseValue = (value: any, type: any) => {
       return value;
     case 'Object':
     case 'Array':
-    case 'Bytes':
       if (typeof value === 'string') {
         try {
           return JSON.parse(value);
@@ -1037,6 +1075,8 @@ const sqliteValueToParseValue = (value: any, type: any) => {
         }
       }
       return value;
+    case 'Bytes':
+      return isSQLiteBlobValue(value) ? sqliteBlobToParseBytesValue(value) : value;
     case 'GeoPoint':
       if (typeof value === 'string') {
         try {
@@ -2688,6 +2728,12 @@ const getScalarValueMatchExpression = (
       params: [toSQLiteValue(comparisonValue)],
     };
   }
+  if (nativeStorageType === 'Bytes' && isParseBytesValue(comparisonValue)) {
+    return {
+      sql: `${targetSql} = ?`,
+      params: [parseBytesValueToSQLiteBlob(comparisonValue)],
+    };
+  }
   if (nativeStorageType === 'Object' && typeof comparisonValue === 'object') {
     // Top-level Object columns and their query values use the same compact JSON
     // representation. Direct comparison preserves Mongo's key-order semantics
@@ -2747,6 +2793,7 @@ const getScalarAnyMatchExpression = (
   if (
     nativeStorageType === 'Date' ||
     nativeStorageType === 'File' ||
+    nativeStorageType === 'Bytes' ||
     nativeStorageType === 'Object'
   ) {
     const nativeValues = [];
@@ -2764,7 +2811,7 @@ const getScalarAnyMatchExpression = (
           getScalarValueMatchExpression
         );
       }
-      nativeValues.push(toSQLiteValue(comparisonValue));
+      nativeValues.push(toSQLiteStorageValue(comparisonValue));
     }
     const sqlParts = [];
     const params = [];
@@ -5482,7 +5529,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     }, {});
   }
 
-  _buildRawStorageObject(row: any): any {
+  _buildRawStorageObject(row: any, schema: SchemaType): any {
     const output = {};
     const legacyACL = {};
 
@@ -5492,7 +5539,10 @@ export class SQLiteStorageAdapter implements StorageAdapter {
         continue;
       }
       let value = sourceRow[key];
-      if (typeof value === 'string') {
+      const fieldSchema = schema && schema.fields ? schema.fields[key] : null;
+      if (fieldSchema && fieldSchema.type === 'Bytes' && isSQLiteBlobValue(value)) {
+        value = sqliteBlobToParseBytesValue(value);
+      } else if (typeof value === 'string') {
         try {
           value = JSON.parse(value);
         } catch {
@@ -5574,7 +5624,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
       if (typeof val === 'undefined') {
         continue;
       }
-      const sqliteValue = toSQLiteValue(val);
+      const sqliteValue = toSQLiteStorageValue(val);
       row[key] = sqliteValue;
       if (
         shouldPersistExplicitNullField(className, key) &&
@@ -5960,6 +6010,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
         (normalizedFieldSchema.type === 'Pointer' ||
           normalizedFieldSchema.type === 'Date' ||
           normalizedFieldSchema.type === 'File' ||
+          normalizedFieldSchema.type === 'Bytes' ||
           normalizedFieldSchema.type === 'Object')
           ? normalizedFieldSchema.type
           : null;
@@ -6283,7 +6334,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
               }
             } else {
               conditions.push(`${targetSql} < ?`);
-              params.push(toSQLiteValue(opVal));
+              params.push(toSQLiteStorageValue(opVal));
             }
           } else if (op === '$lte') {
             if (dotFieldArraySourceSql) {
@@ -6329,7 +6380,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
               }
             } else {
               conditions.push(`${targetSql} <= ?`);
-              params.push(toSQLiteValue(opVal));
+              params.push(toSQLiteStorageValue(opVal));
             }
           } else if (op === '$gt') {
             if (dotFieldArraySourceSql) {
@@ -6375,7 +6426,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
               }
             } else {
               conditions.push(`${targetSql} > ?`);
-              params.push(toSQLiteValue(opVal));
+              params.push(toSQLiteStorageValue(opVal));
             }
           } else if (op === '$gte') {
             if (dotFieldArraySourceSql) {
@@ -6421,7 +6472,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
               }
             } else {
               conditions.push(`${targetSql} >= ?`);
-              params.push(toSQLiteValue(opVal));
+              params.push(toSQLiteStorageValue(opVal));
             }
           } else if (op === '$in') {
             if (!Array.isArray(opVal)) {
@@ -8450,6 +8501,13 @@ export class SQLiteStorageAdapter implements StorageAdapter {
         fieldType: { type: 'Boolean' },
       };
     }
+    if (isParseBytesValue(expression)) {
+      return {
+        sql: '?',
+        params: [parseBytesValueToSQLiteBlob(expression)],
+        fieldType: { type: 'Bytes' },
+      };
+    }
     if (Array.isArray(expression)) {
       return {
         sql: 'json(?)',
@@ -8744,6 +8802,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
         sql: 'NULL',
         params: [],
         groupBy: [],
+        groupByParams: [],
         fieldType: { type: 'String', aggregateNullGroupId: true },
       };
     }
@@ -8751,17 +8810,29 @@ export class SQLiteStorageAdapter implements StorageAdapter {
     if (isPlainObject(expression) && !Object.keys(expression).some(key => key.startsWith('$'))) {
       const params = [];
       const groupBy = [];
+      const groupByParams = [];
       const jsonParts = [];
       for (const key of Object.keys(expression)) {
         const compiled = this._compileAggregateExpression(context, expression[key]);
-        jsonParts.push(`'${key.replace(/'/g, "''")}', ${compiled.sql}`);
+        const isBytesValue = compiled.fieldType && compiled.fieldType.type === 'Bytes';
+        const jsonValueSql = isBytesValue
+          ? getSQLiteBytesJSONExpression(compiled.sql)
+          : compiled.sql;
+        jsonParts.push(`'${key.replace(/'/g, "''")}', ${jsonValueSql}`);
         groupBy.push(compiled.sql);
+        // The Bytes wrapper checks the value before encoding it, so a literal
+        // expression appears twice in the SELECT before GROUP BY repeats it.
+        if (isBytesValue) {
+          params.push(...compiled.params);
+        }
         params.push(...compiled.params);
+        groupByParams.push(...compiled.params);
       }
       return {
         sql: `json_object(${jsonParts.join(', ')})`,
         params,
         groupBy,
+        groupByParams,
         fieldType: { type: 'Object' },
       };
     }
@@ -8778,6 +8849,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
       sql: compiled.sql,
       params: compiled.params,
       groupBy: [compiled.sql],
+      groupByParams: compiled.params,
       fieldType,
     };
   }
@@ -8835,6 +8907,8 @@ export class SQLiteStorageAdapter implements StorageAdapter {
       }
     }
     params.push(...context.params);
+    // SQLite sees GROUP BY placeholders after the nested source query.
+    params.push(...groupId.groupByParams);
 
     return {
       ...context,
@@ -8947,6 +9021,10 @@ export class SQLiteStorageAdapter implements StorageAdapter {
           `'${`_p_${column}`}', CASE WHEN ${qualifiedColumn} IS NULL THEN NULL ELSE ? || ${qualifiedColumn} END`
         );
         params.push(`${schema.fields[column].targetClass}$`);
+      } else if (schema.fields[column] && schema.fields[column].type === 'Bytes') {
+        parts.push(
+          `'${column.replace(/'/g, "''")}', ${getSQLiteBytesJSONExpression(qualifiedColumn)}`
+        );
       } else {
         parts.push(`'${column.replace(/'/g, "''")}', ${qualifiedColumn}`);
       }
@@ -9067,6 +9145,9 @@ export class SQLiteStorageAdapter implements StorageAdapter {
 
   _normalizeAggregateGroupIdValue(value: any, fieldSchema: any): any {
     const parsedValue = parseJSONValue(value);
+    if (fieldSchema && fieldSchema.type === 'Bytes' && isSQLiteBlobValue(parsedValue)) {
+      return sqliteBlobToParseBytesValue(parsedValue);
+    }
     if (fieldSchema && fieldSchema.aggregateGroupPointer && typeof parsedValue === 'string') {
       return parsedValue.includes('$') ? parsedValue.split('$').slice(1).join('$') : parsedValue;
     }
@@ -9101,6 +9182,9 @@ export class SQLiteStorageAdapter implements StorageAdapter {
         className: fieldSchema.targetClass,
         objectId: value.includes('$') ? value.split('$').slice(1).join('$') : value,
       };
+    }
+    if (fieldSchema && fieldSchema.type === 'Bytes' && isSQLiteBlobValue(value)) {
+      return sqliteBlobToParseBytesValue(value);
     }
     if (fieldSchema && (fieldSchema.type === 'Array' || fieldSchema.type === 'Object')) {
       return this._convertAggregateNativeDocument(parseJSONValue(value), null, options);
@@ -9572,7 +9656,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
 
       validateNestedKeys(fieldValue);
       validateFieldName(fieldName);
-      const sqliteValue = toSQLiteValue(fieldValue);
+      const sqliteValue = toSQLiteStorageValue(fieldValue);
       setClauses.push(`${columnName} = ?`);
       params.push(sqliteValue);
       appendNullFieldTrackerUpdate(fieldName, sqliteValue === null);
@@ -10471,7 +10555,7 @@ export class SQLiteStorageAdapter implements StorageAdapter {
           sql += ` WHERE ${where.sql}`;
         }
         const rows = this._prepare(sql).all(...where.params);
-        return rows.map(row => this._buildRawStorageObject(row));
+        return rows.map(row => this._buildRawStorageObject(row, schema));
       },
       _ensureSparseUniqueIndexInBackground: async (index: any) => {
         for (const fieldName of Object.keys(index || {})) {

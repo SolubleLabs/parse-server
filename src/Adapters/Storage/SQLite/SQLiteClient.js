@@ -332,6 +332,18 @@ function createClient(
     return compiledRegex;
   };
 
+  // SQLite JSON builders reject BLOB inputs. Aggregate containers call this
+  // only when a top-level Bytes column must become Parse's JSON wrapper again.
+  db.function('parse_bytes_base64', { deterministic: true }, value => {
+    if (value == null || !(Buffer.isBuffer(value) || value instanceof Uint8Array)) {
+      return null;
+    }
+    const bytes = Buffer.isBuffer(value)
+      ? value
+      : Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+    return bytes.toString('base64');
+  });
+
   // Register REGEXP function for SQLite `REGEXP` operator
   db.function('regexp', { deterministic: true }, (pattern, text) => {
     if (pattern == null || text == null) {
