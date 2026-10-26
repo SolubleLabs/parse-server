@@ -1985,3 +1985,8 @@
 - Aggregate JSON containers encode BLOB fields only at the JSON boundary. Literal group keys also carry their repeated SQL parameters in the real placeholder order.
 - Five-round 20,000-row median with 256-byte values: BLOB insert 26.67 ms versus JSON TEXT 46.99 ms, indexed lookup 11.54 versus 34.56 ms, read/rehydrate 13.65 versus 19.26 ms, and stored payload bytes 5.12 MB versus 7.48 MB.
 - Validation: build, lint, and diff checks green; 114/114 adapter specs, 61/61 schema specs, and 88/88 executed Parse Object specs green. Both better-sqlite3 and node:sqlite paths pass, and the generated package passes isolated direct and worker BLOB/index/aggregate smoke tests.
+
+### Native Binary Input Follow-up
+- CodeRabbit correctly found that raw `Buffer` and `Uint8Array` writes were inferred as Bytes but still fell through to JSON TEXT serialization. Both now enter SQLite as BLOBs; Buffer inputs are reused and typed-array slices become zero-copy Buffer views over only their visible byte range.
+- The regression covers physical storage, indexed equality, Parse Bytes rehydration, and sliced typed-array transport through the worker. Adapter coverage remains 114/114.
+- Legacy JSON TEXT Bytes remain intentionally unsupported. This adapter has no deployed Bytes data requiring a compatibility read/query path.

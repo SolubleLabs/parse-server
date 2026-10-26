@@ -191,6 +191,8 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
       },
     };
     const payload = { __type: 'Bytes', base64: 'd29ya2Vy' };
+    const nativePayloadBacking = Uint8Array.from([0, 119, 111, 114, 107, 101, 114, 0]);
+    const nativePayload = nativePayloadBacking.subarray(1, 7);
     let schemaChanges = 0;
     workerAdapter.watch(() => {
       schemaChanges += 1;
@@ -209,7 +211,7 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
       await workerAdapter.createObject(
         'WorkerClass',
         schema,
-        { objectId: 'committed', value: 1, payload },
+        { objectId: 'committed', value: 1, payload: nativePayload },
         transaction
       );
 
@@ -1772,7 +1774,7 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
       className,
       schema,
       { objectId: 'first' },
-      { payload: updatedPayload }
+      { payload: Buffer.from(updatedPayload.base64, 'base64') }
     );
     const updatedRawRow = adapter
       ._prepare(
@@ -1787,6 +1789,50 @@ describe_only_db('sqlite')('SQLiteStorageAdapter Unit & Security Tests', () => {
     expect((await adapter.find(className, schema, { objectId: 'first' }))[0].payload).toEqual(
       updatedPayload
     );
+
+    const nativeBuffer = Buffer.from([1, 2, 3]);
+    const nativeByteArrayBacking = Uint8Array.from([255, 4, 5, 255]);
+    const nativeByteArray = nativeByteArrayBacking.subarray(1, 3);
+    await adapter.createObject(className, schema, {
+      objectId: 'native-buffer',
+      payload: nativeBuffer,
+    });
+    await adapter.createObject(className, schema, {
+      objectId: 'native-byte-array',
+      payload: nativeByteArray,
+    });
+
+    const rawNativeRows = adapter
+      ._prepare(
+        `SELECT "objectId", typeof("payload") AS storageType, hex("payload") AS payloadHex ` +
+          `FROM ${adapter._tableName(className)} WHERE "objectId" IN (?, ?) ORDER BY "objectId"`
+      )
+      .all('native-buffer', 'native-byte-array');
+    expect(rawNativeRows).toEqual([
+      {
+        objectId: 'native-buffer',
+        storageType: 'blob',
+        payloadHex: '010203',
+      },
+      {
+        objectId: 'native-byte-array',
+        storageType: 'blob',
+        payloadHex: '0405',
+      },
+    ]);
+    expect(
+      (
+        await adapter.find(className, schema, {
+          payload: { __type: 'Bytes', base64: 'AQID' },
+        })
+      ).map(row => row.objectId)
+    ).toEqual(['native-buffer']);
+    expect((await adapter.find(className, schema, { objectId: 'native-buffer' }))[0].payload).toEqual(
+      { __type: 'Bytes', base64: 'AQID' }
+    );
+    expect(
+      (await adapter.find(className, schema, { objectId: 'native-byte-array' }))[0].payload
+    ).toEqual({ __type: 'Bytes', base64: 'BAU=' });
   });
 
   it('rehydrates native Bytes blobs through raw backup and aggregate paths', async () => {

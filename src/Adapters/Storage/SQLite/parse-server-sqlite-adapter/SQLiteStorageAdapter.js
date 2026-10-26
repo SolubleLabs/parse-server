@@ -589,9 +589,10 @@ const parseTypeToSQLiteType = type => {
 };
 const isParseBytesValue = value => value && typeof value === 'object' && !Array.isArray(value) && value.__type === 'Bytes' && typeof value.base64 === 'string';
 const isSQLiteBlobValue = value => Buffer.isBuffer(value) || value instanceof Uint8Array;
+const sqliteBlobValueToBuffer = value => Buffer.isBuffer(value) ? value : Buffer.from(value.buffer, value.byteOffset, value.byteLength);
 const parseBytesValueToSQLiteBlob = value => Buffer.from(value.base64, 'base64');
 const sqliteBlobToParseBytesValue = value => {
-  const bytes = Buffer.isBuffer(value) ? value : Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+  const bytes = sqliteBlobValueToBuffer(value);
   return {
     __type: 'Bytes',
     base64: bytes.toString('base64')
@@ -797,7 +798,15 @@ const toSQLiteValue = value => {
 };
 
 /** Top-level Bytes use SQLite's native binary storage; nested Bytes stay inside JSON containers. */
-const toSQLiteStorageValue = value => isParseBytesValue(value) ? parseBytesValueToSQLiteBlob(value) : toSQLiteValue(value);
+const toSQLiteStorageValue = value => {
+  if (isParseBytesValue(value)) {
+    return parseBytesValueToSQLiteBlob(value);
+  }
+  if (isSQLiteBlobValue(value)) {
+    return sqliteBlobValueToBuffer(value);
+  }
+  return toSQLiteValue(value);
+};
 const shouldTrackCoercedNullStorageValue = (value, sqliteValue) => {
   if (sqliteValue !== null) {
     return false;
